@@ -576,68 +576,39 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
     const metrics = loadMetrics(id_streamer);
     const now = new Date().toISOString();
 
-    // Agrupar por IP — se já existe viewer com mesmo IP, é a mesma pessoa
-    let existingKey = null;
-    for (const [uid, v] of Object.entries(metrics.viewers)) {
-      if (v.ip === ip) {
-        existingKey = uid;
-        break;
+    // Agrupar por IP — cada IP tem um array de conexões (mais nova primeiro)
+    if (!metrics.viewers[ip]) {
+      metrics.viewers[ip] = {
+        kick_username: device_info?.kick_username || '',
+        join_count: 1,
+        connections: [],
+      };
+    } else {
+      metrics.viewers[ip].join_count = (metrics.viewers[ip].join_count || 1) + 1;
+      if (device_info?.kick_username) {
+        metrics.viewers[ip].kick_username = device_info.kick_username;
       }
     }
 
-    if (existingKey && existingKey !== viewer_uid) {
-      // Mesmo IP, UID diferente — mesclar no registro existente
-      const existing = metrics.viewers[existingKey];
-      existing.last_seen = now;
-      existing.join_count = (existing.join_count || 1) + 1;
-      existing.viewer_uids = existing.viewer_uids || [existingKey];
-      if (!existing.viewer_uids.includes(viewer_uid)) {
-        existing.viewer_uids.push(viewer_uid);
-      }
-      // Atualizar device info se veio mais completo
-      if (device_info?.kick_username && !existing.kick_username) {
-        existing.kick_username = device_info.kick_username;
-      }
-      if (device_info?.device_model && !existing.device_model) {
-        existing.device_model = device_info.device_model;
-      }
-      // Mapear o novo UID pro registro existente
-      metrics.viewers[viewer_uid] = existing;
-      delete metrics.viewers[existingKey];
-      // Regravar com o UID mais recente
-      console.log(`[METRICS] Viewer retornou (IP ${ip}) — join_count: ${existing.join_count}`);
-    } else if (!metrics.viewers[viewer_uid]) {
-      metrics.viewers[viewer_uid] = {
-        ip: ip,
-        kick_username: device_info?.kick_username || '',
-        platform: device_info?.platform || 'unknown',
-        os: device_info?.os || 'unknown',
-        os_version: device_info?.os_version || '',
-        device_model: device_info?.device_model || '',
-        browser: device_info?.browser || 'unknown',
-        browser_version: device_info?.browser_version || '',
-        user_agent: device_info?.user_agent || '',
-        is_mobile: device_info?.is_mobile || false,
-        joined_at: now,
-        last_seen: now,
-        join_count: 1,
-        viewer_uids: [viewer_uid],
-        segments_loaded: 0,
-        estimated_mb: 0,
-        quality_history: [],
-      };
-      console.log(`[METRICS] Novo viewer ${viewer_uid} (${device_info?.platform || '?'}, ${ip}) para ${id_streamer}`);
-    } else {
-      // Mesmo UID, mesmo IP — só atualizar
-      metrics.viewers[viewer_uid].last_seen = now;
-      metrics.viewers[viewer_uid].join_count = (metrics.viewers[viewer_uid].join_count || 1) + 1;
-      if (device_info?.kick_username && !metrics.viewers[viewer_uid].kick_username) {
-        metrics.viewers[viewer_uid].kick_username = device_info.kick_username;
-      }
-      if (device_info?.device_model && !metrics.viewers[viewer_uid].device_model) {
-        metrics.viewers[viewer_uid].device_model = device_info.device_model;
-      }
-    }
+    // Adicionar nova conexão no início do array (mais recente primeiro)
+    metrics.viewers[ip].connections.unshift({
+      viewer_uid: viewer_uid,
+      platform: device_info?.platform || 'unknown',
+      os: device_info?.os || 'unknown',
+      os_version: device_info?.os_version || '',
+      device_model: device_info?.device_model || '',
+      browser: device_info?.browser || 'unknown',
+      browser_version: device_info?.browser_version || '',
+      user_agent: device_info?.user_agent || '',
+      is_mobile: device_info?.is_mobile || false,
+      joined_at: now,
+      last_seen: now,
+      segments_loaded: 0,
+      estimated_mb: 0,
+      quality_history: [],
+    });
+
+    console.log(`[METRICS] Viewer ${ip} (${device_info?.kick_username || '?'}) — conexão #${metrics.viewers[ip].join_count}`);
 
     saveMetrics(metrics);
     return res.json({ tracked: true });
@@ -650,26 +621,35 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
 // POST /api/metrics/update — viewer envia consumo periodicamente
 app.post('/api/metrics/update', requireApiKey, (req, res) => {
   try {
-    const { id_streamer, viewer_uid, segments_loaded, current_quality } = req.body;
+    const { id_streamer, viewer_uid, segments_loaded, current_quality, player_health } = req.body;
     if (!id_streamer || !viewer_uid) {
       return res.status(400).json({ message: 'Campos obrigatorios' });
     }
 
     const metrics = loadMetrics(id_streamer);
-    const viewer = metrics.viewers[viewer_uid];
-    if (!viewer) {
+
+    // Encontrar a conexão pelo viewer_uid dentro dos IPs
+    let connection = null;
+    for (const [, viewer] of Object.entries(metrics.viewers)) {
+      if (viewer.connections) {
+        connection = viewer.connections.find(c => c.viewer_uid === viewer_uid);
+        if (connection) break;
+      }
+    }
+    if (!connection) {
       return res.json({ tracked: false });
     }
 
-    viewer.last_seen = new Date().toISOString();
+    connection.last_seen = new Date().toISOString();
     if (segments_loaded !== undefined) {
-      viewer.segments_loaded = segments_loaded;
-      // Estimativa: 4s segmento, 720p ~1.5Mbps = ~0.75MB/seg, 1080p ~4.5Mbps = ~2.25MB/seg
-      // Média simplificada: usar o histórico de qualidades
-      viewer.estimated_mb = Math.round(segments_loaded * 1.2 * 10) / 10;
+      connection.segments_loaded = segments_loaded;
+      connection.estimated_mb = Math.round(segments_loaded * 1.2 * 10) / 10;
     }
-    if (current_quality && (viewer.quality_history.length === 0 || viewer.quality_history[viewer.quality_history.length - 1].q !== current_quality)) {
-      viewer.quality_history.push({ q: current_quality, at: new Date().toISOString() });
+    if (current_quality && (connection.quality_history.length === 0 || connection.quality_history[connection.quality_history.length - 1].q !== current_quality)) {
+      connection.quality_history.push({ q: current_quality, at: new Date().toISOString() });
+    }
+    if (player_health) {
+      connection.player_health = player_health;
     }
 
     saveMetrics(metrics);
@@ -688,17 +668,17 @@ app.get('/api/metrics/:id_streamer', requireApiKey, (req, res) => {
     const metrics = loadMetrics(id_streamer, date);
 
     const viewers = Object.entries(metrics.viewers);
-    const uniqueIPs = new Set(viewers.map(([, v]) => v.ip));
     const totalJoins = viewers.reduce((sum, [, v]) => sum + (v.join_count || 1), 0);
+    const allConnections = viewers.flatMap(([, v]) => v.connections || []);
     const summary = {
       streamer: id_streamer,
       date: date,
-      unique_viewers: uniqueIPs.size,
+      unique_viewers: viewers.length,
       total_joins: totalJoins,
-      total_viewers: viewers.length,
-      mobile: viewers.filter(([, v]) => v.is_mobile).length,
-      desktop: viewers.filter(([, v]) => !v.is_mobile).length,
-      total_estimated_mb: Math.round(viewers.reduce((sum, [, v]) => sum + (v.estimated_mb || 0), 0) * 10) / 10,
+      total_connections: allConnections.length,
+      mobile: allConnections.filter(c => c.is_mobile).length,
+      desktop: allConnections.filter(c => !c.is_mobile).length,
+      total_estimated_mb: Math.round(allConnections.reduce((sum, c) => sum + (c.estimated_mb || 0), 0) * 10) / 10,
       viewers: metrics.viewers,
     };
 

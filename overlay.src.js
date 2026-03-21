@@ -187,20 +187,33 @@
       var ratio = window.devicePixelRatio || 1;
       var key = Math.min(w,h) + 'x' + Math.max(w,h) + '@' + ratio;
       var iphoneModels = {
-        '320x568@2': 'iPhone SE (1st)', '375x667@2': 'iPhone 6/7/8/SE2/SE3',
-        '414x736@3': 'iPhone 6+/7+/8+', '375x812@3': 'iPhone X/XS/11 Pro',
-        '414x896@2': 'iPhone XR/11', '414x896@3': 'iPhone XS Max/11 Pro Max',
-        '390x844@3': 'iPhone 12/13/14', '428x926@3': 'iPhone 12/13/14 Pro Max',
-        '393x852@3': 'iPhone 14/15/16 Pro', '430x932@3': 'iPhone 14/15/16 Pro Max',
+        // Legacy @2x
+        '320x568@2': 'iPhone SE (1st)',
+        '375x667@2': 'iPhone 6/7/8/SE2/SE3',
+        '414x896@2': 'iPhone XR/11',
+        // 5.8" @3x
+        '375x812@3': 'iPhone X/XS/11 Pro/12 mini/13 mini',
+        // 6.1" standard @3x
+        '390x844@3': 'iPhone 12/12 Pro/13/13 Pro/14',
+        '393x852@3': 'iPhone 14 Pro/15/15 Pro/16/16e/16 Plus',
+        // 6.5-6.7" large @3x
+        '414x736@3': 'iPhone 6+/7+/8+',
+        '414x896@3': 'iPhone XS Max/11 Pro Max',
+        '428x926@3': 'iPhone 12 Pro Max/13 Pro Max/14 Plus',
+        '430x932@3': 'iPhone 14 Pro Max/15 Plus/15 Pro Max',
+        // iPhone 16 @3x
+        '402x874@3': 'iPhone 16 Pro/17/17 Pro',
+        '440x956@3': 'iPhone 16 Pro Max/17 Pro Max',
+        // iPhone Air
+        '420x912@3': 'iPhone Air',
       };
       device_model = iphoneModels[key] || 'iPhone';
     } else if (/iPad/.test(ua)) {
       device_model = 'iPad';
     } else if (/Android/.test(ua)) {
-      // Android — pegar modelo do user agent
+      // Android — pegar modelo do user agent (só se tiver Build)
       var match = ua.match(/;\s*([^;)]+)\s*Build/);
-      if (!match) match = ua.match(/;\s*([^;)]+)\s*\)/);
-      if (match) device_model = match[1].trim();
+      if (match && !/rv:/.test(match[1])) device_model = match[1].trim();
       // Fallback: tentar userAgentData (Chrome 90+)
       if (!device_model && navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
         try {
@@ -216,14 +229,17 @@
       if (!device_model) device_model = localStorage.getItem('vody_device_model') || '';
     }
 
-    // Browser detection
+    // Browser detection (iOS browsers first — all use Safari engine but have unique identifiers)
     var browser = 'Unknown';
     var browser_version = '';
-    if (/OPR\/(\d+[\.\d]*)/.test(ua)) { browser = 'Opera'; browser_version = RegExp.$1; }
+    if (/CriOS\/(\d+[\.\d]*)/.test(ua)) { browser = 'Chrome (iOS)'; browser_version = RegExp.$1; }
+    else if (/FxiOS\/(\d+[\.\d]*)/.test(ua)) { browser = 'Firefox (iOS)'; browser_version = RegExp.$1; }
+    else if (/EdgiOS\/(\d+[\.\d]*)/.test(ua)) { browser = 'Edge (iOS)'; browser_version = RegExp.$1; }
+    else if (/OPR\/(\d+[\.\d]*)/.test(ua)) { browser = 'Opera'; browser_version = RegExp.$1; }
     else if (/Edg\/(\d+[\.\d]*)/.test(ua)) { browser = 'Edge'; browser_version = RegExp.$1; }
     else if (/Chrome\/(\d+[\.\d]*)/.test(ua) && !/Edg/.test(ua)) { browser = 'Chrome'; browser_version = RegExp.$1; }
     else if (/Firefox\/(\d+[\.\d]*)/.test(ua)) { browser = 'Firefox'; browser_version = RegExp.$1; }
-    else if (/Safari\/(\d+[\.\d]*)/.test(ua) && !/Chrome/.test(ua)) { browser = 'Safari'; browser_version = RegExp.$1; }
+    else if (/Safari\/(\d+[\.\d]*)/.test(ua) && !/Chrome/.test(ua) && !/CriOS/.test(ua)) { browser = 'Safari'; browser_version = RegExp.$1; }
 
     return {
       platform: platform,
@@ -258,6 +274,83 @@
   var segmentsLoaded = 0;
   var pathCheckInterval = null;
 
+  // Player health tracking
+  var playerHealth = {
+    buffering_count: 0,
+    total_buffering_ms: 0,
+    quality_switches: 0,
+    errors: [],
+    paused_by_user: false,
+    _bufferingStart: 0,
+  };
+
+  function setupPlayerHealthTracking(video) {
+    video.addEventListener('waiting', function () {
+      playerHealth.buffering_count++;
+      playerHealth._bufferingStart = Date.now();
+    });
+    video.addEventListener('playing', function () {
+      if (playerHealth._bufferingStart > 0) {
+        playerHealth.total_buffering_ms += Date.now() - playerHealth._bufferingStart;
+        playerHealth._bufferingStart = 0;
+      }
+      playerHealth.paused_by_user = false;
+    });
+    video.addEventListener('pause', function () {
+      // Se não está em fullscreen e o video do overlay pausou, foi ação do user
+      if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+        playerHealth.paused_by_user = true;
+      }
+    });
+    video.addEventListener('stalled', function () {
+      playerHealth.errors.push({ type: 'STALLED', at: new Date().toISOString() });
+    });
+    video.addEventListener('error', function () {
+      var code = video.error ? video.error.code : 0;
+      var msg = video.error ? video.error.message : '';
+      playerHealth.errors.push({ type: 'VIDEO_ERROR', code: code, msg: msg, at: new Date().toISOString() });
+    });
+
+    // HLS.js error tracking
+    var hls = window._vodyHls;
+    if (hls) {
+      hls.on(Hls.Events.ERROR, function (event, data) {
+        playerHealth.errors.push({
+          type: data.type,
+          details: data.details,
+          fatal: data.fatal,
+          at: new Date().toISOString(),
+        });
+      });
+      hls.on(Hls.Events.LEVEL_SWITCHED, function () {
+        playerHealth.quality_switches++;
+      });
+    }
+  }
+
+  function getPlayerHealthSnapshot(video) {
+    var snapshot = {
+      buffering_count: playerHealth.buffering_count,
+      total_buffering_ms: playerHealth.total_buffering_ms,
+      quality_switches: playerHealth.quality_switches,
+      paused_by_user: playerHealth.paused_by_user,
+      is_paused: video ? video.paused : false,
+      buffer_health: 0,
+      latency_seconds: 0,
+      errors: playerHealth.errors.slice(-10), // últimos 10 erros
+    };
+    // Buffer health: quanto tempo de video está buffered à frente
+    if (video && video.buffered.length > 0) {
+      snapshot.buffer_health = Math.round((video.buffered.end(video.buffered.length - 1) - video.currentTime) * 10) / 10;
+    }
+    // Latency: diferença entre o edge do buffer e o currentTime (estimativa)
+    var hls = window._vodyHls;
+    if (hls && hls.latency !== undefined) {
+      snapshot.latency_seconds = Math.round(hls.latency * 10) / 10;
+    }
+    return snapshot;
+  }
+
   function startHeartbeat(streamerCode) {
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(function () {
@@ -268,7 +361,9 @@
         body: JSON.stringify({ id_streamer: streamerCode, viewer_uid: viewerUid }),
       }).catch(function () {});
 
-      // Metrics update
+      // Metrics update com player health
+      var video = window._vodyVideo;
+      var health = getPlayerHealthSnapshot(video);
       fetch(API_URL + '/api/metrics/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Api-Key': API_KEY },
@@ -277,6 +372,7 @@
           viewer_uid: viewerUid,
           segments_loaded: segmentsLoaded,
           current_quality: window._vodyCurrentQuality || '720p',
+          player_health: health,
         }),
       }).catch(function () {});
     }, 30000);
@@ -590,6 +686,7 @@
     createRevertButton();
 
     startHLS(video, streamUrl);
+    setupPlayerHealthTracking(video);
 
     // Mantém Kick mutado
     setInterval(function () {
@@ -637,7 +734,8 @@
     // Esconde controles do Kick
     var css = document.createElement('style');
     css.textContent = [
-      '#injected-channel-player button:not(#vody-fs):not(#vody-mute):not(#vody-quality-btn){pointer-events:none!important;opacity:0!important;}',
+      '#injected-channel-player button:not(#vody-fs):not(#vody-mute):not(#vody-quality-btn):not(#vody-quality-menu button){pointer-events:none!important;opacity:0!important;}',
+      '#vody-quality-menu button{pointer-events:auto!important;opacity:1!important;}',
       '#injected-channel-player [class*="controls"]{pointer-events:none!important;opacity:0!important;}',
       '#injected-channel-player [class*="overlay-container"]{pointer-events:none!important;}',
     ].join('');
@@ -659,6 +757,7 @@
     createRevertButton();
 
     startHLS(video, streamUrl);
+    setupPlayerHealthTracking(video);
 
     // Impede Kick de retomar
     setInterval(function () {
@@ -764,25 +863,34 @@
     var menu = document.createElement('div');
     menu.id = 'vody-quality-menu';
 
-    btn.onclick = function (e) {
+    var menuOpen = false;
+
+    btn.addEventListener('click', function (e) {
+      e.preventDefault();
       e.stopPropagation();
+
+      if (menuOpen) {
+        menu.classList.remove('open');
+        menuOpen = false;
+        return;
+      }
+
       menu.innerHTML = '';
       qualities.forEach(function (q) {
         var item = document.createElement('button');
         item.textContent = q;
         if (window._vodyCurrentQuality === q) item.classList.add('active');
-        item.onclick = function (ev) {
+        item.addEventListener('click', function (ev) {
+          ev.preventDefault();
           ev.stopPropagation();
-          if (window._vodyCurrentQuality === q) { menu.classList.remove('open'); return; }
+          if (window._vodyCurrentQuality === q) { menu.classList.remove('open'); menuOpen = false; return; }
           var base = window._vodyStreamBase;
-          if (!base) { menu.classList.remove('open'); return; }
+          if (!base) { menu.classList.remove('open'); menuOpen = false; return; }
           var newUrl = base + '/' + q + '/stream.m3u8';
           var hls = window._vodyHls;
           if (hls) {
-            // hls.js (Chrome, Android, etc)
             hls.loadSource(newUrl);
           } else if (window._vodyIsNativeHLS && window._vodyVideo) {
-            // Safari / iOS — trocar src direto
             var vid = window._vodyVideo;
             vid.src = newUrl;
             vid.play().catch(function () {});
@@ -790,14 +898,23 @@
           window._vodyCurrentQuality = q;
           console.log('[VODY] Qualidade: ' + q);
           menu.classList.remove('open');
-        };
+          menuOpen = false;
+        });
         menu.appendChild(item);
       });
-      menu.classList.toggle('open');
-    };
 
+      menu.classList.add('open');
+      menuOpen = true;
+    });
+
+    // Fechar menu ao tocar fora (com delay pra não conflitar com o botão)
     document.addEventListener('click', function () {
-      menu.classList.remove('open');
+      if (menuOpen) {
+        setTimeout(function () {
+          menu.classList.remove('open');
+          menuOpen = false;
+        }, 50);
+      }
     });
 
     wrap.appendChild(btn);
