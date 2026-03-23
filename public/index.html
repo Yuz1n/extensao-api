@@ -3,75 +3,89 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Overlay Stream - Instalacao</title>
+<title>Udhyog Stream</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    background: #0a0a0e;
+    background: #08080f;
     color: #e0e0e0;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     display: flex;
     justify-content: center;
+    align-items: center;
     padding: 40px 20px;
     min-height: 100vh;
+    background-image: radial-gradient(ellipse at top, rgba(255,140,0,0.06) 0%, transparent 60%),
+                      radial-gradient(ellipse at bottom, rgba(0,136,255,0.04) 0%, transparent 60%);
   }
-  .container { max-width: 480px; width: 100%; }
+  .container { max-width: 440px; width: 100%; }
 
   .hero {
     text-align: center;
-    margin-bottom: 32px;
+    margin-bottom: 36px;
   }
   .hero-logo {
-    display: inline-flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 10px;
+    width: 100px;
+    height: 100px;
+    margin: 0 auto 12px;
+    filter: drop-shadow(0 6px 20px rgba(255,140,0,0.3));
   }
-  .hero-dot {
-    width: 10px; height: 10px; border-radius: 50%;
-    background: #00d4ff;
-    box-shadow: 0 0 10px rgba(0,212,255,0.5);
-    animation: pulse 2s ease-in-out infinite;
-  }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
   .hero h1 {
     color: #fff;
-    font-size: 22px;
-    font-weight: 700;
-    letter-spacing: 0.3px;
+    font-size: 24px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+  .hero h1 span {
+    background: linear-gradient(135deg, #ff8c00, #0088ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
   }
   .hero p {
     color: #666;
     font-size: 14px;
     line-height: 1.6;
-    margin-top: 6px;
+    margin-top: 8px;
+  }
+  .hero-divider {
+    width: 60px;
+    height: 2px;
+    background: linear-gradient(90deg, #ff8c00, #0088ff);
+    border-radius: 1px;
+    margin: 16px auto 0;
   }
 
   .step {
-    background: rgba(255,255,255,0.03);
+    background: rgba(255,255,255,0.02);
     border: 1px solid rgba(255,255,255,0.06);
-    border-radius: 12px;
+    border-radius: 14px;
     padding: 18px 20px;
     margin-bottom: 10px;
     display: flex;
     gap: 14px;
     align-items: flex-start;
+    transition: border-color 0.2s;
+  }
+  .step:hover {
+    border-color: rgba(255,140,0,0.15);
   }
   .step-num {
     flex-shrink: 0;
-    width: 28px; height: 28px;
+    width: 30px; height: 30px;
     display: flex; align-items: center; justify-content: center;
-    background: rgba(0,212,255,0.1);
-    color: #00d4ff;
+    background: linear-gradient(135deg, rgba(255,140,0,0.15), rgba(0,136,255,0.15));
+    color: #ff8c00;
     font-size: 13px;
     font-weight: 700;
-    border-radius: 8px;
+    border-radius: 10px;
   }
   .step-content { flex: 1; }
   .step-title {
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 600;
-    color: #ddd;
+    color: #eee;
     margin-bottom: 4px;
   }
   .step-desc {
@@ -79,59 +93,66 @@
     color: #777;
     line-height: 1.5;
   }
+  .step-desc strong { color: #ff8c00; }
 
-  /* Botao bookmarklet */
   .bookmark-area {
     text-align: center;
-    margin: 20px 0 24px;
+    margin: 24px 0 28px;
   }
   .bookmarklet-link {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
-    padding: 13px 28px;
-    background: linear-gradient(135deg, #00d4ff, #0099cc);
-    color: #000;
+    gap: 10px;
+    padding: 14px 32px;
+    background: linear-gradient(135deg, #ff8c00, #ff5500, #0088ff);
+    color: #fff;
     font-weight: 700;
-    font-size: 14px;
-    border-radius: 10px;
+    font-size: 15px;
+    border-radius: 14px;
     text-decoration: none;
     cursor: grab;
     transition: all 0.2s;
-    box-shadow: 0 4px 20px rgba(0,212,255,0.25);
+    box-shadow: 0 6px 24px rgba(255,140,0,0.3);
+    text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+    letter-spacing: 0.5px;
   }
   .bookmarklet-link:hover {
-    filter: brightness(1.1);
-    transform: translateY(-1px);
-    box-shadow: 0 6px 24px rgba(0,212,255,0.35);
+    filter: brightness(1.15);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(255,140,0,0.4);
   }
   .bookmarklet-link:active { transform: translateY(0); }
+  .bookmarklet-link .btn-icon {
+    font-size: 18px;
+  }
   .drag-hint {
     display: block;
-    margin-top: 8px;
+    margin-top: 10px;
     font-size: 11px;
     color: #555;
   }
 
   .note {
-    margin-top: 20px;
-    padding: 14px 16px;
-    background: rgba(255,255,255,0.02);
-    border: 1px solid rgba(255,255,255,0.06);
-    border-radius: 10px;
+    margin-top: 24px;
+    padding: 16px 18px;
+    background: rgba(255,140,0,0.03);
+    border: 1px solid rgba(255,140,0,0.08);
+    border-radius: 12px;
     font-size: 12px;
-    color: #555;
+    color: #666;
     text-align: center;
+    line-height: 1.6;
   }
+  .note strong { color: #888; }
 
   /* Modal favorito */
   .fav-overlay {
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(0,0,0,0.7);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+    background: rgba(0,0,0,0.75);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
     z-index: 99999;
     justify-content: center;
     align-items: center;
@@ -139,14 +160,14 @@
   }
   .fav-overlay.active { display: flex; }
   .fav-modal {
-    background: #111114;
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 16px;
-    padding: 28px 24px 24px;
-    max-width: 340px;
+    background: #111116;
+    border: 1px solid rgba(255,140,0,0.12);
+    border-radius: 20px;
+    padding: 32px 28px 28px;
+    max-width: 360px;
     width: 100%;
     text-align: center;
-    box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+    box-shadow: 0 24px 80px rgba(0,0,0,0.6), 0 0 40px rgba(255,140,0,0.06);
     animation: modalIn 0.25s ease-out;
   }
   @keyframes modalIn {
@@ -155,8 +176,8 @@
   }
   .fav-modal h3 {
     color: #fff;
-    font-size: 16px;
-    font-weight: 600;
+    font-size: 17px;
+    font-weight: 700;
     margin-bottom: 6px;
   }
   .fav-modal p {
@@ -170,31 +191,32 @@
     width: 100%;
     background: rgba(255,255,255,0.04);
     border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 8px;
-    padding: 10px 12px;
-    color: #00d4ff;
+    border-radius: 10px;
+    padding: 12px 14px;
+    color: #ff8c00;
     font-size: 11px;
     font-family: monospace;
     word-break: break-all;
     text-align: left;
-    margin-bottom: 12px;
+    margin-bottom: 14px;
     max-height: 80px;
     overflow-y: auto;
   }
   .fav-modal .fav-copy {
     width: 100%;
-    padding: 11px;
-    background: linear-gradient(135deg, #00d4ff, #0099cc);
-    color: #000;
+    padding: 12px;
+    background: linear-gradient(135deg, #ff8c00, #ff5500, #0088ff);
+    color: #fff;
     border: none;
-    border-radius: 10px;
-    font-size: 13px;
+    border-radius: 12px;
+    font-size: 14px;
     font-weight: 700;
     cursor: pointer;
     transition: all 0.2s;
-    margin-bottom: 8px;
+    margin-bottom: 10px;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.3);
   }
-  .fav-modal .fav-copy:hover { filter: brightness(1.1); }
+  .fav-modal .fav-copy:hover { filter: brightness(1.15); }
   .fav-modal .fav-close {
     background: none;
     border: none;
@@ -202,40 +224,31 @@
     font-size: 13px;
     cursor: pointer;
     padding: 6px;
+    transition: color 0.2s;
   }
-  .fav-modal .fav-close:hover { color: #fff; }
+  .fav-modal .fav-close:hover { color: #ff8c00; }
   .fav-modal .fav-steps {
     text-align: left;
     margin-bottom: 16px;
+    padding-left: 16px;
   }
   .fav-modal .fav-steps li {
     color: #aaa;
-    font-size: 12px;
-    margin-bottom: 6px;
+    font-size: 13px;
+    margin-bottom: 8px;
     line-height: 1.5;
   }
-  .fav-modal .fav-steps li strong { color: #ddd; }
-  .fav-modal .fav-kbd {
-    display: inline-block;
-    background: rgba(255,255,255,0.08);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 4px;
-    padding: 1px 6px;
-    font-size: 11px;
-    font-family: monospace;
-    color: #ccc;
-  }
+  .fav-modal .fav-steps li strong { color: #ff8c00; }
 </style>
 </head>
 <body>
 
 <div class="container">
   <div class="hero">
-    <div class="hero-logo">
-      <span class="hero-dot"></span>
-      <h1>Overlay Stream</h1>
-    </div>
-    <p>Assista streams com overlay direto no Kick.com sem instalar nada.</p>
+    <img class="hero-logo" src="/public/assets/logo-small.png" alt="Udhyog Stream">
+    <h1><span>Udhyog Stream</span></h1>
+    <p>Assista streams com overlay direto.<br>Sem instalar nada.</p>
+    <div class="hero-divider"></div>
   </div>
 
   <div class="step" id="step1-desktop">
@@ -257,7 +270,7 @@
   <div class="bookmark-area">
     <a class="bookmarklet-link" id="bookmarklet-btn"
        href="javascript:void(document.head.appendChild(Object.assign(document.createElement('script'),{src:'https://extensao-api.squareweb.app/public/overlay.js?t='+Date.now()})))">
-      &#9654; Overlay Stream
+      <span class="btn-icon">&#9654;</span> Udhyog Stream
     </a>
     <span class="drag-hint" id="drag-hint"></span>
   </div>
@@ -274,12 +287,12 @@
     <div class="step-num">3</div>
     <div class="step-content">
       <div class="step-title">Ative o overlay</div>
-      <div class="step-desc">Clique no favorito "Overlay Stream" e digite o codigo do streamer.</div>
+      <div class="step-desc">Clique no favorito <strong>"Udhyog Stream"</strong> e digite o codigo do streamer.</div>
     </div>
   </div>
 
   <div class="note">
-    Funciona em qualquer navegador (Chrome, Firefox, Edge, Safari). Nao precisa instalar extensao.
+    <strong>Compatibilidade:</strong> Chrome, Firefox, Edge e Safari.<br>Funciona em desktop e mobile. Nenhuma extensao necessaria.
   </div>
 </div>
 
@@ -293,7 +306,7 @@
         <li>Copie o codigo abaixo</li>
         <li>Adicione qualquer pagina aos favoritos</li>
         <li><strong>Edite</strong> o favorito e substitua a URL pelo codigo copiado</li>
-        <li>Renomeie para <strong>"Overlay Stream"</strong></li>
+        <li>Renomeie para <strong>"Udhyog Stream"</strong></li>
       </ol>
     </div>
     <div class="fav-url" id="fav-url"></div>
@@ -310,12 +323,10 @@
   var hintEl = document.getElementById('drag-hint');
 
   if (isMobile) {
-    // Mobile: mostrar step e hint mobile, esconder desktop
     document.getElementById('step1-desktop').style.display = 'none';
     document.getElementById('step1-mobile').style.display = 'flex';
     hintEl.textContent = 'Toque para copiar o codigo';
 
-    // Interceptar click para abrir modal
     document.getElementById('bookmarklet-btn').addEventListener('click', function (e) {
       e.preventDefault();
       document.getElementById('fav-url').textContent = bookmarkletCode;
@@ -324,11 +335,9 @@
       document.getElementById('fav-overlay').classList.add('active');
     });
   } else {
-    // Desktop: botao funciona normalmente (arrastar para barra de favoritos)
     hintEl.textContent = 'Arraste para a barra de favoritos';
   }
 
-  // Botao copiar (modal mobile)
   document.getElementById('fav-copy').addEventListener('click', function () {
     navigator.clipboard.writeText(bookmarkletCode).then(function () {
       var btn = document.getElementById('fav-copy');
@@ -341,7 +350,6 @@
     });
   });
 
-  // Fechar modal
   document.getElementById('fav-close').addEventListener('click', function () {
     document.getElementById('fav-overlay').classList.remove('active');
   });
