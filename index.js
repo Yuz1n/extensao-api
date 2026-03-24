@@ -396,14 +396,14 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
       stream_url = await getCachedStreamUrl(mediamtxPath);
     }
 
-    // Detectar início de live
-    if (stream_url && !activeLives[id_streamer]) {
-      await onLiveStart(id_streamer, streamer.user);
-    }
     updateLivePeak(id_streamer);
+
+    // Verificar se stream acabou (flag setado pelo /api/live/end)
+    const streamEnded = endedStreamers[id_streamer.toLowerCase()] || false;
 
     return res.json({
       valid: true,
+      stream_ended: streamEnded,
       streamer: {
         ...streamer,
         current_viewers: currentViewers,
@@ -450,6 +450,7 @@ app.post('/api/viewer/join', requireApiKey, async (req, res) => {
 
     // Registrar viewer
     registerViewer(id_streamer, viewer_uid);
+    updateLivePeak(id_streamer);
     const newCount = getViewerCount(id_streamer);
 
     console.log(`[JOIN] Viewer ${viewer_uid.substring(0, 8)}... entrou em "${id_streamer}" | Viewers: ${newCount}/${maxSpectators || 'ilimitado'}`);
@@ -644,7 +645,89 @@ const FLUSH_INTERVAL = 30000; // 30s
 // Em memória: lives ativas { id_streamer: { liveId, peakViewers, viewerSessions: {} } }
 const activeLives = {};
 
-// Detectar início de live
+// Flag de streams encerrados (para forçar refresh no overlay)
+const endedStreamers = {};
+
+// POST /api/live/start — VPS chama quando stream começa
+app.post('/api/live/start', async (req, res) => {
+  try {
+    const { id_mediamtx, api_key } = req.body;
+    if (!id_mediamtx || api_key !== API_KEY) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    // Buscar streamer pelo id_mediamtx
+    const result = await pool.query(
+      'SELECT id, "user", id_streamer FROM streamer WHERE LOWER(id_mediamtx) = LOWER($1)', [id_mediamtx]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: `Streamer com id_mediamtx "${id_mediamtx}" nao encontrado` });
+    }
+
+    const streamer = result.rows[0];
+    const idStreamer = streamer.id_streamer;
+
+    // Proteção: se já tem live ativa, ignorar
+    if (activeLives[idStreamer]) {
+      console.log(`[LIVE] Start ignorado: ${idStreamer} já tem live ativa #${activeLives[idStreamer].liveId}`);
+      return res.json({ started: false, reason: 'already_active', live_id: activeLives[idStreamer].liveId });
+    }
+
+    // Limpar flag de ended
+    delete endedStreamers[idStreamer.toLowerCase()];
+
+    await onLiveStart(idStreamer, streamer.user);
+    return res.json({ started: true, live_id: activeLives[idStreamer]?.liveId });
+  } catch (e) {
+    console.error('[LIVE] Erro start:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// POST /api/live/end — VPS chama quando stream termina
+app.post('/api/live/end', async (req, res) => {
+  try {
+    const { id_mediamtx, api_key } = req.body;
+    if (!id_mediamtx || api_key !== API_KEY) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    // Buscar streamer pelo id_mediamtx
+    const result = await pool.query(
+      'SELECT id, "user", id_streamer FROM streamer WHERE LOWER(id_mediamtx) = LOWER($1)', [id_mediamtx]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: `Streamer com id_mediamtx "${id_mediamtx}" nao encontrado` });
+    }
+
+    const streamer = result.rows[0];
+    const idStreamer = streamer.id_streamer;
+
+    // Proteção: se não tem live ativa, ignorar
+    if (!activeLives[idStreamer]) {
+      console.log(`[LIVE] End ignorado: ${idStreamer} nao tem live ativa`);
+      return res.json({ ended: false, reason: 'no_active_live' });
+    }
+
+    const liveId = activeLives[idStreamer].liveId;
+
+    // Setar flag de ended (overlay vai detectar e forçar refresh)
+    endedStreamers[idStreamer.toLowerCase()] = true;
+
+    // Encerrar a live
+    await onLiveEnd(idStreamer);
+
+    // Limpar flag após 5 minutos (tempo suficiente pra todos os overlays detectarem)
+    setTimeout(() => { delete endedStreamers[idStreamer.toLowerCase()]; }, 300000);
+
+    return res.json({ ended: true, live_id: liveId });
+  } catch (e) {
+    console.error('[LIVE] Erro end:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// Iniciar live (chamado internamente)
 async function onLiveStart(idStreamer, streamerName) {
   if (activeLives[idStreamer]) return;
   try {
@@ -760,31 +843,20 @@ function updateLivePeak(idStreamer) {
   if (currentViewers > live.peakViewers) live.peakViewers = currentViewers;
 }
 
-// Verificar status das lives a cada 30s
-async function checkLiveStatus() {
-  for (const idStreamer of Object.keys(activeLives)) {
-    try {
-      const result = await pool.query(
-        'SELECT id_mediamtx FROM streamer WHERE LOWER(id_streamer) = LOWER($1)', [idStreamer]
-      );
-      if (result.rows.length === 0) continue;
-      const mediamtxPath = result.rows[0].id_mediamtx;
-      if (!mediamtxPath) continue;
-      // Forçar refresh do cache pra verificar se stream ainda está ativo
-      streamUrlCache.delete(mediamtxPath);
-      const url = await getCachedStreamUrl(mediamtxPath);
-      if (!url) await onLiveEnd(idStreamer);
-    } catch (e) { /* ignore */ }
-  }
-  // Flush sessions das lives ativas
-  for (const live of Object.values(activeLives)) {
+// Flush sessions das lives ativas a cada 30s
+async function flushActiveLives() {
+  for (const [idStreamer, live] of Object.entries(activeLives)) {
+    updateLivePeak(idStreamer);
     await flushLiveViewerSessions(live);
+    // Atualizar peak no banco também
+    try {
+      await pool.query('UPDATE lives SET peak_viewers = $1 WHERE id = $2', [live.peakViewers, live.liveId]);
+    } catch (e) { /* ignore */ }
   }
 }
 
-// Flush a cada 30s + check live status
 setInterval(async () => {
-  await checkLiveStatus();
+  await flushActiveLives();
 }, FLUSH_INTERVAL);
 
 // Encerrar lives ativas ao desligar

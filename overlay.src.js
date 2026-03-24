@@ -385,6 +385,13 @@
       })
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        // Stream encerrado pelo servidor (VPS chamou /api/live/end)
+        if (data.stream_ended) {
+          console.log('[STREAM] Stream encerrado pelo servidor. Recarregando...');
+          showStreamEnded();
+          return;
+        }
+
         // Stream encerrado — URL vazia
         if (!data.valid || !data.streamer.stream_url) {
           consecutiveEmptyUrl++;
@@ -477,10 +484,10 @@
     endMsg.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:99999;background:rgba(10,10,14,0.95);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:32px 40px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;text-align:center;box-shadow:0 24px 80px rgba(0,0,0,0.6);';
     endMsg.innerHTML = '<div style="font-size:40px;margin-bottom:12px;">📡</div><div style="color:#fff;font-size:16px;font-weight:600;margin-bottom:8px;">Stream Encerrado</div><div style="color:#888;font-size:13px;">O streamer finalizou a transmissao.</div><button id="stream-end-close" style="margin-top:16px;padding:8px 24px;background:linear-gradient(135deg,#ff6b35,#0099cc);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;">Fechar</button>';
     document.body.appendChild(endMsg);
-    document.getElementById('stream-end-close').onclick = function () { endMsg.remove(); };
+    document.getElementById('stream-end-close').onclick = function () { location.reload(); };
 
-    // Auto-remover após 10s
-    setTimeout(function () { if (endMsg.parentNode) endMsg.remove(); }, 10000);
+    // Auto-reload após 10s
+    setTimeout(function () { location.reload(); }, 10000);
   }
 
   function sendMetricsJoin(streamerCode) {
