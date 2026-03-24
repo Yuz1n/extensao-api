@@ -243,15 +243,32 @@ async function initDB() {
 
     console.log('[DB] Tabela streamer pronta');
 
-    // Tabela de métricas por viewer/conexão
+    // Tabela de lives (cada sessão de transmissão)
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS live_metrics (
+      CREATE TABLE IF NOT EXISTS lives (
         id SERIAL PRIMARY KEY,
         streamer VARCHAR(255) NOT NULL,
-        date VARCHAR(10) NOT NULL,
+        id_streamer VARCHAR(255) NOT NULL,
+        started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        ended_at TIMESTAMP WITH TIME ZONE,
+        duration_seconds INTEGER DEFAULT 0,
+        peak_viewers INTEGER DEFAULT 0,
+        total_unique_viewers INTEGER DEFAULT 0,
+        avg_viewers REAL DEFAULT 0,
+        status VARCHAR(20) DEFAULT 'active'
+      )
+    `);
+
+    // Adicionar avg_viewers se não existir (banco existente)
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers REAL DEFAULT 0`);
+
+    // Tabela de sessões de viewer por live
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS live_viewer_sessions (
+        id SERIAL PRIMARY KEY,
+        live_id INTEGER REFERENCES lives(id) ON DELETE CASCADE,
         ip VARCHAR(100) NOT NULL,
         kick_username VARCHAR(255) DEFAULT '',
-        viewer_uid VARCHAR(100) NOT NULL,
         platform VARCHAR(50) DEFAULT 'unknown',
         os VARCHAR(50) DEFAULT 'unknown',
         os_version VARCHAR(50) DEFAULT '',
@@ -260,38 +277,25 @@ async function initDB() {
         browser_version VARCHAR(50) DEFAULT '',
         user_agent TEXT DEFAULT '',
         is_mobile BOOLEAN DEFAULT false,
-        joined_at VARCHAR(50),
-        last_seen VARCHAR(50),
+        joined_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        last_seen TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        total_seconds INTEGER DEFAULT 0,
         segments_loaded INTEGER DEFAULT 0,
         estimated_mb REAL DEFAULT 0,
         quality_history JSONB DEFAULT '[]',
         player_health JSONB DEFAULT '{}',
-        UNIQUE(streamer, date, viewer_uid)
-      )
-    `);
-
-    // Tabela de resumo diário (viewers únicos)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS daily_viewers (
-        id SERIAL PRIMARY KEY,
-        streamer VARCHAR(255) NOT NULL,
-        date VARCHAR(10) NOT NULL,
-        ip VARCHAR(100) NOT NULL,
-        kick_username VARCHAR(255) DEFAULT '',
-        first_seen VARCHAR(50),
-        last_seen VARCHAR(50),
-        total_seconds INTEGER DEFAULT 0,
-        sessions INTEGER DEFAULT 1,
-        current_uid VARCHAR(100) DEFAULT '',
-        UNIQUE(streamer, date, ip)
+        viewer_uid VARCHAR(100) NOT NULL,
+        UNIQUE(live_id, viewer_uid)
       )
     `);
 
     // Índices para queries rápidas
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_metrics_streamer_date ON live_metrics(streamer, date)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_daily_streamer_date ON daily_viewers(streamer, date)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_lives_streamer ON lives(id_streamer)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_lives_status ON lives(status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_live_viewer_sessions_live ON live_viewer_sessions(live_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_live_viewer_sessions_ip ON live_viewer_sessions(ip)`);
 
-    console.log('[DB] Tabelas streamer, live_metrics, daily_viewers prontas');
+    console.log('[DB] Tabelas streamer, lives, live_viewer_sessions prontas');
 
     const count = await pool.query('SELECT COUNT(*) FROM streamer');
     console.log(`[DB] Streamers cadastrados: ${count.rows[0].count}`);
@@ -385,6 +389,12 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
     if (CF_API_TOKEN && CF_ACCOUNT_ID && CF_KV_NAMESPACE_STREAM_PATHS) {
       stream_url = await getCachedStreamUrl(mediamtxPath);
     }
+
+    // Detectar início de live
+    if (stream_url && !activeLives[id_streamer]) {
+      await onLiveStart(id_streamer, streamer.user);
+    }
+    updateLivePeak(id_streamer, currentViewers);
 
     return res.json({
       valid: true,
@@ -619,209 +629,162 @@ app.delete('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
   }
 });
 
-// ── Metrics + Daily (in-memory + flush periódico pro PostgreSQL) ──
-const FLUSH_INTERVAL = 30000; // Flush pro banco a cada 30s
+// ══════════════════════════════════════════════
+// ── LIVES TRACKING (in-memory + flush to DB) ──
+// ══════════════════════════════════════════════
 
-// Cache em memória — operações instantâneas, sem I/O
-const metricsMemory = {}; // { "streamer_date": { viewers: { ip: { ... } } } }
-const dailyMemory = {};   // { "streamer_date": { unique_viewers: [...] } }
-const dirtyMetrics = new Set();
-const dirtyDaily = new Set();
+const FLUSH_INTERVAL = 30000; // 30s
 
-function memKey(idStreamer, date) {
-  return `${idStreamer.toLowerCase()}_${date || getBrazilDate()}`;
-}
+// Em memória: lives ativas { id_streamer: { liveId, peakViewers, viewerSessions: {} } }
+const activeLives = {};
 
-function getMetricsMem(idStreamer, date) {
-  const key = memKey(idStreamer, date);
-  if (!metricsMemory[key]) {
-    metricsMemory[key] = { streamer: idStreamer, date: date || getBrazilDate(), viewers: {} };
-  }
-  return metricsMemory[key];
-}
-
-function getDailyMem(idStreamer, date) {
-  const key = memKey(idStreamer, date);
-  if (!dailyMemory[key]) {
-    dailyMemory[key] = { streamer: idStreamer, date: date || getBrazilDate(), unique_viewers: [] };
-  }
-  return dailyMemory[key];
-}
-
-// Carregar dados do banco na memória (chamado na inicialização)
-async function loadMetricsFromDB() {
+// Detectar início de live
+async function onLiveStart(idStreamer, streamerName) {
+  if (activeLives[idStreamer]) return;
   try {
-    const today = getBrazilDate();
-
-    // Carregar métricas do dia
-    const metricsRows = await pool.query(
-      'SELECT * FROM live_metrics WHERE date = $1', [today]
+    const result = await pool.query(
+      `INSERT INTO lives (streamer, id_streamer, started_at, status) VALUES ($1, $2, NOW(), 'active') RETURNING id`,
+      [streamerName, idStreamer]
     );
-    for (const row of metricsRows.rows) {
-      const mem = getMetricsMem(row.streamer, row.date);
-      if (!mem.viewers[row.ip]) {
-        mem.viewers[row.ip] = { kick_username: row.kick_username, join_count: 0, connections: [] };
-      }
-      mem.viewers[row.ip].join_count++;
-      if (row.kick_username) mem.viewers[row.ip].kick_username = row.kick_username;
-      mem.viewers[row.ip].connections.push({
-        viewer_uid: row.viewer_uid,
-        platform: row.platform,
-        os: row.os,
-        os_version: row.os_version,
-        device_model: row.device_model,
-        browser: row.browser,
-        browser_version: row.browser_version,
-        user_agent: row.user_agent,
-        is_mobile: row.is_mobile,
-        joined_at: row.joined_at,
-        last_seen: row.last_seen,
-        segments_loaded: row.segments_loaded,
-        estimated_mb: row.estimated_mb,
-        quality_history: row.quality_history || [],
-        player_health: row.player_health || {},
-      });
-    }
-
-    // Carregar daily do dia
-    const dailyRows = await pool.query(
-      'SELECT * FROM daily_viewers WHERE date = $1', [today]
-    );
-    for (const row of dailyRows.rows) {
-      const mem = getDailyMem(row.streamer, row.date);
-      mem.unique_viewers.push({
-        ip: row.ip,
-        kick_username: row.kick_username,
-        first_seen: row.first_seen,
-        last_seen: row.last_seen,
-        total_seconds: row.total_seconds,
-        sessions: row.sessions,
-        current_uid: row.current_uid,
-      });
-    }
-
-    console.log(`[DB] Carregados ${metricsRows.rows.length} metrics e ${dailyRows.rows.length} daily do dia ${today}`);
+    const liveId = result.rows[0].id;
+    activeLives[idStreamer] = { liveId, peakViewers: 0, viewerSessions: {} };
+    console.log(`[LIVE] Iniciada: ${streamerName} (${idStreamer}) → live #${liveId}`);
   } catch (e) {
-    console.warn('[DB] Erro ao carregar metrics/daily:', e.message);
+    console.error('[LIVE] Erro ao iniciar:', e.message);
   }
 }
 
-// Flush periódico — salva dados modificados no PostgreSQL
-async function flushToDB() {
-  let metricsCount = 0;
-  let dailyCount = 0;
+// Detectar fim de live
+async function onLiveEnd(idStreamer) {
+  const live = activeLives[idStreamer];
+  if (!live) return;
+  try {
+    const uniqueIPs = new Set(Object.values(live.viewerSessions).map(s => s.ip));
 
-  // Flush metrics
-  for (const key of dirtyMetrics) {
-    const data = metricsMemory[key];
-    if (!data) continue;
+    // Buscar duração da live
+    const liveRow = await pool.query('SELECT started_at FROM lives WHERE id = $1', [live.liveId]);
+    const durationSeconds = liveRow.rows.length > 0
+      ? Math.round((Date.now() - new Date(liveRow.rows[0].started_at).getTime()) / 1000)
+      : 0;
+
+    // Calcular média de viewers (CCV): soma total_seconds / duração
+    const totalWatchSeconds = Object.values(live.viewerSessions)
+      .reduce((sum, s) => sum + (s.total_seconds || 0), 0);
+    const avgViewers = durationSeconds > 0
+      ? Math.round((totalWatchSeconds / durationSeconds) * 10) / 10
+      : 0;
+
+    await pool.query(
+      `UPDATE lives SET ended_at = NOW(), duration_seconds = $1,
+       peak_viewers = $2, total_unique_viewers = $3, avg_viewers = $4, status = 'ended' WHERE id = $5`,
+      [durationSeconds, live.peakViewers, uniqueIPs.size, avgViewers, live.liveId]
+    );
+    await flushLiveViewerSessions(live);
+    console.log(`[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} | Únicos: ${uniqueIPs.size}`);
+  } catch (e) {
+    console.error('[LIVE] Erro ao encerrar:', e.message);
+  }
+  delete activeLives[idStreamer];
+}
+
+// Flush sessões de viewer pro banco
+async function flushLiveViewerSessions(live) {
+  let count = 0;
+  for (const [viewerUid, s] of Object.entries(live.viewerSessions)) {
     try {
-      for (const [ip, viewer] of Object.entries(data.viewers)) {
-        for (const conn of viewer.connections) {
-          await pool.query(`
-            INSERT INTO live_metrics (streamer, date, ip, kick_username, viewer_uid, platform, os, os_version, device_model, browser, browser_version, user_agent, is_mobile, joined_at, last_seen, segments_loaded, estimated_mb, quality_history, player_health)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-            ON CONFLICT (streamer, date, viewer_uid) DO UPDATE SET
-              kick_username = EXCLUDED.kick_username,
-              last_seen = EXCLUDED.last_seen,
-              segments_loaded = EXCLUDED.segments_loaded,
-              estimated_mb = EXCLUDED.estimated_mb,
-              quality_history = EXCLUDED.quality_history,
-              player_health = EXCLUDED.player_health
-          `, [
-            data.streamer, data.date, ip, viewer.kick_username || '', conn.viewer_uid,
-            conn.platform, conn.os, conn.os_version, conn.device_model,
-            conn.browser, conn.browser_version, conn.user_agent, conn.is_mobile,
-            conn.joined_at, conn.last_seen, conn.segments_loaded, conn.estimated_mb,
-            JSON.stringify(conn.quality_history || []),
-            JSON.stringify(conn.player_health || {}),
-          ]);
-          metricsCount++;
-        }
-      }
+      await pool.query(`
+        INSERT INTO live_viewer_sessions (live_id, ip, kick_username, platform, os, os_version, device_model, browser, browser_version, user_agent, is_mobile, joined_at, last_seen, total_seconds, segments_loaded, estimated_mb, quality_history, player_health, viewer_uid)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        ON CONFLICT (live_id, viewer_uid) DO UPDATE SET
+          kick_username = EXCLUDED.kick_username, last_seen = EXCLUDED.last_seen,
+          total_seconds = EXCLUDED.total_seconds, segments_loaded = EXCLUDED.segments_loaded,
+          estimated_mb = EXCLUDED.estimated_mb, quality_history = EXCLUDED.quality_history,
+          player_health = EXCLUDED.player_health
+      `, [
+        live.liveId, s.ip, s.kick_username || '', s.platform || 'unknown', s.os || 'unknown',
+        s.os_version || '', s.device_model || '', s.browser || 'unknown', s.browser_version || '',
+        s.user_agent || '', s.is_mobile || false, s.joined_at, s.last_seen,
+        s.total_seconds || 0, s.segments_loaded || 0, s.estimated_mb || 0,
+        JSON.stringify(s.quality_history || []), JSON.stringify(s.player_health || {}), viewerUid,
+      ]);
+      count++;
     } catch (e) {
-      console.warn(`[FLUSH] Erro metrics ${key}:`, e.message);
+      console.warn(`[LIVE] Erro flush viewer ${viewerUid}:`, e.message);
     }
   }
-  dirtyMetrics.clear();
+  if (count > 0) console.log(`[FLUSH] Live #${live.liveId}: ${count} viewers`);
+}
 
-  // Flush daily
-  for (const key of dirtyDaily) {
-    const data = dailyMemory[key];
-    if (!data) continue;
-    try {
-      for (const v of data.unique_viewers) {
-        await pool.query(`
-          INSERT INTO daily_viewers (streamer, date, ip, kick_username, first_seen, last_seen, total_seconds, sessions, current_uid)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-          ON CONFLICT (streamer, date, ip) DO UPDATE SET
-            kick_username = EXCLUDED.kick_username,
-            last_seen = EXCLUDED.last_seen,
-            total_seconds = EXCLUDED.total_seconds,
-            sessions = EXCLUDED.sessions,
-            current_uid = EXCLUDED.current_uid
-        `, [
-          data.streamer, data.date, v.ip, v.kick_username,
-          v.first_seen, v.last_seen, v.total_seconds, v.sessions, v.current_uid,
-        ]);
-        dailyCount++;
-      }
-    } catch (e) {
-      console.warn(`[FLUSH] Erro daily ${key}:`, e.message);
-    }
-  }
-  dirtyDaily.clear();
-
-  if (metricsCount > 0 || dailyCount > 0) {
-    console.log(`[FLUSH] DB: ${metricsCount} metrics, ${dailyCount} daily`);
+// Registrar viewer na live ativa
+function trackLiveViewer(idStreamer, viewerUid, deviceInfo, ip) {
+  const live = activeLives[idStreamer];
+  if (!live) return;
+  if (!live.viewerSessions[viewerUid]) {
+    const now = getBrazilTimestamp();
+    live.viewerSessions[viewerUid] = {
+      ip, kick_username: deviceInfo?.kick_username || '',
+      platform: deviceInfo?.platform || 'unknown', os: deviceInfo?.os || 'unknown',
+      os_version: deviceInfo?.os_version || '', device_model: deviceInfo?.device_model || '',
+      browser: deviceInfo?.browser || 'unknown', browser_version: deviceInfo?.browser_version || '',
+      user_agent: deviceInfo?.user_agent || '', is_mobile: deviceInfo?.is_mobile || false,
+      joined_at: now, last_seen: now, total_seconds: 0, segments_loaded: 0, estimated_mb: 0,
+      quality_history: [], player_health: {},
+    };
   }
 }
 
-// Flush a cada 30s
-setInterval(flushToDB, FLUSH_INTERVAL);
+// Atualizar peak viewers
+function updateLivePeak(idStreamer, currentViewers) {
+  const live = activeLives[idStreamer];
+  if (live && currentViewers > live.peakViewers) live.peakViewers = currentViewers;
+}
 
-// Flush ao encerrar
-process.on('SIGTERM', async () => { await flushToDB(); process.exit(0); });
-process.on('SIGINT', async () => { await flushToDB(); process.exit(0); });
+// Verificar status das lives a cada 30s
+async function checkLiveStatus() {
+  for (const idStreamer of Object.keys(activeLives)) {
+    try {
+      const result = await pool.query(
+        'SELECT id_mediamtx FROM streamer WHERE LOWER(id_streamer) = LOWER($1)', [idStreamer]
+      );
+      if (result.rows.length === 0) continue;
+      const mediamtxPath = result.rows[0].id_mediamtx;
+      if (!mediamtxPath) continue;
+      const url = await getCachedStreamUrl(mediamtxPath);
+      if (!url) await onLiveEnd(idStreamer);
+    } catch (e) { /* ignore */ }
+  }
+  // Flush sessions das lives ativas
+  for (const live of Object.values(activeLives)) {
+    await flushLiveViewerSessions(live);
+  }
+}
 
-// POST /api/metrics/join — viewer registra entrada com device info
+// Flush a cada 30s + check live status
+setInterval(async () => {
+  await checkLiveStatus();
+}, FLUSH_INTERVAL);
+
+// Encerrar lives ativas ao desligar
+process.on('SIGTERM', async () => {
+  for (const id of Object.keys(activeLives)) await onLiveEnd(id);
+  process.exit(0);
+});
+process.on('SIGINT', async () => {
+  for (const id of Object.keys(activeLives)) await onLiveEnd(id);
+  process.exit(0);
+});
+
+// POST /api/metrics/join — viewer registra entrada
 app.post('/api/metrics/join', requireApiKey, (req, res) => {
   try {
     const { id_streamer, viewer_uid, device_info } = req.body;
     if (!id_streamer || !viewer_uid) {
       return res.status(400).json({ message: 'Campos obrigatorios: id_streamer, viewer_uid' });
     }
-
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
-      || req.headers['x-real-ip']
-      || req.socket.remoteAddress
-      || 'unknown';
-
-    const metrics = getMetricsMem(id_streamer);
-    const now = getBrazilTimestamp();
-
-    if (!metrics.viewers[ip]) {
-      metrics.viewers[ip] = { kick_username: device_info?.kick_username || '', join_count: 1, connections: [] };
-    } else {
-      metrics.viewers[ip].join_count = (metrics.viewers[ip].join_count || 1) + 1;
-      if (device_info?.kick_username) metrics.viewers[ip].kick_username = device_info.kick_username;
-    }
-
-    metrics.viewers[ip].connections.unshift({
-      viewer_uid, platform: device_info?.platform || 'unknown',
-      os: device_info?.os || 'unknown', os_version: device_info?.os_version || '',
-      device_model: device_info?.device_model || '', browser: device_info?.browser || 'unknown',
-      browser_version: device_info?.browser_version || '', user_agent: device_info?.user_agent || '',
-      is_mobile: device_info?.is_mobile || false,
-      joined_at: now, last_seen: now, segments_loaded: 0, estimated_mb: 0, quality_history: [],
-    });
-
-    console.log(`[METRICS] Viewer ${ip} (${device_info?.kick_username || '?'}) — conexão #${metrics.viewers[ip].join_count}`);
-    dirtyMetrics.add(memKey(id_streamer));
-
-    // Daily
-    trackDailyViewer(id_streamer, ip, device_info?.kick_username, viewer_uid);
-
+      || req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown';
+    trackLiveViewer(id_streamer, viewer_uid, device_info, ip);
+    console.log(`[METRICS] Viewer ${ip} (${device_info?.kick_username || '?'}) entrou em ${id_streamer}`);
     return res.json({ tracked: true });
   } catch (e) {
     console.error('[METRICS] Erro join:', e.message);
@@ -829,213 +792,38 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
   }
 });
 
-// POST /api/metrics/update — viewer envia consumo periodicamente
+// POST /api/metrics/update — viewer envia consumo
 app.post('/api/metrics/update', requireApiKey, (req, res) => {
   try {
     const { id_streamer, viewer_uid, segments_loaded, current_quality, player_health } = req.body;
     if (!id_streamer || !viewer_uid) {
       return res.status(400).json({ message: 'Campos obrigatorios' });
     }
-
-    const metrics = getMetricsMem(id_streamer);
-
-    let connection = null;
-    for (const [, viewer] of Object.entries(metrics.viewers)) {
-      if (viewer.connections) {
-        connection = viewer.connections.find(c => c.viewer_uid === viewer_uid);
-        if (connection) break;
+    const live = activeLives[id_streamer];
+    if (live && live.viewerSessions[viewer_uid]) {
+      const session = live.viewerSessions[viewer_uid];
+      const now = new Date();
+      const lastSeen = new Date(session.last_seen);
+      const diff = Math.round((now - lastSeen) / 1000);
+      if (diff > 0 && diff < 120) session.total_seconds = (session.total_seconds || 0) + diff;
+      session.last_seen = getBrazilTimestamp();
+      if (segments_loaded !== undefined) {
+        session.segments_loaded = segments_loaded;
+        session.estimated_mb = Math.round(segments_loaded * 1.2 * 10) / 10;
       }
+      if (current_quality) {
+        const qh = session.quality_history || [];
+        if (qh.length === 0 || qh[qh.length - 1].q !== current_quality) {
+          qh.push({ q: current_quality, at: getBrazilTimestamp() });
+          session.quality_history = qh;
+        }
+      }
+      if (player_health) session.player_health = player_health;
     }
-    if (!connection) return res.json({ tracked: false });
-
-    connection.last_seen = getBrazilTimestamp();
-    if (segments_loaded !== undefined) {
-      connection.segments_loaded = segments_loaded;
-      connection.estimated_mb = Math.round(segments_loaded * 1.2 * 10) / 10;
-    }
-    if (current_quality && (connection.quality_history.length === 0 || connection.quality_history[connection.quality_history.length - 1].q !== current_quality)) {
-      connection.quality_history.push({ q: current_quality, at: getBrazilTimestamp() });
-    }
-    if (player_health) connection.player_health = player_health;
-
-    dirtyMetrics.add(memKey(id_streamer));
-    updateDailyTime(id_streamer, viewer_uid);
-
+    updateLivePeak(id_streamer, getViewerCount(id_streamer));
     return res.json({ tracked: true });
   } catch (e) {
     console.error('[METRICS] Erro update:', e.message);
-    return res.status(500).json({ message: 'Erro interno' });
-  }
-});
-
-// GET /api/metrics/:id_streamer — consultar métricas
-app.get('/api/metrics/:id_streamer', requireApiKey, async (req, res) => {
-  try {
-    const { id_streamer } = req.params;
-    const date = req.query.date || getBrazilDate();
-
-    // Se é o dia atual, usa memória. Se é histórico, busca no banco.
-    let viewers;
-    if (date === getBrazilDate()) {
-      const metrics = getMetricsMem(id_streamer, date);
-      viewers = metrics.viewers;
-    } else {
-      const rows = await pool.query(
-        'SELECT * FROM live_metrics WHERE LOWER(streamer) = LOWER($1) AND date = $2', [id_streamer, date]
-      );
-      viewers = {};
-      for (const row of rows.rows) {
-        if (!viewers[row.ip]) {
-          viewers[row.ip] = { kick_username: row.kick_username, join_count: 0, connections: [] };
-        }
-        viewers[row.ip].join_count++;
-        if (row.kick_username) viewers[row.ip].kick_username = row.kick_username;
-        viewers[row.ip].connections.push({
-          viewer_uid: row.viewer_uid, platform: row.platform, os: row.os,
-          os_version: row.os_version, device_model: row.device_model,
-          browser: row.browser, browser_version: row.browser_version,
-          user_agent: row.user_agent, is_mobile: row.is_mobile,
-          joined_at: row.joined_at, last_seen: row.last_seen,
-          segments_loaded: row.segments_loaded, estimated_mb: row.estimated_mb,
-          quality_history: row.quality_history || [], player_health: row.player_health || {},
-        });
-      }
-    }
-
-    const viewerEntries = Object.entries(viewers);
-    const totalJoins = viewerEntries.reduce((sum, [, v]) => sum + (v.join_count || 1), 0);
-    const allConnections = viewerEntries.flatMap(([, v]) => v.connections || []);
-
-    return res.json({
-      streamer: id_streamer, date,
-      unique_viewers: viewerEntries.length,
-      total_joins: totalJoins,
-      total_connections: allConnections.length,
-      mobile: allConnections.filter(c => c.is_mobile).length,
-      desktop: allConnections.filter(c => !c.is_mobile).length,
-      total_estimated_mb: Math.round(allConnections.reduce((sum, c) => sum + (c.estimated_mb || 0), 0) * 10) / 10,
-      viewers,
-    });
-  } catch (e) {
-    console.error('[METRICS] Erro get:', e.message);
-    return res.status(500).json({ message: 'Erro interno' });
-  }
-});
-
-// GET /api/metrics — listar datas disponíveis
-app.get('/api/metrics', requireApiKey, async (req, res) => {
-  try {
-    const { streamer } = req.query;
-    let query = 'SELECT DISTINCT date FROM live_metrics';
-    const params = [];
-    if (streamer) {
-      query += ' WHERE LOWER(streamer) = LOWER($1)';
-      params.push(streamer);
-    }
-    query += ' ORDER BY date DESC';
-    const result = await pool.query(query, params);
-    return res.json({ streamer: streamer || 'all', dates: result.rows.map(r => r.date) });
-  } catch (e) {
-    console.error('[METRICS] Erro list:', e.message);
-    return res.status(500).json({ message: 'Erro interno' });
-  }
-});
-
-// ── Daily helpers ──
-
-function trackDailyViewer(idStreamer, ip, kickUsername, viewerUid) {
-  const daily = getDailyMem(idStreamer);
-
-  const exists = daily.unique_viewers.find(v =>
-    v.ip === ip || (kickUsername && v.kick_username && v.kick_username.toLowerCase() === kickUsername.toLowerCase())
-  );
-
-  if (exists) {
-    exists.last_seen = getBrazilTimestamp();
-    exists.sessions = (exists.sessions || 1) + 1;
-    if (kickUsername) exists.kick_username = kickUsername;
-    exists.current_uid = viewerUid;
-  } else {
-    daily.unique_viewers.push({
-      ip, kick_username: kickUsername || '',
-      first_seen: getBrazilTimestamp(), last_seen: getBrazilTimestamp(),
-      total_seconds: 0, sessions: 1, current_uid: viewerUid,
-    });
-  }
-
-  dirtyDaily.add(memKey(idStreamer));
-}
-
-function updateDailyTime(idStreamer, viewerUid) {
-  const daily = getDailyMem(idStreamer);
-  const viewer = daily.unique_viewers.find(v => v.current_uid === viewerUid);
-  if (viewer) {
-    const now = new Date();
-    const lastSeen = new Date(viewer.last_seen);
-    const diff = Math.round((now - lastSeen) / 1000);
-    if (diff > 0 && diff < 120) {
-      viewer.total_seconds = (viewer.total_seconds || 0) + diff;
-    }
-    viewer.last_seen = getBrazilTimestamp();
-    dirtyDaily.add(memKey(idStreamer));
-  }
-}
-
-// GET /api/daily/:id_streamer — resumo diário
-app.get('/api/daily/:id_streamer', requireApiKey, async (req, res) => {
-  try {
-    const { id_streamer } = req.params;
-    const date = req.query.date || getBrazilDate();
-
-    let uniqueViewers;
-    if (date === getBrazilDate()) {
-      const daily = getDailyMem(id_streamer, date);
-      uniqueViewers = daily.unique_viewers;
-    } else {
-      const rows = await pool.query(
-        'SELECT * FROM daily_viewers WHERE LOWER(streamer) = LOWER($1) AND date = $2', [id_streamer, date]
-      );
-      uniqueViewers = rows.rows.map(r => ({
-        ip: r.ip, kick_username: r.kick_username,
-        first_seen: r.first_seen, last_seen: r.last_seen,
-        total_seconds: r.total_seconds, sessions: r.sessions,
-      }));
-    }
-
-    const viewers = uniqueViewers.map(v => ({
-      ip: v.ip, kick_username: v.kick_username,
-      first_seen: v.first_seen, last_seen: v.last_seen,
-      sessions: v.sessions,
-      time_minutes: Math.round((v.total_seconds || 0) / 60 * 10) / 10,
-      time_formatted: formatTime(v.total_seconds || 0),
-    }));
-
-    return res.json({
-      streamer: id_streamer, date,
-      total_unique_viewers: uniqueViewers.length,
-      viewers,
-    });
-  } catch (e) {
-    console.error('[DAILY] Erro get:', e.message);
-    return res.status(500).json({ message: 'Erro interno' });
-  }
-});
-
-// GET /api/daily — listar datas disponíveis
-app.get('/api/daily', requireApiKey, async (req, res) => {
-  try {
-    const { streamer } = req.query;
-    let query = 'SELECT DISTINCT date FROM daily_viewers';
-    const params = [];
-    if (streamer) {
-      query += ' WHERE LOWER(streamer) = LOWER($1)';
-      params.push(streamer);
-    }
-    query += ' ORDER BY date DESC';
-    const result = await pool.query(query, params);
-    return res.json({ streamer: streamer || 'all', dates: result.rows.map(r => r.date) });
-  } catch (e) {
-    console.error('[DAILY] Erro list:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
@@ -1049,10 +837,101 @@ function formatTime(seconds) {
   return `${s}s`;
 }
 
+// GET /api/lives/:id_streamer — listar lives
+app.get('/api/lives/:id_streamer', requireApiKey, async (req, res) => {
+  try {
+    const { id_streamer } = req.params;
+    const limit = parseInt(req.query.limit) || 20;
+    const result = await pool.query(
+      `SELECT id, streamer, id_streamer, started_at, ended_at, duration_seconds,
+              peak_viewers, total_unique_viewers, avg_viewers, status
+       FROM lives WHERE LOWER(id_streamer) = LOWER($1)
+       ORDER BY started_at DESC LIMIT $2`, [id_streamer, limit]
+    );
+    const lives = result.rows.map(r => ({
+      id: r.id, streamer: r.streamer, started_at: r.started_at, ended_at: r.ended_at,
+      duration: formatTime(r.duration_seconds || 0), duration_seconds: r.duration_seconds,
+      peak_viewers: r.peak_viewers, total_unique_viewers: r.total_unique_viewers,
+      avg_viewers: r.avg_viewers || 0, status: r.status,
+    }));
+    return res.json({ streamer: id_streamer, total: lives.length, lives });
+  } catch (e) {
+    console.error('[LIVES] Erro list:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// GET /api/lives/:id_streamer/:live_id — detalhes de uma live
+app.get('/api/lives/:id_streamer/:live_id', requireApiKey, async (req, res) => {
+  try {
+    const { id_streamer, live_id } = req.params;
+    const liveResult = await pool.query(
+      'SELECT * FROM lives WHERE id = $1 AND LOWER(id_streamer) = LOWER($2)', [live_id, id_streamer]
+    );
+    if (liveResult.rows.length === 0) return res.status(404).json({ message: 'Live nao encontrada' });
+    const live = liveResult.rows[0];
+    const viewersResult = await pool.query(
+      `SELECT ip, kick_username, platform, os, os_version, device_model, browser, browser_version,
+              user_agent, is_mobile, joined_at, last_seen, total_seconds, segments_loaded, estimated_mb,
+              quality_history, player_health
+       FROM live_viewer_sessions WHERE live_id = $1 ORDER BY joined_at ASC`, [live_id]
+    );
+    const viewers = viewersResult.rows.map(v => ({
+      ip: v.ip, kick_username: v.kick_username, platform: v.platform, os: v.os,
+      device_model: v.device_model, browser: v.browser, is_mobile: v.is_mobile,
+      joined_at: v.joined_at, last_seen: v.last_seen,
+      time_formatted: formatTime(v.total_seconds || 0), total_seconds: v.total_seconds,
+      segments_loaded: v.segments_loaded, estimated_mb: v.estimated_mb,
+      quality_history: v.quality_history, player_health: v.player_health,
+    }));
+    return res.json({
+      live: {
+        id: live.id, streamer: live.streamer, started_at: live.started_at, ended_at: live.ended_at,
+        duration: formatTime(live.duration_seconds || 0), duration_seconds: live.duration_seconds,
+        peak_viewers: live.peak_viewers, total_unique_viewers: live.total_unique_viewers,
+        avg_viewers: live.avg_viewers || 0, status: live.status,
+      },
+      viewers: {
+        total: viewers.length,
+        mobile: viewers.filter(v => v.is_mobile).length,
+        desktop: viewers.filter(v => !v.is_mobile).length,
+        list: viewers,
+      },
+    });
+  } catch (e) {
+    console.error('[LIVES] Erro detail:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// Restaurar lives ativas do banco (se API reiniciou durante uma live)
+async function restoreActiveLives() {
+  try {
+    const result = await pool.query("SELECT * FROM lives WHERE status = 'active'");
+    for (const row of result.rows) {
+      activeLives[row.id_streamer] = { liveId: row.id, peakViewers: row.peak_viewers || 0, viewerSessions: {} };
+      const sessions = await pool.query('SELECT * FROM live_viewer_sessions WHERE live_id = $1', [row.id]);
+      for (const s of sessions.rows) {
+        activeLives[row.id_streamer].viewerSessions[s.viewer_uid] = {
+          ip: s.ip, kick_username: s.kick_username, platform: s.platform, os: s.os,
+          os_version: s.os_version, device_model: s.device_model, browser: s.browser,
+          browser_version: s.browser_version, user_agent: s.user_agent, is_mobile: s.is_mobile,
+          joined_at: s.joined_at, last_seen: s.last_seen, total_seconds: s.total_seconds,
+          segments_loaded: s.segments_loaded, estimated_mb: s.estimated_mb,
+          quality_history: s.quality_history || [], player_health: s.player_health || {},
+        };
+      }
+      console.log(`[LIVE] Restaurada: ${row.streamer} (${row.id_streamer}) → live #${row.id} | ${sessions.rows.length} viewers`);
+    }
+  } catch (e) {
+    console.warn('[LIVE] Erro ao restaurar lives:', e.message);
+  }
+}
+
 // ── Start ──
 const PORT = process.env.PORT || 3000;
 
-initDB().then(() => loadMetricsFromDB()).then(() => {
+initDB().then(() => restoreActiveLives()).then(() => {
   app.listen(PORT, () => {
     console.log(`[SERVER] API rodando na porta ${PORT}`);
     console.log(`[SERVER] Endpoints disponíveis:`);
@@ -1066,5 +945,9 @@ initDB().then(() => loadMetricsFromDB()).then(() => {
     console.log(`   POST   /api/viewer/heartbeat`);
     console.log(`   POST   /api/viewer/leave`);
     console.log(`   GET    /api/viewer/count/:id_streamer`);
+    console.log(`   POST   /api/metrics/join`);
+    console.log(`   POST   /api/metrics/update`);
+    console.log(`   GET    /api/lives/:id_streamer`);
+    console.log(`   GET    /api/lives/:id_streamer/:live_id`);
   });
 });
