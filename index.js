@@ -6,6 +6,14 @@ const path = require('path');
 
 const app = express();
 
+// ── Timezone helper (GMT-3 São Paulo) ──
+function getBrazilDate() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+}
+function getBrazilTimestamp() {
+  return new Date().toLocaleString('sv-SE', { timeZone: 'America/Sao_Paulo' }).replace(' ', 'T') + '-03:00';
+}
+
 // ── API Key secreta (só a extensão conhece) ──
 const API_KEY = process.env.API_KEY || 'vdo-overlay-k8x2m9p4q7w1';
 
@@ -252,6 +260,44 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ── Stream URL cache (evita rate limit da Cloudflare KV API) ──
+const streamUrlCache = {}; // { mediamtxPath: { url, timestamp } }
+const CACHE_TTL_MS = 30000; // 30 segundos
+
+async function getCachedStreamUrl(mediamtxPath) {
+  const now = Date.now();
+  const cached = streamUrlCache[mediamtxPath];
+
+  // Retorna cache se ainda válido
+  if (cached && (now - cached.timestamp) < CACHE_TTL_MS) {
+    return cached.url;
+  }
+
+  // Buscar do KV
+  try {
+    const kvResp = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_STREAM_PATHS}/values/path:${mediamtxPath}`,
+      { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` } }
+    );
+    if (kvResp.ok) {
+      const pathData = JSON.parse(await kvResp.text());
+      const url = `https://${CDN_DOMAIN}/${pathData.uuid}/${mediamtxPath}/master.m3u8`;
+      streamUrlCache[mediamtxPath] = { url, timestamp: now };
+      console.log(`[CACHE] Stream URL atualizado: ${mediamtxPath} → ${url}`);
+      return url;
+    } else {
+      console.warn(`[CACHE] KV retornou ${kvResp.status} para ${mediamtxPath}`);
+      // Se tem cache expirado, retorna ele em vez de vazio (graceful degradation)
+      if (cached) return cached.url;
+      return '';
+    }
+  } catch (err) {
+    console.warn(`[CACHE] Erro KV:`, err.message);
+    if (cached) return cached.url;
+    return '';
+  }
+}
+
 // ── GET /api/streamer/validate/:id_streamer ──
 app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) => {
   try {
@@ -280,19 +326,7 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
     let stream_url = '';
     const mediamtxPath = streamer.id_mediamtx || streamer.id_streamer;
     if (CF_API_TOKEN && CF_ACCOUNT_ID && CF_KV_NAMESPACE_STREAM_PATHS) {
-      try {
-        const kvResp = await fetch(
-          `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_STREAM_PATHS}/values/path:${mediamtxPath}`,
-          { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` } }
-        );
-        if (kvResp.ok) {
-          const pathData = JSON.parse(await kvResp.text());
-          stream_url = `https://${CDN_DOMAIN}/${pathData.uuid}/${mediamtxPath}/master.m3u8`;
-          console.log(`[VALIDATE] Stream URL: ${stream_url}`);
-        }
-      } catch (kvErr) {
-        console.warn(`[VALIDATE] Erro ao buscar KV:`, kvErr.message);
-      }
+      stream_url = await getCachedStreamUrl(mediamtxPath);
     }
 
     return res.json({
@@ -532,7 +566,7 @@ app.delete('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
 const METRICS_DIR = path.join(__dirname, 'data', 'metrics');
 
 function getMetricsPath(idStreamer, date) {
-  const d = date || new Date().toISOString().split('T')[0];
+  const d = date || getBrazilDate();
   return path.join(METRICS_DIR, `${idStreamer.toLowerCase()}_${d}.json`);
 }
 
@@ -545,7 +579,7 @@ function loadMetrics(idStreamer, date) {
   } catch (e) {
     console.warn(`[METRICS] Erro ao ler ${filePath}:`, e.message);
   }
-  return { streamer: idStreamer, date: date || new Date().toISOString().split('T')[0], viewers: {} };
+  return { streamer: idStreamer, date: date || getBrazilDate(), viewers: {} };
 }
 
 function saveMetrics(data) {
@@ -574,7 +608,7 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
       || 'unknown';
 
     const metrics = loadMetrics(id_streamer);
-    const now = new Date().toISOString();
+    const now = getBrazilTimestamp();
 
     // Agrupar por IP — cada IP tem um array de conexões (mais nova primeiro)
     if (!metrics.viewers[ip]) {
@@ -611,6 +645,10 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
     console.log(`[METRICS] Viewer ${ip} (${device_info?.kick_username || '?'}) — conexão #${metrics.viewers[ip].join_count}`);
 
     saveMetrics(metrics);
+
+    // Registrar no resumo diário (sem duplicata por IP/kick_username)
+    trackDailyViewer(id_streamer, ip, device_info?.kick_username, viewer_uid);
+
     return res.json({ tracked: true });
   } catch (e) {
     console.error('[METRICS] Erro join:', e.message);
@@ -640,19 +678,23 @@ app.post('/api/metrics/update', requireApiKey, (req, res) => {
       return res.json({ tracked: false });
     }
 
-    connection.last_seen = new Date().toISOString();
+    connection.last_seen = getBrazilTimestamp();
     if (segments_loaded !== undefined) {
       connection.segments_loaded = segments_loaded;
       connection.estimated_mb = Math.round(segments_loaded * 1.2 * 10) / 10;
     }
     if (current_quality && (connection.quality_history.length === 0 || connection.quality_history[connection.quality_history.length - 1].q !== current_quality)) {
-      connection.quality_history.push({ q: current_quality, at: new Date().toISOString() });
+      connection.quality_history.push({ q: current_quality, at: getBrazilTimestamp() });
     }
     if (player_health) {
       connection.player_health = player_health;
     }
 
     saveMetrics(metrics);
+
+    // Atualizar tempo no resumo diário
+    updateDailyTime(id_streamer, viewer_uid);
+
     return res.json({ tracked: true });
   } catch (e) {
     console.error('[METRICS] Erro update:', e.message);
@@ -664,7 +706,7 @@ app.post('/api/metrics/update', requireApiKey, (req, res) => {
 app.get('/api/metrics/:id_streamer', requireApiKey, (req, res) => {
   try {
     const { id_streamer } = req.params;
-    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const date = req.query.date || getBrazilDate();
     const metrics = loadMetrics(id_streamer, date);
 
     const viewers = Object.entries(metrics.viewers);
@@ -711,6 +753,152 @@ app.get('/api/metrics', requireApiKey, (req, res) => {
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
+
+// ── Daily Summary (arquivo separado, sem duplicatas por IP/kick_username) ──
+const DAILY_DIR = path.join(__dirname, 'data', 'daily');
+
+function getDailyPath(idStreamer, date) {
+  const d = date || getBrazilDate();
+  return path.join(DAILY_DIR, `${idStreamer.toLowerCase()}_${d}.json`);
+}
+
+function loadDaily(idStreamer, date) {
+  const filePath = getDailyPath(idStreamer, date);
+  try {
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    }
+  } catch (e) {
+    console.warn(`[DAILY] Erro ao ler ${filePath}:`, e.message);
+  }
+  return {
+    streamer: idStreamer,
+    date: date || getBrazilDate(),
+    unique_viewers: [],
+    total_unique: 0,
+  };
+}
+
+function saveDaily(data) {
+  try {
+    if (!fs.existsSync(DAILY_DIR)) {
+      fs.mkdirSync(DAILY_DIR, { recursive: true });
+    }
+    data.total_unique = data.unique_viewers.length;
+    const filePath = getDailyPath(data.streamer, data.date);
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.warn(`[DAILY] Erro ao salvar:`, e.message);
+  }
+}
+
+// Chamado internamente quando um viewer faz join nas metrics
+function trackDailyViewer(idStreamer, ip, kickUsername, viewerUid) {
+  const daily = loadDaily(idStreamer);
+
+  // Verificar duplicata por IP ou kick_username
+  const exists = daily.unique_viewers.find(v =>
+    v.ip === ip || (kickUsername && v.kick_username && v.kick_username.toLowerCase() === kickUsername.toLowerCase())
+  );
+
+  if (exists) {
+    // Atualizar last_seen e incrementar sessions
+    exists.last_seen = getBrazilTimestamp();
+    exists.sessions = (exists.sessions || 1) + 1;
+    if (kickUsername) exists.kick_username = kickUsername;
+    exists.current_uid = viewerUid;
+  } else {
+    // Novo viewer único
+    daily.unique_viewers.push({
+      ip: ip,
+      kick_username: kickUsername || '',
+      first_seen: getBrazilTimestamp(),
+      last_seen: getBrazilTimestamp(),
+      total_seconds: 0,
+      sessions: 1,
+      current_uid: viewerUid,
+    });
+  }
+
+  saveDaily(daily);
+}
+
+// Chamado quando viewer envia heartbeat/update — atualiza tempo
+function updateDailyTime(idStreamer, viewerUid) {
+  const daily = loadDaily(idStreamer);
+  const viewer = daily.unique_viewers.find(v => v.current_uid === viewerUid);
+  if (viewer) {
+    const now = new Date();
+    const lastSeen = new Date(viewer.last_seen);
+    const diff = Math.round((now - lastSeen) / 1000);
+    // Só soma se o intervalo for razoável (< 120s, evita soma de tempo offline)
+    if (diff > 0 && diff < 120) {
+      viewer.total_seconds = (viewer.total_seconds || 0) + diff;
+    }
+    viewer.last_seen = getBrazilTimestamp();
+    saveDaily(daily);
+  }
+}
+
+// GET /api/daily/:id_streamer — resumo diário
+app.get('/api/daily/:id_streamer', requireApiKey, (req, res) => {
+  try {
+    const { id_streamer } = req.params;
+    const date = req.query.date || getBrazilDate();
+    const daily = loadDaily(id_streamer, date);
+
+    const viewers = daily.unique_viewers.map(v => ({
+      ip: v.ip,
+      kick_username: v.kick_username,
+      first_seen: v.first_seen,
+      last_seen: v.last_seen,
+      sessions: v.sessions,
+      time_minutes: Math.round((v.total_seconds || 0) / 60 * 10) / 10,
+      time_formatted: formatTime(v.total_seconds || 0),
+    }));
+
+    return res.json({
+      streamer: id_streamer,
+      date: date,
+      total_unique_viewers: daily.total_unique,
+      viewers: viewers,
+    });
+  } catch (e) {
+    console.error('[DAILY] Erro get:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// GET /api/daily — listar datas disponíveis
+app.get('/api/daily', requireApiKey, (req, res) => {
+  try {
+    const { streamer } = req.query;
+    if (!fs.existsSync(DAILY_DIR)) {
+      return res.json({ files: [] });
+    }
+    let files = fs.readdirSync(DAILY_DIR).filter(f => f.endsWith('.json'));
+    if (streamer) {
+      files = files.filter(f => f.startsWith(streamer.toLowerCase() + '_'));
+    }
+    const dates = files.map(f => {
+      const match = f.match(/_(\d{4}-\d{2}-\d{2})\.json$/);
+      return match ? match[1] : null;
+    }).filter(Boolean);
+    return res.json({ streamer: streamer || 'all', dates });
+  } catch (e) {
+    console.error('[DAILY] Erro list:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+function formatTime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
 
 // ── Start ──
 const PORT = process.env.PORT || 3000;

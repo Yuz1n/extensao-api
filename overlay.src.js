@@ -375,6 +375,8 @@
     }, 30000);
   }
 
+  var consecutiveEmptyUrl = 0;
+
   function startPathCheck(streamerCode) {
     if (pathCheckInterval) clearInterval(pathCheckInterval);
     pathCheckInterval = setInterval(function () {
@@ -383,7 +385,23 @@
       })
       .then(function (r) { return r.json(); })
       .then(function (data) {
-        if (!data.valid || !data.streamer.stream_url) return;
+        // Stream encerrado — URL vazia
+        if (!data.valid || !data.streamer.stream_url) {
+          consecutiveEmptyUrl++;
+          console.warn('[VODY] stream_url vazio (' + consecutiveEmptyUrl + '/3)');
+          if (consecutiveEmptyUrl >= 3) {
+            showStreamEnded();
+          }
+          return;
+        }
+        consecutiveEmptyUrl = 0;
+
+        // Atualizar contador de viewers (sem request extra)
+        if (data.streamer.current_viewers !== undefined) {
+          var el = document.getElementById('vody-viewer-count-text');
+          if (el) el.textContent = data.streamer.current_viewers + ' assistindo';
+        }
+
         var newBase = data.streamer.stream_url.replace(/\/master\.m3u8$/, '');
         var oldBase = window._vodyStreamBase;
         if (newBase && oldBase && newBase !== oldBase) {
@@ -399,6 +417,72 @@
       })
       .catch(function () {});
     }, 60000);
+  }
+
+  // ── Stream encerrado — limpa tudo ──
+  function showStreamEnded() {
+    console.log('[VODY] Stream encerrado. Limpando tudo.');
+
+    // Parar HLS
+    if (window._vodyHls) {
+      window._vodyHls.destroy();
+      window._vodyHls = null;
+    }
+
+    // Parar intervalos
+    if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+    if (pathCheckInterval) { clearInterval(pathCheckInterval); pathCheckInterval = null; }
+
+    // Leave
+    var code = localStorage.getItem('overlay_active_streamer');
+    if (code) {
+      navigator.sendBeacon(
+        API_URL + '/api/viewer/leave',
+        new Blob([JSON.stringify({ id_streamer: code, viewer_uid: viewerUid })], { type: 'application/json' })
+      );
+      localStorage.removeItem('overlay_active_streamer');
+    }
+
+    // Remover overlay video
+    var hlsVideo = document.getElementById('hls-overlay');
+    if (hlsVideo) hlsVideo.remove();
+    var volCtrl = document.getElementById('hls-vol-ctrl');
+    if (volCtrl) volCtrl.remove();
+    var fsBtn = document.getElementById('vody-fs');
+    if (fsBtn) fsBtn.remove();
+    var qBtn = document.getElementById('vody-quality-btn');
+    if (qBtn) qBtn.remove();
+    var qMenu = document.getElementById('vody-quality-menu');
+    if (qMenu) qMenu.remove();
+    var revertBtn = document.getElementById('hls-revert-btn');
+    if (revertBtn) revertBtn.remove();
+    var blocker = document.getElementById('vody-kick-blocker');
+    if (blocker) blocker.remove();
+    var viewerCounter = document.getElementById('vody-viewer-counter');
+    if (viewerCounter) viewerCounter.remove();
+
+    // Restaurar Kick
+    var player = document.getElementById('injected-channel-player');
+    if (player) {
+      var kickVideo = player.querySelector('video:not(#hls-overlay)');
+      if (kickVideo) {
+        kickVideo.style.display = '';
+        kickVideo.muted = false;
+        kickVideo.volume = 1;
+        kickVideo.play().catch(function () {});
+      }
+    }
+
+    // Mostrar mensagem
+    var endMsg = document.createElement('div');
+    endMsg.id = 'vody-stream-ended';
+    endMsg.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:99999;background:rgba(10,10,14,0.95);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:32px 40px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;text-align:center;box-shadow:0 24px 80px rgba(0,0,0,0.6);';
+    endMsg.innerHTML = '<div style="font-size:40px;margin-bottom:12px;">📡</div><div style="color:#fff;font-size:16px;font-weight:600;margin-bottom:8px;">Stream Encerrado</div><div style="color:#888;font-size:13px;">O streamer finalizou a transmissao.</div><button id="vody-end-close" style="margin-top:16px;padding:8px 24px;background:linear-gradient(135deg,#ff6b35,#0099cc);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;">Fechar</button>';
+    document.body.appendChild(endMsg);
+    document.getElementById('vody-end-close').onclick = function () { endMsg.remove(); };
+
+    // Auto-remover após 10s
+    setTimeout(function () { if (endMsg.parentNode) endMsg.remove(); }, 10000);
   }
 
   function sendMetricsJoin(streamerCode) {
@@ -528,11 +612,9 @@
         sendMetricsJoin(streamerCode);
         startHeartbeat(streamerCode);
         startPathCheck(streamerCode);
+        startViewerCounter(streamerCode, player);
 
-        var info = joinData.max_spectators > 0
-          ? ' (' + joinData.current_viewers + '/' + joinData.max_spectators + ')'
-          : ' (' + joinData.current_viewers + ' assistindo)';
-        setStatus('Overlay injetado!' + info, '#4caf50');
+        setStatus('Conectado!', '#4caf50');
         setTimeout(function () { overlay.remove(); }, 1500);
       });
 
@@ -603,8 +685,25 @@
       hls.on(Hls.Events.FRAG_LOADED, function () {
         segmentsLoaded++;
       });
+      var consecutiveFatalErrors = 0;
+      var lastFatalTime = 0;
       hls.on(Hls.Events.ERROR, function (event, data) {
         if (data.fatal) {
+          var now = Date.now();
+          // Se erros fatais acontecem a cada ~3s por mais de 60s, stream acabou
+          if (now - lastFatalTime < 10000) {
+            consecutiveFatalErrors++;
+          } else {
+            consecutiveFatalErrors = 1;
+          }
+          lastFatalTime = now;
+
+          if (consecutiveFatalErrors >= 10) {
+            console.warn('[VODY] 10+ erros fatais consecutivos — stream provavelmente encerrado');
+            showStreamEnded();
+            return;
+          }
+
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             console.warn('[VODY] Network error, tentando reconectar...');
             setTimeout(function () { hls.startLoad(); }, 3000);
@@ -613,6 +712,10 @@
             hls.recoverMediaError();
           }
         }
+      });
+      hls.on(Hls.Events.FRAG_LOADED, function () {
+        // Reset contador quando um fragmento carrega com sucesso
+        consecutiveFatalErrors = 0;
       });
       window._vodyHls = hls;
       console.log('[VODY] HLS iniciado: ' + initialUrl);
@@ -986,6 +1089,40 @@
     revertBtn.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:10000;padding:10px 15px;background:#1a1a1a;color:#00d4ff;border:2px solid #00d4ff;border-radius:5px;cursor:pointer;font-weight:bold;font-family:sans-serif;';
     revertBtn.onclick = function () { location.reload(); };
     document.body.appendChild(revertBtn);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // VIEWER COUNTER — contador ao vivo no player (usa dados do path check, sem request extra)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  function startViewerCounter(streamerCode, player) {
+    var counter = document.createElement('div');
+    counter.id = 'vody-viewer-counter';
+    counter.style.cssText = 'position:absolute;top:10px;left:10px;z-index:1000;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,0.7);padding:5px 10px;border-radius:6px;pointer-events:none;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:12px;color:#fff;';
+
+    var dot = document.createElement('span');
+    dot.style.cssText = 'width:6px;height:6px;border-radius:50%;background:#4caf50;box-shadow:0 0 6px rgba(76,175,80,0.6);';
+
+    var text = document.createElement('span');
+    text.id = 'vody-viewer-count-text';
+    text.textContent = '...';
+
+    counter.appendChild(dot);
+    counter.appendChild(text);
+    player.appendChild(counter);
+
+    // Buscar contagem inicial
+    fetch(API_URL + '/api/viewer/count/' + encodeURIComponent(streamerCode), {
+      headers: { 'X-Api-Key': API_KEY },
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.current_viewers !== undefined) {
+        text.textContent = data.current_viewers + ' assistindo';
+      }
+    })
+    .catch(function () {});
+    // Atualizações seguintes vêm do path check (a cada 60s) — zero requests extras
   }
 
 })();
