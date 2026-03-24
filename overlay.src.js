@@ -112,16 +112,16 @@
     '#hls-overlay:-webkit-full-screen{width:100vw!important;height:100vh!important;object-fit:contain;}',
     '#hls-overlay:fullscreen{width:100vw!important;height:100vh!important;object-fit:contain;}',
     // Quality selector
-    '#vody-quality-wrap{position:relative;display:inline-block;}',
-    '#vody-quality-btn{background:none;border:none;color:#fff;font-size:18px;cursor:pointer;padding:4px 8px;line-height:1;min-width:32px;min-height:32px;}',
-    '#vody-quality-menu{display:none;position:absolute;bottom:40px;left:50%;transform:translateX(-50%);',
+    '#stream-quality-wrap{position:relative;display:inline-block;}',
+    '#stream-quality-btn{background:none;border:none;color:#fff;font-size:18px;cursor:pointer;padding:4px 8px;line-height:1;min-width:32px;min-height:32px;}',
+    '#stream-quality-menu{display:none;position:absolute;bottom:40px;left:50%;transform:translateX(-50%);',
     'background:rgba(0,0,0,0.9);border:1px solid rgba(255,255,255,0.15);border-radius:8px;',
     'padding:4px 0;min-width:100px;z-index:1001;pointer-events:auto;}',
-    '#vody-quality-menu.open{display:block;}',
-    '#vody-quality-menu button{display:block;width:100%;padding:12px 20px;background:none;border:none;',
+    '#stream-quality-menu.open{display:block;}',
+    '#stream-quality-menu button{display:block;width:100%;padding:12px 20px;background:none;border:none;',
     'color:#ccc;font-size:14px;cursor:pointer;text-align:left;white-space:nowrap;}',
-    '#vody-quality-menu button:hover{background:rgba(255,255,255,0.1);color:#fff;}',
-    '#vody-quality-menu button.active{color:#00d4ff;font-weight:700;}',
+    '#stream-quality-menu button:hover{background:rgba(255,255,255,0.1);color:#fff;}',
+    '#stream-quality-menu button.active{color:#00d4ff;font-weight:700;}',
   ].join('\n');
   document.head.appendChild(uiStyle);
 
@@ -388,7 +388,7 @@
         // Stream encerrado — URL vazia
         if (!data.valid || !data.streamer.stream_url) {
           consecutiveEmptyUrl++;
-          console.warn('[VODY] stream_url vazio (' + consecutiveEmptyUrl + '/3)');
+          console.warn('[STREAM] stream_url vazio (' + consecutiveEmptyUrl + '/3)');
           if (consecutiveEmptyUrl >= 3) {
             showStreamEnded();
           }
@@ -398,20 +398,20 @@
 
         // Atualizar contador de viewers (sem request extra)
         if (data.streamer.current_viewers !== undefined) {
-          var el = document.getElementById('vody-viewer-count-text');
+          var el = document.getElementById('stream-viewer-count-text');
           if (el) el.textContent = data.streamer.current_viewers + ' assistindo';
         }
 
         var newBase = data.streamer.stream_url.replace(/\/master\.m3u8$/, '');
         var oldBase = window._vodyStreamBase;
         if (newBase && oldBase && newBase !== oldBase) {
-          console.log('[VODY] UUID rotacionou, reconectando...');
+          console.log('[STREAM] UUID rotacionou, reconectando...');
           window._vodyStreamBase = newBase;
           var hls = window._vodyHls;
           if (hls) {
             var quality = window._vodyCurrentQuality || '720p';
             hls.loadSource(newBase + '/' + quality + '/stream.m3u8');
-            console.log('[VODY] Reconectado: ' + newBase);
+            console.log('[STREAM] Reconectado: ' + newBase);
           }
         }
       })
@@ -421,7 +421,7 @@
 
   // ── Stream encerrado — limpa tudo ──
   function showStreamEnded() {
-    console.log('[VODY] Stream encerrado. Limpando tudo.');
+    console.log('[STREAM] Stream encerrado. Limpando tudo.');
 
     // Parar HLS
     if (window._vodyHls) {
@@ -448,17 +448,15 @@
     if (hlsVideo) hlsVideo.remove();
     var volCtrl = document.getElementById('hls-vol-ctrl');
     if (volCtrl) volCtrl.remove();
-    var fsBtn = document.getElementById('vody-fs');
+    var fsBtn = document.getElementById('stream-fs');
     if (fsBtn) fsBtn.remove();
-    var qBtn = document.getElementById('vody-quality-btn');
+    var qBtn = document.getElementById('stream-quality-btn');
     if (qBtn) qBtn.remove();
-    var qMenu = document.getElementById('vody-quality-menu');
+    var qMenu = document.getElementById('stream-quality-menu');
     if (qMenu) qMenu.remove();
-    var revertBtn = document.getElementById('hls-revert-btn');
-    if (revertBtn) revertBtn.remove();
-    var blocker = document.getElementById('vody-kick-blocker');
+    var blocker = document.getElementById('stream-kick-blocker');
     if (blocker) blocker.remove();
-    var viewerCounter = document.getElementById('vody-viewer-counter');
+    var viewerCounter = document.getElementById('stream-viewer-counter');
     if (viewerCounter) viewerCounter.remove();
 
     // Restaurar Kick
@@ -475,11 +473,11 @@
 
     // Mostrar mensagem
     var endMsg = document.createElement('div');
-    endMsg.id = 'vody-stream-ended';
+    endMsg.id = 'stream-stream-ended';
     endMsg.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:99999;background:rgba(10,10,14,0.95);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:32px 40px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;text-align:center;box-shadow:0 24px 80px rgba(0,0,0,0.6);';
-    endMsg.innerHTML = '<div style="font-size:40px;margin-bottom:12px;">📡</div><div style="color:#fff;font-size:16px;font-weight:600;margin-bottom:8px;">Stream Encerrado</div><div style="color:#888;font-size:13px;">O streamer finalizou a transmissao.</div><button id="vody-end-close" style="margin-top:16px;padding:8px 24px;background:linear-gradient(135deg,#ff6b35,#0099cc);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;">Fechar</button>';
+    endMsg.innerHTML = '<div style="font-size:40px;margin-bottom:12px;">📡</div><div style="color:#fff;font-size:16px;font-weight:600;margin-bottom:8px;">Stream Encerrado</div><div style="color:#888;font-size:13px;">O streamer finalizou a transmissao.</div><button id="stream-end-close" style="margin-top:16px;padding:8px 24px;background:linear-gradient(135deg,#ff6b35,#0099cc);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;">Fechar</button>';
     document.body.appendChild(endMsg);
-    document.getElementById('vody-end-close').onclick = function () { endMsg.remove(); };
+    document.getElementById('stream-end-close').onclick = function () { endMsg.remove(); };
 
     // Auto-remover após 10s
     setTimeout(function () { if (endMsg.parentNode) endMsg.remove(); }, 10000);
@@ -619,7 +617,7 @@
       });
 
     } catch (e) {
-      console.error('[VODY] Erro:', e);
+      console.error('[STREAM] Erro:', e);
       setStatus('Erro de conexao com o servidor', '#f44336');
       btn.disabled = false;
       btn.textContent = 'Conectar';
@@ -699,16 +697,16 @@
           lastFatalTime = now;
 
           if (consecutiveFatalErrors >= 10) {
-            console.warn('[VODY] 10+ erros fatais consecutivos — stream provavelmente encerrado');
+            console.warn('[STREAM] 10+ erros fatais consecutivos — stream provavelmente encerrado');
             showStreamEnded();
             return;
           }
 
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            console.warn('[VODY] Network error, tentando reconectar...');
+            console.warn('[STREAM] Network error, tentando reconectar...');
             setTimeout(function () { hls.startLoad(); }, 3000);
           } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-            console.warn('[VODY] Media error, recuperando...');
+            console.warn('[STREAM] Media error, recuperando...');
             hls.recoverMediaError();
           }
         }
@@ -718,7 +716,7 @@
         consecutiveFatalErrors = 0;
       });
       window._vodyHls = hls;
-      console.log('[VODY] HLS iniciado: ' + initialUrl);
+      console.log('[STREAM] HLS iniciado: ' + initialUrl);
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       // Safari / iOS — HLS nativo
       window._vodyIsNativeHLS = true;
@@ -752,7 +750,7 @@
         }
       });
 
-      console.log('[VODY] HLS nativo (Safari): ' + initialUrl);
+      console.log('[STREAM] HLS nativo (Safari): ' + initialUrl);
     }
   }
 
@@ -763,8 +761,6 @@
   function injectDesktop(player, kickVideo, streamUrl) {
     var old = document.getElementById('hls-overlay');
     if (old) old.remove();
-    var oldBtn = document.getElementById('hls-revert-btn');
-    if (oldBtn) oldBtn.remove();
 
     // Tenta mudar Kick pra 160p
     setTimeout(function () { trySet160p(player); }, 3000);
@@ -783,7 +779,6 @@
 
     createVolumeControls(video, player, false);
     createFullscreenButton(video, player);
-    createRevertButton();
 
     startHLS(video, streamUrl);
     setupPlayerHealthTracking(video);
@@ -802,8 +797,6 @@
   function injectMobile(player, kickVideo, streamUrl) {
     var old = document.getElementById('hls-overlay');
     if (old) old.remove();
-    var oldBtn = document.getElementById('hls-revert-btn');
-    if (oldBtn) oldBtn.remove();
 
     // Espera Kick carregar e pausa
     var checkCount = 0;
@@ -827,15 +820,15 @@
   function doInjectMobile(player, streamUrl) {
     // Bloqueador de interação com Kick
     var blocker = document.createElement('div');
-    blocker.id = 'vody-kick-blocker';
+    blocker.id = 'stream-kick-blocker';
     blocker.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;z-index:998;background:transparent;pointer-events:auto;';
     player.appendChild(blocker);
 
     // Esconde controles do Kick
     var css = document.createElement('style');
     css.textContent = [
-      '#injected-channel-player button:not(#vody-fs):not(#vody-mute):not(#vody-quality-btn):not(#vody-quality-menu button){pointer-events:none!important;opacity:0!important;}',
-      '#vody-quality-menu button{pointer-events:auto!important;opacity:1!important;}',
+      '#injected-channel-player button:not(#stream-fs):not(#stream-mute):not(#stream-quality-btn):not(#stream-quality-menu button){pointer-events:none!important;opacity:0!important;}',
+      '#stream-quality-menu button{pointer-events:auto!important;opacity:1!important;}',
       '#injected-channel-player [class*="controls"]{pointer-events:none!important;opacity:0!important;}',
       '#injected-channel-player [class*="overlay-container"]{pointer-events:none!important;}',
     ].join('');
@@ -854,7 +847,6 @@
 
     createVolumeControls(video, player, true);
     createFullscreenButton(video, player);
-    createRevertButton();
 
     startHLS(video, streamUrl);
     setupPlayerHealthTracking(video);
@@ -900,7 +892,7 @@
           for (var j = 0; j < options.length; j++) {
             if (options[j].textContent.includes('160')) {
               options[j].click();
-              console.log('[VODY] Kick mudado pra 160p');
+              console.log('[STREAM] Kick mudado pra 160p');
               return;
             }
           }
@@ -919,7 +911,7 @@
     volWrap.style.cssText = 'position:absolute;bottom:12px;left:12px;z-index:1000;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,0.7);padding:6px 10px;border-radius:6px;pointer-events:auto;opacity:' + (alwaysVisible ? '1' : '0') + ';transition:opacity 0.3s;';
 
     var muteBtn = document.createElement('button');
-    muteBtn.id = 'vody-mute';
+    muteBtn.id = 'stream-mute';
     muteBtn.textContent = '\u{1F50A}';
     muteBtn.style.cssText = 'background:none;border:none;color:#fff;font-size:18px;cursor:pointer;padding:0;';
     muteBtn.onclick = function () {
@@ -953,15 +945,15 @@
   function createQualitySelector() {
     var qualities = ['1080p', '720p'];
     var wrap = document.createElement('div');
-    wrap.id = 'vody-quality-wrap';
+    wrap.id = 'stream-quality-wrap';
 
     var btn = document.createElement('button');
-    btn.id = 'vody-quality-btn';
+    btn.id = 'stream-quality-btn';
     btn.innerHTML = '\u2699';
     btn.title = 'Qualidade';
 
     var menu = document.createElement('div');
-    menu.id = 'vody-quality-menu';
+    menu.id = 'stream-quality-menu';
 
     var menuOpen = false;
 
@@ -996,7 +988,7 @@
             vid.play().catch(function () {});
           }
           window._vodyCurrentQuality = q;
-          console.log('[VODY] Qualidade: ' + q);
+          console.log('[STREAM] Qualidade: ' + q);
           menu.classList.remove('open');
           menuOpen = false;
         });
@@ -1024,7 +1016,7 @@
 
   function createFullscreenButton(video, player) {
     var fsBtn = document.createElement('button');
-    fsBtn.id = 'vody-fs';
+    fsBtn.id = 'stream-fs';
     fsBtn.textContent = '\u26F6';
     fsBtn.style.cssText = 'position:absolute;top:10px;right:10px;z-index:1000;background:rgba(0,0,0,0.7);color:#fff;border:none;border-radius:4px;padding:6px 10px;font-size:16px;cursor:pointer;pointer-events:auto;';
     fsBtn._simulated = false;
@@ -1082,14 +1074,6 @@
     player.appendChild(fsBtn);
   }
 
-  function createRevertButton() {
-    var revertBtn = document.createElement('button');
-    revertBtn.id = 'hls-revert-btn';
-    revertBtn.textContent = 'Reverter';
-    revertBtn.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:10000;padding:10px 15px;background:#1a1a1a;color:#00d4ff;border:2px solid #00d4ff;border-radius:5px;cursor:pointer;font-weight:bold;font-family:sans-serif;';
-    revertBtn.onclick = function () { location.reload(); };
-    document.body.appendChild(revertBtn);
-  }
 
   // ════════════════════════════════════════════════════════════════════════════
   // VIEWER COUNTER — contador ao vivo no player (usa dados do path check, sem request extra)
@@ -1097,14 +1081,14 @@
 
   function startViewerCounter(streamerCode, player) {
     var counter = document.createElement('div');
-    counter.id = 'vody-viewer-counter';
-    counter.style.cssText = 'position:absolute;top:10px;left:10px;z-index:1000;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,0.7);padding:5px 10px;border-radius:6px;pointer-events:none;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:12px;color:#fff;';
+    counter.id = 'stream-viewer-counter';
+    counter.style.cssText = 'position:absolute;bottom:44px;left:12px;z-index:1000;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,0.7);padding:5px 10px;border-radius:6px;pointer-events:none;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:12px;color:#fff;';
 
     var dot = document.createElement('span');
     dot.style.cssText = 'width:6px;height:6px;border-radius:50%;background:#4caf50;box-shadow:0 0 6px rgba(76,175,80,0.6);';
 
     var text = document.createElement('span');
-    text.id = 'vody-viewer-count-text';
+    text.id = 'stream-viewer-count-text';
     text.textContent = '...';
 
     counter.appendChild(dot);

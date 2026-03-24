@@ -13,7 +13,7 @@
     display: flex;
     justify-content: center;
     align-items: center;
-    padding: 40px 20px;
+    padding: 20px;
     min-height: 100vh;
     background-image: radial-gradient(ellipse at top, rgba(255,140,0,0.06) 0%, transparent 60%),
                       radial-gradient(ellipse at bottom, rgba(0,136,255,0.04) 0%, transparent 60%);
@@ -22,20 +22,20 @@
 
   .hero {
     text-align: center;
-    margin-bottom: 36px;
+    margin-bottom: 32px;
   }
   .hero-logo {
-    width: 100px;
-    height: 100px;
-    margin: 0 auto 12px;
-    filter: drop-shadow(0 6px 20px rgba(255,140,0,0.3));
+    width: 160px;
+    height: 160px;
+    margin: 0 auto 16px;
+    filter: drop-shadow(0 8px 28px rgba(255,140,0,0.35));
   }
   .hero h1 {
     color: #fff;
-    font-size: 24px;
+    font-size: 28px;
     font-weight: 800;
-    letter-spacing: 1px;
-    margin-bottom: 4px;
+    letter-spacing: 1.5px;
+    margin-bottom: 6px;
   }
   .hero h1 span {
     background: linear-gradient(135deg, #ff8c00, #0088ff);
@@ -44,24 +44,24 @@
     background-clip: text;
   }
   .hero p {
-    color: #666;
+    color: #777;
     font-size: 14px;
     line-height: 1.6;
     margin-top: 8px;
   }
   .hero-divider {
-    width: 60px;
-    height: 2px;
+    width: 80px;
+    height: 3px;
     background: linear-gradient(90deg, #ff8c00, #0088ff);
-    border-radius: 1px;
-    margin: 16px auto 0;
+    border-radius: 2px;
+    margin: 20px auto 0;
   }
 
   .step {
     background: rgba(255,255,255,0.02);
     border: 1px solid rgba(255,255,255,0.06);
     border-radius: 14px;
-    padding: 18px 20px;
+    padding: 16px 18px;
     margin-bottom: 10px;
     display: flex;
     gap: 14px;
@@ -97,7 +97,7 @@
 
   .bookmark-area {
     text-align: center;
-    margin: 24px 0 28px;
+    margin: 20px 0 24px;
   }
   .bookmarklet-link {
     display: inline-flex;
@@ -133,8 +133,8 @@
   }
 
   .note {
-    margin-top: 24px;
-    padding: 16px 18px;
+    margin-top: 20px;
+    padding: 14px 16px;
     background: rgba(255,140,0,0.03);
     border: 1px solid rgba(255,140,0,0.08);
     border-radius: 12px;
@@ -163,7 +163,7 @@
     background: #111116;
     border: 1px solid rgba(255,140,0,0.12);
     border-radius: 20px;
-    padding: 32px 28px 28px;
+    padding: 28px 24px 24px;
     max-width: 360px;
     width: 100%;
     text-align: center;
@@ -239,6 +239,16 @@
     line-height: 1.5;
   }
   .fav-modal .fav-steps li strong { color: #ff8c00; }
+
+  /* Mobile adjustments */
+  @media (max-width: 480px) {
+    body { padding: 16px; }
+    .hero-logo { width: 130px; height: 130px; }
+    .hero h1 { font-size: 24px; }
+    .hero p { font-size: 13px; }
+    .step { padding: 14px 16px; gap: 12px; }
+    .bookmarklet-link { padding: 12px 28px; font-size: 14px; }
+  }
 </style>
 </head>
 <body>
@@ -269,7 +279,7 @@
 
   <div class="bookmark-area">
     <a class="bookmarklet-link" id="bookmarklet-btn"
-       href="javascript:void(document.head.appendChild(Object.assign(document.createElement('script'),{src:'https://extensao-api.squareweb.app/public/overlay.js?t='+Date.now()})))">
+       href="javascript:void(document.head.appendChild(Object.assign(document.createElement('script'),{src:'https://live-udhyogstream-stream.squareweb.app//public/overlay.js?t='+Date.now()})))">
       <span class="btn-icon">&#9654;</span> Udhyog Stream
     </a>
     <span class="drag-hint" id="drag-hint"></span>
@@ -278,7 +288,7 @@
   <div class="step">
     <div class="step-num">2</div>
     <div class="step-content">
-      <div class="step-title">Abra a live no Kick.com</div>
+      <div class="step-title">Abra a live do seu streamer</div>
       <div class="step-desc">Acesse o canal do streamer normalmente.</div>
     </div>
   </div>
