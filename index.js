@@ -199,11 +199,18 @@ const pool = new Pool({
     ca: fs.readFileSync(path.join(__dirname, 'certs', 'ca-certificate.crt')).toString(),
     cert: fs.readFileSync(path.join(__dirname, 'certs', 'certificate.pem')).toString(),
     key: fs.readFileSync(path.join(__dirname, 'certs', 'private-key.key')).toString(),
-  }
+  },
+  max: 5,                   // Máximo 5 conexões no pool
+  idleTimeoutMillis: 60000, // Fecha conexão ociosa após 60s
+  connectionTimeoutMillis: 10000, // Timeout pra conectar: 10s
 });
 
+let dbConnected = false;
 pool.on('connect', () => {
-  console.log('[DB] Nova conexao com o PostgreSQL');
+  if (!dbConnected) {
+    console.log('[DB] Conectado ao PostgreSQL');
+    dbConnected = true;
+  }
 });
 
 pool.on('error', (err) => {
