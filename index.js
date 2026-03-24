@@ -240,6 +240,9 @@ async function initDB() {
     await pool.query(`
       ALTER TABLE streamer ADD COLUMN IF NOT EXISTS id_mediamtx VARCHAR(255)
     `);
+    await pool.query(`
+      ALTER TABLE streamer ADD COLUMN IF NOT EXISTS commission REAL DEFAULT 0
+    `);
 
     console.log('[DB] Tabela streamer pronta');
 
@@ -259,6 +262,9 @@ async function initDB() {
       )
     `);
 
+    // Adicionar colunas se não existirem (banco existente)
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS unique_mobile INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS unique_desktop INTEGER DEFAULT 0`);
     // Adicionar avg_viewers se não existir (banco existente)
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers REAL DEFAULT 0`);
 
@@ -528,7 +534,7 @@ app.get('/api/viewer/count/:id_streamer', requireApiKey, async (req, res) => {
 app.get('/api/streamers', requireApiKey, async (req, res) => {
   try {
     console.log('[LIST] Listando todos os streamers');
-    const result = await pool.query('SELECT id, "user", link, id_streamer, max_spectators, link_vps, id_mediamtx FROM streamer ORDER BY id');
+    const result = await pool.query('SELECT id, "user", link, id_streamer, max_spectators, link_vps, id_mediamtx, commission FROM streamer ORDER BY id');
 
     // Adicionar contagem de viewers ativos a cada streamer
     const streamers = result.rows.map(s => ({
@@ -674,13 +680,22 @@ async function onLiveEnd(idStreamer) {
       ? Math.round((totalWatchSeconds / durationSeconds) * 10) / 10
       : 0;
 
+    // Contar viewers únicos mobile vs desktop (por IP)
+    const mobileIPs = new Set();
+    const desktopIPs = new Set();
+    for (const s of Object.values(live.viewerSessions)) {
+      if (s.is_mobile) mobileIPs.add(s.ip);
+      else desktopIPs.add(s.ip);
+    }
+
     await pool.query(
       `UPDATE lives SET ended_at = NOW(), duration_seconds = $1,
-       peak_viewers = $2, total_unique_viewers = $3, avg_viewers = $4, status = 'ended' WHERE id = $5`,
-      [durationSeconds, live.peakViewers, uniqueIPs.size, avgViewers, live.liveId]
+       peak_viewers = $2, total_unique_viewers = $3, avg_viewers = $4,
+       unique_mobile = $5, unique_desktop = $6, status = 'ended' WHERE id = $7`,
+      [durationSeconds, live.peakViewers, uniqueIPs.size, avgViewers, mobileIPs.size, desktopIPs.size, live.liveId]
     );
     await flushLiveViewerSessions(live);
-    console.log(`[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} | Únicos: ${uniqueIPs.size}`);
+    console.log(`[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} | Únicos: ${uniqueIPs.size} (M:${mobileIPs.size} D:${desktopIPs.size})`);
   } catch (e) {
     console.error('[LIVE] Erro ao encerrar:', e.message);
   }
@@ -844,7 +859,7 @@ app.get('/api/lives/:id_streamer', requireApiKey, async (req, res) => {
     const limit = parseInt(req.query.limit) || 20;
     const result = await pool.query(
       `SELECT id, streamer, id_streamer, started_at, ended_at, duration_seconds,
-              peak_viewers, total_unique_viewers, avg_viewers, status
+              peak_viewers, total_unique_viewers, avg_viewers, unique_mobile, unique_desktop, status
        FROM lives WHERE LOWER(id_streamer) = LOWER($1)
        ORDER BY started_at DESC LIMIT $2`, [id_streamer, limit]
     );
@@ -852,7 +867,8 @@ app.get('/api/lives/:id_streamer', requireApiKey, async (req, res) => {
       id: r.id, streamer: r.streamer, started_at: r.started_at, ended_at: r.ended_at,
       duration: formatTime(r.duration_seconds || 0), duration_seconds: r.duration_seconds,
       peak_viewers: r.peak_viewers, total_unique_viewers: r.total_unique_viewers,
-      avg_viewers: r.avg_viewers || 0, status: r.status,
+      avg_viewers: r.avg_viewers || 0, unique_mobile: r.unique_mobile || 0,
+      unique_desktop: r.unique_desktop || 0, status: r.status,
     }));
     return res.json({ streamer: id_streamer, total: lives.length, lives });
   } catch (e) {
@@ -889,7 +905,8 @@ app.get('/api/lives/:id_streamer/:live_id', requireApiKey, async (req, res) => {
         id: live.id, streamer: live.streamer, started_at: live.started_at, ended_at: live.ended_at,
         duration: formatTime(live.duration_seconds || 0), duration_seconds: live.duration_seconds,
         peak_viewers: live.peak_viewers, total_unique_viewers: live.total_unique_viewers,
-        avg_viewers: live.avg_viewers || 0, status: live.status,
+        avg_viewers: live.avg_viewers || 0, unique_mobile: live.unique_mobile || 0,
+        unique_desktop: live.unique_desktop || 0, status: live.status,
       },
       viewers: {
         total: viewers.length,
@@ -927,6 +944,121 @@ async function restoreActiveLives() {
     console.warn('[LIVE] Erro ao restaurar lives:', e.message);
   }
 }
+
+// ── POST /api/revenue — Cálculo de receita e comissão ──
+app.post('/api/revenue', requireApiKey, async (req, res) => {
+  try {
+    const { value_per_view_hour, start_date, end_date } = req.body;
+    if (!value_per_view_hour || !start_date || !end_date) {
+      return res.status(400).json({ message: 'Campos obrigatórios: value_per_view_hour, start_date, end_date' });
+    }
+
+    // Buscar todos os streamers com comissão
+    const streamersResult = await pool.query(
+      'SELECT id, "user", id_streamer, commission FROM streamer ORDER BY id'
+    );
+
+    // Buscar todas as lives no período (apenas finalizadas)
+    const livesResult = await pool.query(
+      `SELECT id, streamer, id_streamer, started_at, ended_at, duration_seconds,
+              peak_viewers, total_unique_viewers, avg_viewers, status
+       FROM lives
+       WHERE started_at >= $1 AND started_at <= $2
+       ORDER BY started_at ASC`,
+      [start_date, end_date + 'T23:59:59']
+    );
+
+    const vpvh = parseFloat(value_per_view_hour);
+    let totalRevenue = 0;
+    let totalCommission = 0;
+
+    // Agrupar lives por streamer
+    const streamerData = {};
+    for (const s of streamersResult.rows) {
+      streamerData[s.id_streamer.toLowerCase()] = {
+        user: s.user,
+        id_streamer: s.id_streamer,
+        commission_pct: s.commission || 0,
+        lives: [],
+        total_hours: 0,
+        total_revenue: 0,
+        total_commission: 0,
+      };
+    }
+
+    for (const live of livesResult.rows) {
+      const key = live.id_streamer.toLowerCase();
+      if (!streamerData[key]) continue;
+
+      const durationHours = (live.duration_seconds || 0) / 3600;
+      const avgViewers = live.avg_viewers || 0;
+      const revenue = avgViewers * durationHours * vpvh;
+
+      streamerData[key].lives.push({
+        live_id: live.id,
+        date: live.started_at,
+        started_at: live.started_at,
+        ended_at: live.ended_at,
+        duration_hours: Math.round(durationHours * 100) / 100,
+        duration_formatted: formatTime(live.duration_seconds || 0),
+        avg_viewers: Math.round(avgViewers),
+        peak_viewers: live.peak_viewers,
+        total_unique_viewers: live.total_unique_viewers,
+        revenue: Math.round(revenue * 100) / 100,
+        status: live.status,
+      });
+
+      streamerData[key].total_hours += durationHours;
+      streamerData[key].total_revenue += revenue;
+    }
+
+    // Calcular comissão por streamer
+    const streamers = [];
+    for (const key of Object.keys(streamerData)) {
+      const s = streamerData[key];
+      s.total_hours = Math.round(s.total_hours * 100) / 100;
+      s.total_revenue = Math.round(s.total_revenue * 100) / 100;
+      s.total_commission = Math.round(s.total_revenue * (s.commission_pct / 100) * 100) / 100;
+      totalRevenue += s.total_revenue;
+      totalCommission += s.total_commission;
+      if (s.lives.length > 0 || s.commission_pct > 0) {
+        streamers.push(s);
+      }
+    }
+
+    return res.json({
+      period: { start: start_date, end: end_date },
+      value_per_view_hour: vpvh,
+      total_revenue: Math.round(totalRevenue * 100) / 100,
+      total_commission: Math.round(totalCommission * 100) / 100,
+      net_profit: Math.round((totalRevenue - totalCommission) * 100) / 100,
+      streamers: streamers,
+    });
+  } catch (e) {
+    console.error('[REVENUE] Erro:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// ── PUT /api/streamer/:id_streamer/commission — Atualizar comissão ──
+app.put('/api/streamer/:id_streamer/commission', requireApiKey, async (req, res) => {
+  try {
+    const { id_streamer } = req.params;
+    const { commission } = req.body;
+    if (commission === undefined || commission < 0 || commission > 100) {
+      return res.status(400).json({ message: 'commission deve ser entre 0 e 100' });
+    }
+    const result = await pool.query(
+      'UPDATE streamer SET commission = $1 WHERE LOWER(id_streamer) = LOWER($2) RETURNING *',
+      [commission, id_streamer]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Streamer não encontrado' });
+    return res.json({ updated: true, streamer: result.rows[0].user, commission: commission });
+  } catch (e) {
+    console.error('[COMMISSION] Erro:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
 
 // ── Start ──
 const PORT = process.env.PORT || 3000;
