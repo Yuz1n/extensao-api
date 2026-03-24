@@ -236,6 +236,56 @@ async function initDB() {
 
     console.log('[DB] Tabela streamer pronta');
 
+    // Tabela de métricas por viewer/conexão
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS live_metrics (
+        id SERIAL PRIMARY KEY,
+        streamer VARCHAR(255) NOT NULL,
+        date VARCHAR(10) NOT NULL,
+        ip VARCHAR(100) NOT NULL,
+        kick_username VARCHAR(255) DEFAULT '',
+        viewer_uid VARCHAR(100) NOT NULL,
+        platform VARCHAR(50) DEFAULT 'unknown',
+        os VARCHAR(50) DEFAULT 'unknown',
+        os_version VARCHAR(50) DEFAULT '',
+        device_model VARCHAR(100) DEFAULT '',
+        browser VARCHAR(50) DEFAULT 'unknown',
+        browser_version VARCHAR(50) DEFAULT '',
+        user_agent TEXT DEFAULT '',
+        is_mobile BOOLEAN DEFAULT false,
+        joined_at VARCHAR(50),
+        last_seen VARCHAR(50),
+        segments_loaded INTEGER DEFAULT 0,
+        estimated_mb REAL DEFAULT 0,
+        quality_history JSONB DEFAULT '[]',
+        player_health JSONB DEFAULT '{}',
+        UNIQUE(streamer, date, viewer_uid)
+      )
+    `);
+
+    // Tabela de resumo diário (viewers únicos)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS daily_viewers (
+        id SERIAL PRIMARY KEY,
+        streamer VARCHAR(255) NOT NULL,
+        date VARCHAR(10) NOT NULL,
+        ip VARCHAR(100) NOT NULL,
+        kick_username VARCHAR(255) DEFAULT '',
+        first_seen VARCHAR(50),
+        last_seen VARCHAR(50),
+        total_seconds INTEGER DEFAULT 0,
+        sessions INTEGER DEFAULT 1,
+        current_uid VARCHAR(100) DEFAULT '',
+        UNIQUE(streamer, date, ip)
+      )
+    `);
+
+    // Índices para queries rápidas
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_metrics_streamer_date ON live_metrics(streamer, date)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_daily_streamer_date ON daily_viewers(streamer, date)`);
+
+    console.log('[DB] Tabelas streamer, live_metrics, daily_viewers prontas');
+
     const count = await pool.query('SELECT COUNT(*) FROM streamer');
     console.log(`[DB] Streamers cadastrados: ${count.rows[0].count}`);
   } catch (err) {
@@ -562,37 +612,170 @@ app.delete('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
   }
 });
 
-// ── Metrics ──
-const METRICS_DIR = path.join(__dirname, 'data', 'metrics');
+// ── Metrics + Daily (in-memory + flush periódico pro PostgreSQL) ──
+const FLUSH_INTERVAL = 30000; // Flush pro banco a cada 30s
 
-function getMetricsPath(idStreamer, date) {
-  const d = date || getBrazilDate();
-  return path.join(METRICS_DIR, `${idStreamer.toLowerCase()}_${d}.json`);
+// Cache em memória — operações instantâneas, sem I/O
+const metricsMemory = {}; // { "streamer_date": { viewers: { ip: { ... } } } }
+const dailyMemory = {};   // { "streamer_date": { unique_viewers: [...] } }
+const dirtyMetrics = new Set();
+const dirtyDaily = new Set();
+
+function memKey(idStreamer, date) {
+  return `${idStreamer.toLowerCase()}_${date || getBrazilDate()}`;
 }
 
-function loadMetrics(idStreamer, date) {
-  const filePath = getMetricsPath(idStreamer, date);
-  try {
-    if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    }
-  } catch (e) {
-    console.warn(`[METRICS] Erro ao ler ${filePath}:`, e.message);
+function getMetricsMem(idStreamer, date) {
+  const key = memKey(idStreamer, date);
+  if (!metricsMemory[key]) {
+    metricsMemory[key] = { streamer: idStreamer, date: date || getBrazilDate(), viewers: {} };
   }
-  return { streamer: idStreamer, date: date || getBrazilDate(), viewers: {} };
+  return metricsMemory[key];
 }
 
-function saveMetrics(data) {
+function getDailyMem(idStreamer, date) {
+  const key = memKey(idStreamer, date);
+  if (!dailyMemory[key]) {
+    dailyMemory[key] = { streamer: idStreamer, date: date || getBrazilDate(), unique_viewers: [] };
+  }
+  return dailyMemory[key];
+}
+
+// Carregar dados do banco na memória (chamado na inicialização)
+async function loadMetricsFromDB() {
   try {
-    if (!fs.existsSync(METRICS_DIR)) {
-      fs.mkdirSync(METRICS_DIR, { recursive: true });
+    const today = getBrazilDate();
+
+    // Carregar métricas do dia
+    const metricsRows = await pool.query(
+      'SELECT * FROM live_metrics WHERE date = $1', [today]
+    );
+    for (const row of metricsRows.rows) {
+      const mem = getMetricsMem(row.streamer, row.date);
+      if (!mem.viewers[row.ip]) {
+        mem.viewers[row.ip] = { kick_username: row.kick_username, join_count: 0, connections: [] };
+      }
+      mem.viewers[row.ip].join_count++;
+      if (row.kick_username) mem.viewers[row.ip].kick_username = row.kick_username;
+      mem.viewers[row.ip].connections.push({
+        viewer_uid: row.viewer_uid,
+        platform: row.platform,
+        os: row.os,
+        os_version: row.os_version,
+        device_model: row.device_model,
+        browser: row.browser,
+        browser_version: row.browser_version,
+        user_agent: row.user_agent,
+        is_mobile: row.is_mobile,
+        joined_at: row.joined_at,
+        last_seen: row.last_seen,
+        segments_loaded: row.segments_loaded,
+        estimated_mb: row.estimated_mb,
+        quality_history: row.quality_history || [],
+        player_health: row.player_health || {},
+      });
     }
-    const filePath = getMetricsPath(data.streamer, data.date);
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+
+    // Carregar daily do dia
+    const dailyRows = await pool.query(
+      'SELECT * FROM daily_viewers WHERE date = $1', [today]
+    );
+    for (const row of dailyRows.rows) {
+      const mem = getDailyMem(row.streamer, row.date);
+      mem.unique_viewers.push({
+        ip: row.ip,
+        kick_username: row.kick_username,
+        first_seen: row.first_seen,
+        last_seen: row.last_seen,
+        total_seconds: row.total_seconds,
+        sessions: row.sessions,
+        current_uid: row.current_uid,
+      });
+    }
+
+    console.log(`[DB] Carregados ${metricsRows.rows.length} metrics e ${dailyRows.rows.length} daily do dia ${today}`);
   } catch (e) {
-    console.warn(`[METRICS] Erro ao salvar:`, e.message);
+    console.warn('[DB] Erro ao carregar metrics/daily:', e.message);
   }
 }
+
+// Flush periódico — salva dados modificados no PostgreSQL
+async function flushToDB() {
+  let metricsCount = 0;
+  let dailyCount = 0;
+
+  // Flush metrics
+  for (const key of dirtyMetrics) {
+    const data = metricsMemory[key];
+    if (!data) continue;
+    try {
+      for (const [ip, viewer] of Object.entries(data.viewers)) {
+        for (const conn of viewer.connections) {
+          await pool.query(`
+            INSERT INTO live_metrics (streamer, date, ip, kick_username, viewer_uid, platform, os, os_version, device_model, browser, browser_version, user_agent, is_mobile, joined_at, last_seen, segments_loaded, estimated_mb, quality_history, player_health)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+            ON CONFLICT (streamer, date, viewer_uid) DO UPDATE SET
+              kick_username = EXCLUDED.kick_username,
+              last_seen = EXCLUDED.last_seen,
+              segments_loaded = EXCLUDED.segments_loaded,
+              estimated_mb = EXCLUDED.estimated_mb,
+              quality_history = EXCLUDED.quality_history,
+              player_health = EXCLUDED.player_health
+          `, [
+            data.streamer, data.date, ip, viewer.kick_username || '', conn.viewer_uid,
+            conn.platform, conn.os, conn.os_version, conn.device_model,
+            conn.browser, conn.browser_version, conn.user_agent, conn.is_mobile,
+            conn.joined_at, conn.last_seen, conn.segments_loaded, conn.estimated_mb,
+            JSON.stringify(conn.quality_history || []),
+            JSON.stringify(conn.player_health || {}),
+          ]);
+          metricsCount++;
+        }
+      }
+    } catch (e) {
+      console.warn(`[FLUSH] Erro metrics ${key}:`, e.message);
+    }
+  }
+  dirtyMetrics.clear();
+
+  // Flush daily
+  for (const key of dirtyDaily) {
+    const data = dailyMemory[key];
+    if (!data) continue;
+    try {
+      for (const v of data.unique_viewers) {
+        await pool.query(`
+          INSERT INTO daily_viewers (streamer, date, ip, kick_username, first_seen, last_seen, total_seconds, sessions, current_uid)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          ON CONFLICT (streamer, date, ip) DO UPDATE SET
+            kick_username = EXCLUDED.kick_username,
+            last_seen = EXCLUDED.last_seen,
+            total_seconds = EXCLUDED.total_seconds,
+            sessions = EXCLUDED.sessions,
+            current_uid = EXCLUDED.current_uid
+        `, [
+          data.streamer, data.date, v.ip, v.kick_username,
+          v.first_seen, v.last_seen, v.total_seconds, v.sessions, v.current_uid,
+        ]);
+        dailyCount++;
+      }
+    } catch (e) {
+      console.warn(`[FLUSH] Erro daily ${key}:`, e.message);
+    }
+  }
+  dirtyDaily.clear();
+
+  if (metricsCount > 0 || dailyCount > 0) {
+    console.log(`[FLUSH] DB: ${metricsCount} metrics, ${dailyCount} daily`);
+  }
+}
+
+// Flush a cada 30s
+setInterval(flushToDB, FLUSH_INTERVAL);
+
+// Flush ao encerrar
+process.on('SIGTERM', async () => { await flushToDB(); process.exit(0); });
+process.on('SIGINT', async () => { await flushToDB(); process.exit(0); });
 
 // POST /api/metrics/join — viewer registra entrada com device info
 app.post('/api/metrics/join', requireApiKey, (req, res) => {
@@ -607,46 +790,29 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
       || req.socket.remoteAddress
       || 'unknown';
 
-    const metrics = loadMetrics(id_streamer);
+    const metrics = getMetricsMem(id_streamer);
     const now = getBrazilTimestamp();
 
-    // Agrupar por IP — cada IP tem um array de conexões (mais nova primeiro)
     if (!metrics.viewers[ip]) {
-      metrics.viewers[ip] = {
-        kick_username: device_info?.kick_username || '',
-        join_count: 1,
-        connections: [],
-      };
+      metrics.viewers[ip] = { kick_username: device_info?.kick_username || '', join_count: 1, connections: [] };
     } else {
       metrics.viewers[ip].join_count = (metrics.viewers[ip].join_count || 1) + 1;
-      if (device_info?.kick_username) {
-        metrics.viewers[ip].kick_username = device_info.kick_username;
-      }
+      if (device_info?.kick_username) metrics.viewers[ip].kick_username = device_info.kick_username;
     }
 
-    // Adicionar nova conexão no início do array (mais recente primeiro)
     metrics.viewers[ip].connections.unshift({
-      viewer_uid: viewer_uid,
-      platform: device_info?.platform || 'unknown',
-      os: device_info?.os || 'unknown',
-      os_version: device_info?.os_version || '',
-      device_model: device_info?.device_model || '',
-      browser: device_info?.browser || 'unknown',
-      browser_version: device_info?.browser_version || '',
-      user_agent: device_info?.user_agent || '',
+      viewer_uid, platform: device_info?.platform || 'unknown',
+      os: device_info?.os || 'unknown', os_version: device_info?.os_version || '',
+      device_model: device_info?.device_model || '', browser: device_info?.browser || 'unknown',
+      browser_version: device_info?.browser_version || '', user_agent: device_info?.user_agent || '',
       is_mobile: device_info?.is_mobile || false,
-      joined_at: now,
-      last_seen: now,
-      segments_loaded: 0,
-      estimated_mb: 0,
-      quality_history: [],
+      joined_at: now, last_seen: now, segments_loaded: 0, estimated_mb: 0, quality_history: [],
     });
 
     console.log(`[METRICS] Viewer ${ip} (${device_info?.kick_username || '?'}) — conexão #${metrics.viewers[ip].join_count}`);
+    dirtyMetrics.add(memKey(id_streamer));
 
-    saveMetrics(metrics);
-
-    // Registrar no resumo diário (sem duplicata por IP/kick_username)
+    // Daily
     trackDailyViewer(id_streamer, ip, device_info?.kick_username, viewer_uid);
 
     return res.json({ tracked: true });
@@ -664,9 +830,8 @@ app.post('/api/metrics/update', requireApiKey, (req, res) => {
       return res.status(400).json({ message: 'Campos obrigatorios' });
     }
 
-    const metrics = loadMetrics(id_streamer);
+    const metrics = getMetricsMem(id_streamer);
 
-    // Encontrar a conexão pelo viewer_uid dentro dos IPs
     let connection = null;
     for (const [, viewer] of Object.entries(metrics.viewers)) {
       if (viewer.connections) {
@@ -674,9 +839,7 @@ app.post('/api/metrics/update', requireApiKey, (req, res) => {
         if (connection) break;
       }
     }
-    if (!connection) {
-      return res.json({ tracked: false });
-    }
+    if (!connection) return res.json({ tracked: false });
 
     connection.last_seen = getBrazilTimestamp();
     if (segments_loaded !== undefined) {
@@ -686,13 +849,9 @@ app.post('/api/metrics/update', requireApiKey, (req, res) => {
     if (current_quality && (connection.quality_history.length === 0 || connection.quality_history[connection.quality_history.length - 1].q !== current_quality)) {
       connection.quality_history.push({ q: current_quality, at: getBrazilTimestamp() });
     }
-    if (player_health) {
-      connection.player_health = player_health;
-    }
+    if (player_health) connection.player_health = player_health;
 
-    saveMetrics(metrics);
-
-    // Atualizar tempo no resumo diário
+    dirtyMetrics.add(memKey(id_streamer));
     updateDailyTime(id_streamer, viewer_uid);
 
     return res.json({ tracked: true });
@@ -702,166 +861,152 @@ app.post('/api/metrics/update', requireApiKey, (req, res) => {
   }
 });
 
-// GET /api/metrics/:id_streamer — consultar métricas (opcional: ?date=2026-03-21)
-app.get('/api/metrics/:id_streamer', requireApiKey, (req, res) => {
+// GET /api/metrics/:id_streamer — consultar métricas
+app.get('/api/metrics/:id_streamer', requireApiKey, async (req, res) => {
   try {
     const { id_streamer } = req.params;
     const date = req.query.date || getBrazilDate();
-    const metrics = loadMetrics(id_streamer, date);
 
-    const viewers = Object.entries(metrics.viewers);
-    const totalJoins = viewers.reduce((sum, [, v]) => sum + (v.join_count || 1), 0);
-    const allConnections = viewers.flatMap(([, v]) => v.connections || []);
-    const summary = {
-      streamer: id_streamer,
-      date: date,
-      unique_viewers: viewers.length,
+    // Se é o dia atual, usa memória. Se é histórico, busca no banco.
+    let viewers;
+    if (date === getBrazilDate()) {
+      const metrics = getMetricsMem(id_streamer, date);
+      viewers = metrics.viewers;
+    } else {
+      const rows = await pool.query(
+        'SELECT * FROM live_metrics WHERE LOWER(streamer) = LOWER($1) AND date = $2', [id_streamer, date]
+      );
+      viewers = {};
+      for (const row of rows.rows) {
+        if (!viewers[row.ip]) {
+          viewers[row.ip] = { kick_username: row.kick_username, join_count: 0, connections: [] };
+        }
+        viewers[row.ip].join_count++;
+        if (row.kick_username) viewers[row.ip].kick_username = row.kick_username;
+        viewers[row.ip].connections.push({
+          viewer_uid: row.viewer_uid, platform: row.platform, os: row.os,
+          os_version: row.os_version, device_model: row.device_model,
+          browser: row.browser, browser_version: row.browser_version,
+          user_agent: row.user_agent, is_mobile: row.is_mobile,
+          joined_at: row.joined_at, last_seen: row.last_seen,
+          segments_loaded: row.segments_loaded, estimated_mb: row.estimated_mb,
+          quality_history: row.quality_history || [], player_health: row.player_health || {},
+        });
+      }
+    }
+
+    const viewerEntries = Object.entries(viewers);
+    const totalJoins = viewerEntries.reduce((sum, [, v]) => sum + (v.join_count || 1), 0);
+    const allConnections = viewerEntries.flatMap(([, v]) => v.connections || []);
+
+    return res.json({
+      streamer: id_streamer, date,
+      unique_viewers: viewerEntries.length,
       total_joins: totalJoins,
       total_connections: allConnections.length,
       mobile: allConnections.filter(c => c.is_mobile).length,
       desktop: allConnections.filter(c => !c.is_mobile).length,
       total_estimated_mb: Math.round(allConnections.reduce((sum, c) => sum + (c.estimated_mb || 0), 0) * 10) / 10,
-      viewers: metrics.viewers,
-    };
-
-    return res.json(summary);
+      viewers,
+    });
   } catch (e) {
     console.error('[METRICS] Erro get:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
 
-// GET /api/metrics — listar datas disponíveis de um streamer
-app.get('/api/metrics', requireApiKey, (req, res) => {
+// GET /api/metrics — listar datas disponíveis
+app.get('/api/metrics', requireApiKey, async (req, res) => {
   try {
     const { streamer } = req.query;
-    if (!fs.existsSync(METRICS_DIR)) {
-      return res.json({ files: [] });
-    }
-    let files = fs.readdirSync(METRICS_DIR).filter(f => f.endsWith('.json'));
+    let query = 'SELECT DISTINCT date FROM live_metrics';
+    const params = [];
     if (streamer) {
-      files = files.filter(f => f.startsWith(streamer.toLowerCase() + '_'));
+      query += ' WHERE LOWER(streamer) = LOWER($1)';
+      params.push(streamer);
     }
-    const dates = files.map(f => {
-      const match = f.match(/_(\d{4}-\d{2}-\d{2})\.json$/);
-      return match ? match[1] : null;
-    }).filter(Boolean);
-
-    return res.json({ streamer: streamer || 'all', dates });
+    query += ' ORDER BY date DESC';
+    const result = await pool.query(query, params);
+    return res.json({ streamer: streamer || 'all', dates: result.rows.map(r => r.date) });
   } catch (e) {
     console.error('[METRICS] Erro list:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
 
-// ── Daily Summary (arquivo separado, sem duplicatas por IP/kick_username) ──
-const DAILY_DIR = path.join(__dirname, 'data', 'daily');
+// ── Daily helpers ──
 
-function getDailyPath(idStreamer, date) {
-  const d = date || getBrazilDate();
-  return path.join(DAILY_DIR, `${idStreamer.toLowerCase()}_${d}.json`);
-}
-
-function loadDaily(idStreamer, date) {
-  const filePath = getDailyPath(idStreamer, date);
-  try {
-    if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    }
-  } catch (e) {
-    console.warn(`[DAILY] Erro ao ler ${filePath}:`, e.message);
-  }
-  return {
-    streamer: idStreamer,
-    date: date || getBrazilDate(),
-    unique_viewers: [],
-    total_unique: 0,
-  };
-}
-
-function saveDaily(data) {
-  try {
-    if (!fs.existsSync(DAILY_DIR)) {
-      fs.mkdirSync(DAILY_DIR, { recursive: true });
-    }
-    data.total_unique = data.unique_viewers.length;
-    const filePath = getDailyPath(data.streamer, data.date);
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.warn(`[DAILY] Erro ao salvar:`, e.message);
-  }
-}
-
-// Chamado internamente quando um viewer faz join nas metrics
 function trackDailyViewer(idStreamer, ip, kickUsername, viewerUid) {
-  const daily = loadDaily(idStreamer);
+  const daily = getDailyMem(idStreamer);
 
-  // Verificar duplicata por IP ou kick_username
   const exists = daily.unique_viewers.find(v =>
     v.ip === ip || (kickUsername && v.kick_username && v.kick_username.toLowerCase() === kickUsername.toLowerCase())
   );
 
   if (exists) {
-    // Atualizar last_seen e incrementar sessions
     exists.last_seen = getBrazilTimestamp();
     exists.sessions = (exists.sessions || 1) + 1;
     if (kickUsername) exists.kick_username = kickUsername;
     exists.current_uid = viewerUid;
   } else {
-    // Novo viewer único
     daily.unique_viewers.push({
-      ip: ip,
-      kick_username: kickUsername || '',
-      first_seen: getBrazilTimestamp(),
-      last_seen: getBrazilTimestamp(),
-      total_seconds: 0,
-      sessions: 1,
-      current_uid: viewerUid,
+      ip, kick_username: kickUsername || '',
+      first_seen: getBrazilTimestamp(), last_seen: getBrazilTimestamp(),
+      total_seconds: 0, sessions: 1, current_uid: viewerUid,
     });
   }
 
-  saveDaily(daily);
+  dirtyDaily.add(memKey(idStreamer));
 }
 
-// Chamado quando viewer envia heartbeat/update — atualiza tempo
 function updateDailyTime(idStreamer, viewerUid) {
-  const daily = loadDaily(idStreamer);
+  const daily = getDailyMem(idStreamer);
   const viewer = daily.unique_viewers.find(v => v.current_uid === viewerUid);
   if (viewer) {
     const now = new Date();
     const lastSeen = new Date(viewer.last_seen);
     const diff = Math.round((now - lastSeen) / 1000);
-    // Só soma se o intervalo for razoável (< 120s, evita soma de tempo offline)
     if (diff > 0 && diff < 120) {
       viewer.total_seconds = (viewer.total_seconds || 0) + diff;
     }
     viewer.last_seen = getBrazilTimestamp();
-    saveDaily(daily);
+    dirtyDaily.add(memKey(idStreamer));
   }
 }
 
 // GET /api/daily/:id_streamer — resumo diário
-app.get('/api/daily/:id_streamer', requireApiKey, (req, res) => {
+app.get('/api/daily/:id_streamer', requireApiKey, async (req, res) => {
   try {
     const { id_streamer } = req.params;
     const date = req.query.date || getBrazilDate();
-    const daily = loadDaily(id_streamer, date);
 
-    const viewers = daily.unique_viewers.map(v => ({
-      ip: v.ip,
-      kick_username: v.kick_username,
-      first_seen: v.first_seen,
-      last_seen: v.last_seen,
+    let uniqueViewers;
+    if (date === getBrazilDate()) {
+      const daily = getDailyMem(id_streamer, date);
+      uniqueViewers = daily.unique_viewers;
+    } else {
+      const rows = await pool.query(
+        'SELECT * FROM daily_viewers WHERE LOWER(streamer) = LOWER($1) AND date = $2', [id_streamer, date]
+      );
+      uniqueViewers = rows.rows.map(r => ({
+        ip: r.ip, kick_username: r.kick_username,
+        first_seen: r.first_seen, last_seen: r.last_seen,
+        total_seconds: r.total_seconds, sessions: r.sessions,
+      }));
+    }
+
+    const viewers = uniqueViewers.map(v => ({
+      ip: v.ip, kick_username: v.kick_username,
+      first_seen: v.first_seen, last_seen: v.last_seen,
       sessions: v.sessions,
       time_minutes: Math.round((v.total_seconds || 0) / 60 * 10) / 10,
       time_formatted: formatTime(v.total_seconds || 0),
     }));
 
     return res.json({
-      streamer: id_streamer,
-      date: date,
-      total_unique_viewers: daily.total_unique,
-      viewers: viewers,
+      streamer: id_streamer, date,
+      total_unique_viewers: uniqueViewers.length,
+      viewers,
     });
   } catch (e) {
     console.error('[DAILY] Erro get:', e.message);
@@ -870,21 +1015,18 @@ app.get('/api/daily/:id_streamer', requireApiKey, (req, res) => {
 });
 
 // GET /api/daily — listar datas disponíveis
-app.get('/api/daily', requireApiKey, (req, res) => {
+app.get('/api/daily', requireApiKey, async (req, res) => {
   try {
     const { streamer } = req.query;
-    if (!fs.existsSync(DAILY_DIR)) {
-      return res.json({ files: [] });
-    }
-    let files = fs.readdirSync(DAILY_DIR).filter(f => f.endsWith('.json'));
+    let query = 'SELECT DISTINCT date FROM daily_viewers';
+    const params = [];
     if (streamer) {
-      files = files.filter(f => f.startsWith(streamer.toLowerCase() + '_'));
+      query += ' WHERE LOWER(streamer) = LOWER($1)';
+      params.push(streamer);
     }
-    const dates = files.map(f => {
-      const match = f.match(/_(\d{4}-\d{2}-\d{2})\.json$/);
-      return match ? match[1] : null;
-    }).filter(Boolean);
-    return res.json({ streamer: streamer || 'all', dates });
+    query += ' ORDER BY date DESC';
+    const result = await pool.query(query, params);
+    return res.json({ streamer: streamer || 'all', dates: result.rows.map(r => r.date) });
   } catch (e) {
     console.error('[DAILY] Erro list:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
@@ -903,7 +1045,7 @@ function formatTime(seconds) {
 // ── Start ──
 const PORT = process.env.PORT || 3000;
 
-initDB().then(() => {
+initDB().then(() => loadMetricsFromDB()).then(() => {
   app.listen(PORT, () => {
     console.log(`[SERVER] API rodando na porta ${PORT}`);
     console.log(`[SERVER] Endpoints disponíveis:`);
