@@ -400,7 +400,7 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
     if (stream_url && !activeLives[id_streamer]) {
       await onLiveStart(id_streamer, streamer.user);
     }
-    updateLivePeak(id_streamer, currentViewers);
+    updateLivePeak(id_streamer);
 
     return res.json({
       valid: true,
@@ -742,16 +742,22 @@ function trackLiveViewer(idStreamer, viewerUid, deviceInfo, ip) {
       os_version: deviceInfo?.os_version || '', device_model: deviceInfo?.device_model || '',
       browser: deviceInfo?.browser || 'unknown', browser_version: deviceInfo?.browser_version || '',
       user_agent: deviceInfo?.user_agent || '', is_mobile: deviceInfo?.is_mobile || false,
-      joined_at: now, last_seen: now, total_seconds: 0, segments_loaded: 0, estimated_mb: 0,
+      joined_at: now, last_seen: now, _lastSeenMs: Date.now(),
+      total_seconds: 0, segments_loaded: 0, estimated_mb: 0,
       quality_history: [], player_health: {},
     };
   }
 }
 
 // Atualizar peak viewers
-function updateLivePeak(idStreamer, currentViewers) {
+function updateLivePeak(idStreamer) {
   const live = activeLives[idStreamer];
-  if (live && currentViewers > live.peakViewers) live.peakViewers = currentViewers;
+  if (!live) return;
+  // Usar o maior entre: viewer count do heartbeat e sessões ativas na live
+  const heartbeatCount = getViewerCount(idStreamer);
+  const sessionCount = Object.keys(live.viewerSessions).length;
+  const currentViewers = Math.max(heartbeatCount, sessionCount);
+  if (currentViewers > live.peakViewers) live.peakViewers = currentViewers;
 }
 
 // Verificar status das lives a cada 30s
@@ -764,6 +770,8 @@ async function checkLiveStatus() {
       if (result.rows.length === 0) continue;
       const mediamtxPath = result.rows[0].id_mediamtx;
       if (!mediamtxPath) continue;
+      // Forçar refresh do cache pra verificar se stream ainda está ativo
+      streamUrlCache.delete(mediamtxPath);
       const url = await getCachedStreamUrl(mediamtxPath);
       if (!url) await onLiveEnd(idStreamer);
     } catch (e) { /* ignore */ }
@@ -799,6 +807,7 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
       || req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown';
     trackLiveViewer(id_streamer, viewer_uid, device_info, ip);
+    updateLivePeak(id_streamer);
     console.log(`[METRICS] Viewer ${ip} (${device_info?.kick_username || '?'}) entrou em ${id_streamer}`);
     return res.json({ tracked: true });
   } catch (e) {
@@ -817,10 +826,11 @@ app.post('/api/metrics/update', requireApiKey, (req, res) => {
     const live = activeLives[id_streamer];
     if (live && live.viewerSessions[viewer_uid]) {
       const session = live.viewerSessions[viewer_uid];
-      const now = new Date();
-      const lastSeen = new Date(session.last_seen);
+      const now = Date.now();
+      const lastSeen = session._lastSeenMs || now;
       const diff = Math.round((now - lastSeen) / 1000);
       if (diff > 0 && diff < 120) session.total_seconds = (session.total_seconds || 0) + diff;
+      session._lastSeenMs = now;
       session.last_seen = getBrazilTimestamp();
       if (segments_loaded !== undefined) {
         session.segments_loaded = segments_loaded;
@@ -835,7 +845,7 @@ app.post('/api/metrics/update', requireApiKey, (req, res) => {
       }
       if (player_health) session.player_health = player_health;
     }
-    updateLivePeak(id_streamer, getViewerCount(id_streamer));
+    updateLivePeak(id_streamer);
     return res.json({ tracked: true });
   } catch (e) {
     console.error('[METRICS] Erro update:', e.message);
