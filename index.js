@@ -14,7 +14,7 @@ function getBrazilTimestamp() {
   return new Date().toLocaleString('sv-SE', { timeZone: 'America/Sao_Paulo' }).replace(' ', 'T') + '-03:00';
 }
 
-// ── Logger em arquivo ──
+// ── Logger em arquivo (intercepta TODOS os console.log/warn/error) ──
 const LOG_DIR = path.join(__dirname, 'data', 'logs');
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
@@ -22,21 +22,37 @@ function getLogPath() {
   return path.join(LOG_DIR, `api_${getBrazilDate()}.log`);
 }
 
-function logToFile(level, message) {
+function logToFile(level, ...args) {
   const timestamp = getBrazilTimestamp();
+  const message = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
   const line = `[${timestamp}] [${level}] ${message}\n`;
   try {
     fs.appendFileSync(getLogPath(), line);
   } catch (e) { /* ignore */ }
-  // Também imprime no console
-  if (level === 'ERROR') console.error(line.trim());
-  else console.log(line.trim());
 }
 
+// Interceptar console.log, console.warn, console.error
+const _originalLog = console.log.bind(console);
+const _originalWarn = console.warn.bind(console);
+const _originalError = console.error.bind(console);
+
+console.log = function (...args) {
+  _originalLog(...args);
+  logToFile('INFO', ...args);
+};
+console.warn = function (...args) {
+  _originalWarn(...args);
+  logToFile('WARN', ...args);
+};
+console.error = function (...args) {
+  _originalError(...args);
+  logToFile('ERROR', ...args);
+};
+
 const logger = {
-  info: (msg) => logToFile('INFO', msg),
-  warn: (msg) => logToFile('WARN', msg),
-  error: (msg) => logToFile('ERROR', msg),
+  info: (...args) => console.log(...args),
+  warn: (...args) => console.warn(...args),
+  error: (...args) => console.error(...args),
 };
 
 // ── API Key secreta (só a extensão conhece) ──
@@ -426,7 +442,7 @@ async function getCachedLiveStatus(mediamtxPath) {
 // ── GET /api/streamer/validate/:id_streamer ──
 app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) => {
   try {
-    const { id_streamer } = req.params;
+    const id_streamer = req.params.id_streamer.toLowerCase();
     console.log(`[VALIDATE] Validando streamer: "${id_streamer}"`);
 
     const result = await pool.query(
@@ -494,7 +510,8 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
 // ── POST /api/viewer/join — Viewer entra na sala ──
 app.post('/api/viewer/join', requireApiKey, async (req, res) => {
   try {
-    const { id_streamer, viewer_uid } = req.body;
+    const id_streamer = (req.body.id_streamer || '').toLowerCase();
+    const viewer_uid = req.body.viewer_uid;
 
     if (!id_streamer || !viewer_uid) {
       return res.status(400).json({ message: 'Campos "id_streamer" e "viewer_uid" sao obrigatorios' });
@@ -544,7 +561,8 @@ app.post('/api/viewer/join', requireApiKey, async (req, res) => {
 // ── POST /api/viewer/heartbeat — Viewer ainda está assistindo ──
 app.post('/api/viewer/heartbeat', requireApiKey, async (req, res) => {
   try {
-    const { id_streamer, viewer_uid } = req.body;
+    const id_streamer = (req.body.id_streamer || '').toLowerCase();
+    const viewer_uid = req.body.viewer_uid;
 
     if (!id_streamer || !viewer_uid) {
       return res.status(400).json({ message: 'Campos obrigatorios faltando' });
@@ -566,7 +584,8 @@ app.post('/api/viewer/heartbeat', requireApiKey, async (req, res) => {
 // ── POST /api/viewer/leave — Viewer saiu ──
 app.post('/api/viewer/leave', requireApiKey, async (req, res) => {
   try {
-    const { id_streamer, viewer_uid } = req.body;
+    const id_streamer = (req.body.id_streamer || '').toLowerCase();
+    const viewer_uid = req.body.viewer_uid;
 
     if (!id_streamer || !viewer_uid) {
       return res.status(400).json({ message: 'Campos obrigatorios faltando' });
@@ -740,7 +759,7 @@ app.post('/api/live/start', async (req, res) => {
     }
 
     const streamer = result.rows[0];
-    const idStreamer = streamer.id_streamer;
+    const idStreamer = streamer.id_streamer.toLowerCase();
 
     // Proteção: se já tem live ativa, ignorar
     if (activeLives[idStreamer]) {
@@ -749,7 +768,7 @@ app.post('/api/live/start', async (req, res) => {
     }
 
     // Limpar flag de ended
-    delete endedStreamers[idStreamer.toLowerCase()];
+    delete endedStreamers[idStreamer];
 
     await onLiveStart(idStreamer, streamer.user);
     return res.json({ started: true, live_id: activeLives[idStreamer]?.liveId });
@@ -776,7 +795,7 @@ app.post('/api/live/end', async (req, res) => {
     }
 
     const streamer = result.rows[0];
-    const idStreamer = streamer.id_streamer;
+    const idStreamer = streamer.id_streamer.toLowerCase();
 
     // Proteção: se não tem live ativa, ignorar
     if (!activeLives[idStreamer]) {
@@ -804,6 +823,7 @@ app.post('/api/live/end', async (req, res) => {
 
 // Iniciar live (chamado internamente)
 async function onLiveStart(idStreamer, streamerName) {
+  idStreamer = idStreamer.toLowerCase();
   if (activeLives[idStreamer]) return;
   try {
     const result = await pool.query(
@@ -820,6 +840,7 @@ async function onLiveStart(idStreamer, streamerName) {
 
 // Detectar fim de live
 async function onLiveEnd(idStreamer) {
+  idStreamer = idStreamer.toLowerCase();
   const live = activeLives[idStreamer];
   if (!live) return;
   try {
@@ -890,6 +911,7 @@ async function flushLiveViewerSessions(live) {
 
 // Registrar viewer na live ativa
 function trackLiveViewer(idStreamer, viewerUid, deviceInfo, ip) {
+  idStreamer = (idStreamer || '').toLowerCase();
   const live = activeLives[idStreamer];
   if (!live) return;
   if (!live.viewerSessions[viewerUid]) {
@@ -909,6 +931,7 @@ function trackLiveViewer(idStreamer, viewerUid, deviceInfo, ip) {
 
 // Atualizar peak viewers
 function updateLivePeak(idStreamer) {
+  idStreamer = (idStreamer || '').toLowerCase();
   const live = activeLives[idStreamer];
   if (!live) return;
   // Usar o maior entre: viewer count do heartbeat e sessões ativas na live
@@ -947,7 +970,8 @@ process.on('SIGINT', async () => {
 // POST /api/metrics/join — viewer registra entrada
 app.post('/api/metrics/join', requireApiKey, (req, res) => {
   try {
-    const { id_streamer, viewer_uid, device_info } = req.body;
+    const id_streamer = (req.body.id_streamer || '').toLowerCase();
+    const { viewer_uid, device_info } = req.body;
     if (!id_streamer || !viewer_uid) {
       return res.status(400).json({ message: 'Campos obrigatorios: id_streamer, viewer_uid' });
     }
@@ -966,7 +990,8 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
 // POST /api/metrics/update — viewer envia consumo
 app.post('/api/metrics/update', requireApiKey, (req, res) => {
   try {
-    const { id_streamer, viewer_uid, segments_loaded, current_quality, player_health } = req.body;
+    const id_streamer = (req.body.id_streamer || '').toLowerCase();
+    const { viewer_uid, segments_loaded, current_quality, player_health } = req.body;
     if (!id_streamer || !viewer_uid) {
       return res.status(400).json({ message: 'Campos obrigatorios' });
     }
@@ -1083,10 +1108,10 @@ async function restoreActiveLives() {
   try {
     const result = await pool.query("SELECT * FROM lives WHERE status = 'active'");
     for (const row of result.rows) {
-      activeLives[row.id_streamer] = { liveId: row.id, peakViewers: row.peak_viewers || 0, viewerSessions: {} };
+      activeLives[row.id_streamer.toLowerCase()] = { liveId: row.id, peakViewers: row.peak_viewers || 0, viewerSessions: {} };
       const sessions = await pool.query('SELECT * FROM live_viewer_sessions WHERE live_id = $1', [row.id]);
       for (const s of sessions.rows) {
-        activeLives[row.id_streamer].viewerSessions[s.viewer_uid] = {
+        activeLives[row.id_streamer.toLowerCase()].viewerSessions[s.viewer_uid] = {
           ip: s.ip, kick_username: s.kick_username, platform: s.platform, os: s.os,
           os_version: s.os_version, device_model: s.device_model, browser: s.browser,
           browser_version: s.browser_version, user_agent: s.user_agent, is_mobile: s.is_mobile,

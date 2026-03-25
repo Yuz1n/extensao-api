@@ -668,8 +668,8 @@
         liveMaxLatencyDurationCount: 5,
         backBufferLength: 0,
         enableWorker: true,
-        maxBufferLength: 10,
-        maxMaxBufferLength: 20,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
         maxBufferHole: 0.8,
         fragLoadingTimeOut: 25000,
         fragLoadingMaxRetry: 8,
@@ -692,48 +692,133 @@
       });
       var consecutiveFatalErrors = 0;
       var lastFatalTime = 0;
-      hls.on(Hls.Events.ERROR, function (event, data) {
-        if (data.fatal) {
-          var now = Date.now();
-          // Se erros fatais acontecem a cada ~3s por mais de 60s, stream acabou
-          if (now - lastFatalTime < 10000) {
-            consecutiveFatalErrors++;
+      var mediaRecoverAttempts = 0;
+      var isRecreating = false;
+
+      // Função para destruir e recriar hls.js quando está morto
+      function recreateHls() {
+        if (isRecreating) return;
+        isRecreating = true;
+        console.warn('[STREAM] Recriando hls.js...');
+        try {
+          if (window._vodyHls) {
+            window._vodyHls.destroy();
+            window._vodyHls = null;
+          }
+        } catch (e) {}
+        setTimeout(function () {
+          var quality = window._vodyCurrentQuality || defaultQuality;
+          var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
+          var newHls = new Hls({
+            lowLatencyMode: true,
+            liveSyncDurationCount: 3,
+            liveMaxLatencyDurationCount: 5,
+            backBufferLength: 0,
+            enableWorker: true,
+            maxBufferLength: 10,
+            maxMaxBufferLength: 20,
+            maxBufferHole: 0.8,
+            fragLoadingTimeOut: 25000,
+            fragLoadingMaxRetry: 8,
+            fragLoadingRetryDelay: 1500,
+          });
+          newHls.attachMedia(video);
+          newHls.loadSource(url);
+          newHls.on(Hls.Events.MANIFEST_PARSED, function () {
+            video.play().catch(function () {
+              video.muted = true;
+              video.play().catch(function () {});
+            });
+          });
+          newHls.on(Hls.Events.FRAG_LOADED, function () {
+            segmentsLoaded++;
+            consecutiveFatalErrors = 0;
+            mediaRecoverAttempts = 0;
+          });
+          newHls.on(Hls.Events.ERROR, function (event, data) {
+            handleHlsError(data);
+          });
+          window._vodyHls = newHls;
+          hls = newHls;
+          isRecreating = false;
+          console.log('[STREAM] hls.js recriado: ' + url);
+        }, 2000);
+      }
+
+      function handleHlsError(data) {
+        if (!data.fatal) return;
+
+        var now = Date.now();
+        if (now - lastFatalTime < 10000) {
+          consecutiveFatalErrors++;
+        } else {
+          consecutiveFatalErrors = 1;
+        }
+        lastFatalTime = now;
+
+        // Stream realmente encerrado (muitos erros seguidos por muito tempo)
+        if (consecutiveFatalErrors >= 30) {
+          console.warn('[STREAM] 30+ erros fatais consecutivos — stream provavelmente encerrado');
+          showStreamEnded();
+          return;
+        }
+
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          console.warn('[STREAM] Network error, tentando reconectar...');
+          setTimeout(function () {
+            if (window._vodyHls) window._vodyHls.startLoad();
+          }, 3000);
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          mediaRecoverAttempts++;
+          if (mediaRecoverAttempts <= 2) {
+            console.warn('[STREAM] Media error (' + mediaRecoverAttempts + '/2), recuperando...');
+            if (window._vodyHls) window._vodyHls.recoverMediaError();
           } else {
-            consecutiveFatalErrors = 1;
-          }
-          lastFatalTime = now;
-
-          if (consecutiveFatalErrors >= 20) {
-            console.warn('[STREAM] 20+ erros fatais consecutivos — stream provavelmente encerrado');
-            showStreamEnded();
-            return;
-          }
-
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            console.warn('[STREAM] Network error, tentando reconectar...');
-            setTimeout(function () { hls.startLoad(); }, 3000);
-          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-            console.warn('[STREAM] Media error, recuperando...');
-            hls.recoverMediaError();
+            console.warn('[STREAM] Media error persistente — recriando player...');
+            mediaRecoverAttempts = 0;
+            recreateHls();
           }
         }
+      }
+
+      hls.on(Hls.Events.ERROR, function (event, data) {
+        handleHlsError(data);
       });
       hls.on(Hls.Events.FRAG_LOADED, function () {
-        // Reset contador quando um fragmento carrega com sucesso
+        // Reset contadores quando um fragmento carrega com sucesso
         consecutiveFatalErrors = 0;
+        mediaRecoverAttempts = 0;
       });
       window._vodyHls = hls;
 
       // Sincronização com live edge — evita loop/atraso
       setInterval(function () {
-        if (hls && hls.media && hls.liveSyncPosition) {
-          var behind = hls.liveSyncPosition - hls.media.currentTime;
+        var h = window._vodyHls;
+        if (h && h.media && h.liveSyncPosition) {
+          var behind = h.liveSyncPosition - h.media.currentTime;
           if (behind > 30) {
             console.warn('[STREAM] ' + Math.round(behind) + 's atras do live — pulando pro live edge');
-            hls.media.currentTime = hls.liveSyncPosition;
+            h.media.currentTime = h.liveSyncPosition;
           }
         }
       }, 10000);
+
+      // Watchdog — detecta player morto (sem novos segmentos por 60s)
+      var lastSegCount = 0;
+      var staleCheckCount = 0;
+      setInterval(function () {
+        if (segmentsLoaded === lastSegCount && !isRecreating) {
+          staleCheckCount++;
+          if (staleCheckCount >= 4) { // 4 x 15s = 60s sem novos segmentos
+            console.warn('[STREAM] Player morto (60s sem segmentos) — recriando...');
+            staleCheckCount = 0;
+            recreateHls();
+          }
+        } else {
+          staleCheckCount = 0;
+          lastSegCount = segmentsLoaded;
+        }
+      }, 15000);
 
       console.log('[STREAM] HLS iniciado: ' + initialUrl);
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
