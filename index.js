@@ -14,6 +14,31 @@ function getBrazilTimestamp() {
   return new Date().toLocaleString('sv-SE', { timeZone: 'America/Sao_Paulo' }).replace(' ', 'T') + '-03:00';
 }
 
+// ── Logger em arquivo ──
+const LOG_DIR = path.join(__dirname, 'data', 'logs');
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+
+function getLogPath() {
+  return path.join(LOG_DIR, `api_${getBrazilDate()}.log`);
+}
+
+function logToFile(level, message) {
+  const timestamp = getBrazilTimestamp();
+  const line = `[${timestamp}] [${level}] ${message}\n`;
+  try {
+    fs.appendFileSync(getLogPath(), line);
+  } catch (e) { /* ignore */ }
+  // Também imprime no console
+  if (level === 'ERROR') console.error(line.trim());
+  else console.log(line.trim());
+}
+
+const logger = {
+  info: (msg) => logToFile('INFO', msg),
+  warn: (msg) => logToFile('WARN', msg),
+  error: (msg) => logToFile('ERROR', msg),
+};
+
 // ── API Key secreta (só a extensão conhece) ──
 const API_KEY = process.env.API_KEY || 'vdo-overlay-k8x2m9p4q7w1';
 
@@ -323,7 +348,8 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    activeViewers: stats
+    activeViewers: stats,
+    activeLives: Object.keys(activeLives),
   });
 });
 
@@ -365,6 +391,38 @@ async function getCachedStreamUrl(mediamtxPath) {
   }
 }
 
+// ── Cache de live status via KV ──
+const liveStatusCache = {}; // { mediamtxPath: { status, timestamp } }
+const LIVE_STATUS_CACHE_TTL = 30000; // 30s
+
+async function getCachedLiveStatus(mediamtxPath) {
+  const now = Date.now();
+  const cached = liveStatusCache[mediamtxPath];
+
+  if (cached && (now - cached.timestamp) < LIVE_STATUS_CACHE_TTL) {
+    return cached.status;
+  }
+
+  try {
+    const kvResp = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_STREAM_PATHS}/values/live:${mediamtxPath}`,
+      { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` } }
+    );
+    if (kvResp.ok) {
+      const data = JSON.parse(await kvResp.text());
+      liveStatusCache[mediamtxPath] = { status: data.status, timestamp: now };
+      return data.status;
+    } else {
+      liveStatusCache[mediamtxPath] = { status: null, timestamp: now };
+      return null;
+    }
+  } catch (err) {
+    console.warn('[LIVE-STATUS] Erro KV:', err.message);
+    if (cached) return cached.status;
+    return null;
+  }
+}
+
 // ── GET /api/streamer/validate/:id_streamer ──
 app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) => {
   try {
@@ -396,9 +454,26 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
       stream_url = await getCachedStreamUrl(mediamtxPath);
     }
 
+    // Detectar início/fim de live via KV (live:{mediamtxPath})
+    const liveStatus = await getCachedLiveStatus(mediamtxPath);
+
+    // Se status = "active" e não tem live ativa → iniciar live
+    if (liveStatus === 'active' && stream_url && !activeLives[id_streamer]) {
+      await onLiveStart(id_streamer, streamer.user);
+    }
+
+    // Se status = "ended" e tem live ativa → encerrar live
+    if (liveStatus === 'ended' && activeLives[id_streamer]) {
+      // Setar flag para overlay fazer reload
+      endedStreamers[id_streamer.toLowerCase()] = true;
+      await onLiveEnd(id_streamer);
+      // Limpar flag após 5 min
+      setTimeout(() => { delete endedStreamers[id_streamer.toLowerCase()]; }, 300000);
+    }
+
     updateLivePeak(id_streamer);
 
-    // Verificar se stream acabou (flag setado pelo /api/live/end)
+    // Verificar se stream acabou
     const streamEnded = endedStreamers[id_streamer.toLowerCase()] || false;
 
     return res.json({
@@ -407,7 +482,7 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
       streamer: {
         ...streamer,
         current_viewers: currentViewers,
-        stream_url: stream_url
+        stream_url: streamEnded ? '' : stream_url
       }
     });
   } catch (err) {
@@ -669,7 +744,7 @@ app.post('/api/live/start', async (req, res) => {
 
     // Proteção: se já tem live ativa, ignorar
     if (activeLives[idStreamer]) {
-      console.log(`[LIVE] Start ignorado: ${idStreamer} já tem live ativa #${activeLives[idStreamer].liveId}`);
+      logger.info(`[LIVE] Start ignorado: ${idStreamer} já tem live ativa #${activeLives[idStreamer].liveId}`);
       return res.json({ started: false, reason: 'already_active', live_id: activeLives[idStreamer].liveId });
     }
 
@@ -679,7 +754,7 @@ app.post('/api/live/start', async (req, res) => {
     await onLiveStart(idStreamer, streamer.user);
     return res.json({ started: true, live_id: activeLives[idStreamer]?.liveId });
   } catch (e) {
-    console.error('[LIVE] Erro start:', e.message);
+    logger.error('[LIVE] Erro start:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
@@ -705,7 +780,7 @@ app.post('/api/live/end', async (req, res) => {
 
     // Proteção: se não tem live ativa, ignorar
     if (!activeLives[idStreamer]) {
-      console.log(`[LIVE] End ignorado: ${idStreamer} nao tem live ativa`);
+      logger.info(`[LIVE] End ignorado: ${idStreamer} nao tem live ativa`);
       return res.json({ ended: false, reason: 'no_active_live' });
     }
 
@@ -722,7 +797,7 @@ app.post('/api/live/end', async (req, res) => {
 
     return res.json({ ended: true, live_id: liveId });
   } catch (e) {
-    console.error('[LIVE] Erro end:', e.message);
+    logger.error('[LIVE] Erro end:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
@@ -737,9 +812,9 @@ async function onLiveStart(idStreamer, streamerName) {
     );
     const liveId = result.rows[0].id;
     activeLives[idStreamer] = { liveId, peakViewers: 0, viewerSessions: {} };
-    console.log(`[LIVE] Iniciada: ${streamerName} (${idStreamer}) → live #${liveId}`);
+    logger.info(`[LIVE] Iniciada: ${streamerName} (${idStreamer}) → live #${liveId}`);
   } catch (e) {
-    console.error('[LIVE] Erro ao iniciar:', e.message);
+    logger.error('[LIVE] Erro ao iniciar:', e.message);
   }
 }
 
@@ -778,9 +853,9 @@ async function onLiveEnd(idStreamer) {
       [durationSeconds, live.peakViewers, uniqueIPs.size, avgViewers, mobileIPs.size, desktopIPs.size, live.liveId]
     );
     await flushLiveViewerSessions(live);
-    console.log(`[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} | Únicos: ${uniqueIPs.size} (M:${mobileIPs.size} D:${desktopIPs.size})`);
+    logger.info(`[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} | Únicos: ${uniqueIPs.size} (M:${mobileIPs.size} D:${desktopIPs.size})`);
   } catch (e) {
-    console.error('[LIVE] Erro ao encerrar:', e.message);
+    logger.error('[LIVE] Erro ao encerrar:', e.message);
   }
   delete activeLives[idStreamer];
 }
@@ -807,7 +882,7 @@ async function flushLiveViewerSessions(live) {
       ]);
       count++;
     } catch (e) {
-      console.warn(`[LIVE] Erro flush viewer ${viewerUid}:`, e.message);
+      logger.warn(`[LIVE] Erro flush viewer ${viewerUid}:`, e.message);
     }
   }
   if (count > 0) console.log(`[FLUSH] Live #${live.liveId}: ${count} viewers`);
@@ -1020,10 +1095,10 @@ async function restoreActiveLives() {
           quality_history: s.quality_history || [], player_health: s.player_health || {},
         };
       }
-      console.log(`[LIVE] Restaurada: ${row.streamer} (${row.id_streamer}) → live #${row.id} | ${sessions.rows.length} viewers`);
+      logger.info(`[LIVE] Restaurada: ${row.streamer} (${row.id_streamer}) → live #${row.id} | ${sessions.rows.length} viewers`);
     }
   } catch (e) {
-    console.warn('[LIVE] Erro ao restaurar lives:', e.message);
+    logger.warn('[LIVE] Erro ao restaurar lives:', e.message);
   }
 }
 
@@ -1139,6 +1214,39 @@ app.put('/api/streamer/:id_streamer/commission', requireApiKey, async (req, res)
   } catch (e) {
     console.error('[COMMISSION] Erro:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// GET /api/logs — ler logs do dia (ou data específica)
+app.get('/api/logs', requireApiKey, (req, res) => {
+  try {
+    const date = req.query.date || getBrazilDate();
+    const logPath = path.join(LOG_DIR, `api_${date}.log`);
+    if (!fs.existsSync(logPath)) {
+      return res.json({ date, lines: [] });
+    }
+    const content = fs.readFileSync(logPath, 'utf8');
+    const lines = content.split('\n').filter(Boolean);
+    // Filtro opcional
+    const filter = req.query.filter;
+    const filtered = filter ? lines.filter(l => l.includes(filter)) : lines;
+    // Últimas N linhas
+    const tail = parseInt(req.query.tail) || 100;
+    return res.json({ date, total: filtered.length, lines: filtered.slice(-tail) });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+// GET /api/logs/dates — listar datas disponíveis
+app.get('/api/logs/dates', requireApiKey, (req, res) => {
+  try {
+    if (!fs.existsSync(LOG_DIR)) return res.json({ dates: [] });
+    const files = fs.readdirSync(LOG_DIR).filter(f => f.startsWith('api_') && f.endsWith('.log'));
+    const dates = files.map(f => f.replace('api_', '').replace('.log', '')).sort().reverse();
+    return res.json({ dates });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
   }
 });
 

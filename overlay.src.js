@@ -395,8 +395,8 @@
         // Stream encerrado — URL vazia
         if (!data.valid || !data.streamer.stream_url) {
           consecutiveEmptyUrl++;
-          console.warn('[STREAM] stream_url vazio (' + consecutiveEmptyUrl + '/3)');
-          if (consecutiveEmptyUrl >= 3) {
+          console.warn('[STREAM] stream_url vazio (' + consecutiveEmptyUrl + '/5)');
+          if (consecutiveEmptyUrl >= 5) {
             showStreamEnded();
           }
           return;
@@ -703,8 +703,8 @@
           }
           lastFatalTime = now;
 
-          if (consecutiveFatalErrors >= 10) {
-            console.warn('[STREAM] 10+ erros fatais consecutivos — stream provavelmente encerrado');
+          if (consecutiveFatalErrors >= 20) {
+            console.warn('[STREAM] 20+ erros fatais consecutivos — stream provavelmente encerrado');
             showStreamEnded();
             return;
           }
@@ -723,6 +723,18 @@
         consecutiveFatalErrors = 0;
       });
       window._vodyHls = hls;
+
+      // Sincronização com live edge — evita loop/atraso
+      setInterval(function () {
+        if (hls && hls.media && hls.liveSyncPosition) {
+          var behind = hls.liveSyncPosition - hls.media.currentTime;
+          if (behind > 30) {
+            console.warn('[STREAM] ' + Math.round(behind) + 's atras do live — pulando pro live edge');
+            hls.media.currentTime = hls.liveSyncPosition;
+          }
+        }
+      }, 10000);
+
       console.log('[STREAM] HLS iniciado: ' + initialUrl);
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       // Safari / iOS — HLS nativo
