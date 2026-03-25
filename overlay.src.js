@@ -403,11 +403,11 @@
         }
         consecutiveEmptyUrl = 0;
 
-        // Atualizar contador de viewers (sem request extra)
-        if (data.streamer.current_viewers !== undefined) {
-          var el = document.getElementById('stream-viewer-count-text');
-          if (el) el.textContent = data.streamer.current_viewers + ' assistindo';
-        }
+        // Atualizar contador de viewers (sem request extra) — DESABILITADO TEMPORARIAMENTE
+        // if (data.streamer.current_viewers !== undefined) {
+        //   var el = document.getElementById('stream-viewer-count-text');
+        //   if (el) el.textContent = data.streamer.current_viewers + ' assistindo';
+        // }
 
         var newBase = data.streamer.stream_url.replace(/\/master\.m3u8$/, '');
         var oldBase = window._vodyStreamBase;
@@ -617,7 +617,7 @@
         sendMetricsJoin(streamerCode);
         startHeartbeat(streamerCode);
         startPathCheck(streamerCode);
-        startViewerCounter(streamerCode, player);
+        // startViewerCounter(streamerCode, player); // DESABILITADO TEMPORARIAMENTE
 
         setStatus('Conectado!', '#4caf50');
         setTimeout(function () { overlay.remove(); }, 1500);
