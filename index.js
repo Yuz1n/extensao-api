@@ -308,6 +308,8 @@ async function initDB() {
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS unique_desktop INTEGER DEFAULT 0`);
     // Adicionar avg_viewers se não existir (banco existente)
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers REAL DEFAULT 0`);
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_mobile REAL DEFAULT 0`);
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_desktop REAL DEFAULT 0`);
 
     // Tabela de sessões de viewer por live
     await pool.query(`
@@ -853,10 +855,19 @@ async function onLiveEnd(idStreamer) {
       : 0;
 
     // Calcular média de viewers (CCV): soma total_seconds / duração
-    const totalWatchSeconds = Object.values(live.viewerSessions)
-      .reduce((sum, s) => sum + (s.total_seconds || 0), 0);
+    const sessions = Object.values(live.viewerSessions);
+    const totalWatchSeconds = sessions.reduce((sum, s) => sum + (s.total_seconds || 0), 0);
+    const totalMobileSeconds = sessions.filter(s => s.is_mobile).reduce((sum, s) => sum + (s.total_seconds || 0), 0);
+    const totalDesktopSeconds = totalWatchSeconds - totalMobileSeconds;
+
     const avgViewers = durationSeconds > 0
       ? Math.round((totalWatchSeconds / durationSeconds) * 10) / 10
+      : 0;
+    const avgViewersMobile = durationSeconds > 0
+      ? Math.round((totalMobileSeconds / durationSeconds) * 10) / 10
+      : 0;
+    const avgViewersDesktop = durationSeconds > 0
+      ? Math.round((totalDesktopSeconds / durationSeconds) * 10) / 10
       : 0;
 
     // Contar viewers únicos mobile vs desktop (por IP)
@@ -870,11 +881,13 @@ async function onLiveEnd(idStreamer) {
     await pool.query(
       `UPDATE lives SET ended_at = NOW(), duration_seconds = $1,
        peak_viewers = $2, total_unique_viewers = $3, avg_viewers = $4,
-       unique_mobile = $5, unique_desktop = $6, status = 'ended' WHERE id = $7`,
-      [durationSeconds, live.peakViewers, uniqueIPs.size, avgViewers, mobileIPs.size, desktopIPs.size, live.liveId]
+       unique_mobile = $5, unique_desktop = $6,
+       avg_viewers_mobile = $7, avg_viewers_desktop = $8,
+       status = 'ended' WHERE id = $9`,
+      [durationSeconds, live.peakViewers, uniqueIPs.size, avgViewers, mobileIPs.size, desktopIPs.size, avgViewersMobile, avgViewersDesktop, live.liveId]
     );
     await flushLiveViewerSessions(live);
-    logger.info(`[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} | Únicos: ${uniqueIPs.size} (M:${mobileIPs.size} D:${desktopIPs.size})`);
+    logger.info(`[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} (M:${avgViewersMobile} D:${avgViewersDesktop}) | Únicos: ${uniqueIPs.size} (M:${mobileIPs.size} D:${desktopIPs.size})`);
   } catch (e) {
     logger.error('[LIVE] Erro ao encerrar:', e.message);
   }
@@ -1130,23 +1143,31 @@ async function restoreActiveLives() {
 // ── POST /api/revenue — Cálculo de receita e comissão ──
 app.post('/api/revenue', requireApiKey, async (req, res) => {
   try {
-    const { value_per_view_hour, start_date, end_date } = req.body;
+    const { value_per_view_hour, start_date, end_date, platform_filter } = req.body;
     if (!value_per_view_hour || !start_date || !end_date) {
       return res.status(400).json({ message: 'Campos obrigatórios: value_per_view_hour, start_date, end_date' });
     }
+
+    const pf = platform_filter || 'all'; // 'all' | 'mobile' | 'desktop'
 
     // Buscar todos os streamers com comissão
     const streamersResult = await pool.query(
       'SELECT id, "user", id_streamer, commission FROM streamer ORDER BY id'
     );
 
-    // Buscar todas as lives no período (apenas finalizadas)
+    // Buscar lives no período com watch-seconds por plataforma (via JOIN)
     const livesResult = await pool.query(
-      `SELECT id, streamer, id_streamer, started_at, ended_at, duration_seconds,
-              peak_viewers, total_unique_viewers, avg_viewers, status
-       FROM lives
-       WHERE started_at >= $1 AND started_at <= $2
-       ORDER BY started_at ASC`,
+      `SELECT l.id, l.streamer, l.id_streamer, l.started_at, l.ended_at, l.duration_seconds,
+              l.peak_viewers, l.total_unique_viewers, l.avg_viewers,
+              l.avg_viewers_mobile, l.avg_viewers_desktop, l.status,
+              COALESCE(SUM(CASE WHEN vs.is_mobile = true THEN vs.total_seconds ELSE 0 END), 0)::INTEGER as mobile_seconds,
+              COALESCE(SUM(CASE WHEN vs.is_mobile = false THEN vs.total_seconds ELSE 0 END), 0)::INTEGER as desktop_seconds,
+              COALESCE(SUM(vs.total_seconds), 0)::INTEGER as all_seconds
+       FROM lives l
+       LEFT JOIN live_viewer_sessions vs ON vs.live_id = l.id
+       WHERE l.started_at >= $1 AND l.started_at <= $2
+       GROUP BY l.id
+       ORDER BY l.started_at ASC`,
       [start_date, end_date + 'T23:59:59']
     );
 
@@ -1172,9 +1193,21 @@ app.post('/api/revenue', requireApiKey, async (req, res) => {
       const key = live.id_streamer.toLowerCase();
       if (!streamerData[key]) continue;
 
-      const durationHours = (live.duration_seconds || 0) / 3600;
-      const avgViewers = live.avg_viewers || 0;
-      const revenue = avgViewers * durationHours * vpvh;
+      const durationSeconds = live.duration_seconds || 0;
+      const durationHours = durationSeconds / 3600;
+
+      // Calcular avg_viewers por plataforma a partir dos seconds (funciona pra dados historicos)
+      const avgAll = durationSeconds > 0 ? Math.round((live.all_seconds / durationSeconds) * 10) / 10 : (live.avg_viewers || 0);
+      const avgMobile = durationSeconds > 0 ? Math.round((live.mobile_seconds / durationSeconds) * 10) / 10 : 0;
+      const avgDesktop = durationSeconds > 0 ? Math.round((live.desktop_seconds / durationSeconds) * 10) / 10 : 0;
+
+      // Escolher avg baseado no filtro de plataforma
+      let avgForRevenue;
+      if (pf === 'mobile') avgForRevenue = avgMobile;
+      else if (pf === 'desktop') avgForRevenue = avgDesktop;
+      else avgForRevenue = avgAll;
+
+      const revenue = avgForRevenue * durationHours * vpvh;
 
       streamerData[key].lives.push({
         live_id: live.id,
@@ -1182,8 +1215,10 @@ app.post('/api/revenue', requireApiKey, async (req, res) => {
         started_at: live.started_at,
         ended_at: live.ended_at,
         duration_hours: Math.round(durationHours * 100) / 100,
-        duration_formatted: formatTime(live.duration_seconds || 0),
-        avg_viewers: Math.round(avgViewers),
+        duration_formatted: formatTime(durationSeconds),
+        avg_viewers: Math.round(avgAll),
+        avg_viewers_mobile: Math.round(avgMobile),
+        avg_viewers_desktop: Math.round(avgDesktop),
         peak_viewers: live.peak_viewers,
         total_unique_viewers: live.total_unique_viewers,
         revenue: Math.round(revenue * 100) / 100,
@@ -1211,6 +1246,7 @@ app.post('/api/revenue', requireApiKey, async (req, res) => {
     return res.json({
       period: { start: start_date, end: end_date },
       value_per_view_hour: vpvh,
+      platform_filter: pf,
       total_revenue: Math.round(totalRevenue * 100) / 100,
       total_commission: Math.round(totalCommission * 100) / 100,
       net_profit: Math.round((totalRevenue - totalCommission) * 100) / 100,
