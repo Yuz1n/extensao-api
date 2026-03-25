@@ -803,21 +803,30 @@
         }
       }, 10000);
 
-      // Watchdog — detecta player morto (sem novos segmentos por 60s)
+      // Watchdog — detecta player realmente morto
+      // Só recria se: segmentos pararam + buffer vazio + não pausado pelo user
       var lastSegCount = 0;
       var staleCheckCount = 0;
       setInterval(function () {
-        if (segmentsLoaded === lastSegCount && !isRecreating) {
+        var h = window._vodyHls;
+        if (!h || !h.media || isRecreating) return;
+
+        var vid = h.media;
+        var segsStopped = (segmentsLoaded === lastSegCount);
+        var bufferEmpty = vid.buffered.length === 0 || (vid.buffered.length > 0 && (vid.buffered.end(vid.buffered.length - 1) - vid.currentTime) < 1);
+        var notPaused = !vid.paused;
+
+        if (segsStopped && bufferEmpty && notPaused) {
           staleCheckCount++;
-          if (staleCheckCount >= 4) { // 4 x 15s = 60s sem novos segmentos
-            console.warn('[STREAM] Player morto (60s sem segmentos) — recriando...');
+          if (staleCheckCount >= 6) { // 6 x 15s = 90s sem segmentos + buffer vazio + tocando
+            console.warn('[STREAM] Player morto (90s sem segmentos, buffer vazio) — recriando...');
             staleCheckCount = 0;
             recreateHls();
           }
         } else {
           staleCheckCount = 0;
-          lastSegCount = segmentsLoaded;
         }
+        lastSegCount = segmentsLoaded;
       }, 15000);
 
       console.log('[STREAM] HLS iniciado: ' + initialUrl);
