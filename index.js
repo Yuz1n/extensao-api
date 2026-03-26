@@ -611,7 +611,21 @@ app.post('/api/viewer/leave', requireApiKey, async (req, res) => {
 // ── GET /api/viewer/count/:id_streamer — Ver contagem atual ──
 app.get('/api/viewer/count/:id_streamer', requireApiKey, async (req, res) => {
   const { id_streamer } = req.params;
+  const key = id_streamer.toLowerCase();
   const currentViewers = getViewerCount(id_streamer);
+
+  // Contar viewers ativos por plataforma (cruzando activeViewers com activeLives)
+  let currentMobile = 0;
+  let currentDesktop = 0;
+  const liveData = activeLives[key];
+  const viewers = activeViewers[key];
+  if (liveData && viewers) {
+    for (const uid of Object.keys(viewers)) {
+      const session = liveData.viewerSessions[uid];
+      if (session?.is_mobile) currentMobile++;
+      else currentDesktop++;
+    }
+  }
 
   const result = await pool.query(
     'SELECT max_spectators FROM streamer WHERE LOWER(id_streamer) = LOWER($1)',
@@ -623,6 +637,8 @@ app.get('/api/viewer/count/:id_streamer', requireApiKey, async (req, res) => {
   return res.json({
     id_streamer,
     current_viewers: currentViewers,
+    current_mobile: currentMobile,
+    current_desktop: currentDesktop,
     max_spectators: maxSpectators
   });
 });
