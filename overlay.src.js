@@ -663,17 +663,20 @@
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
       var hls = new Hls({
-        lowLatencyMode: true,
-        liveSyncDurationCount: 3,
-        liveMaxLatencyDurationCount: 5,
-        backBufferLength: 0,
+        lowLatencyMode: false,
+        liveSyncDurationCount: 4,
+        liveMaxLatencyDurationCount: 8,
+        backBufferLength: 15,
         enableWorker: true,
         maxBufferLength: 30,
         maxMaxBufferLength: 60,
-        maxBufferHole: 0.8,
-        fragLoadingTimeOut: 25000,
-        fragLoadingMaxRetry: 8,
-        fragLoadingRetryDelay: 1500,
+        maxBufferHole: 1.5,
+        fragLoadingTimeOut: 45000,
+        fragLoadingMaxRetry: 6,
+        fragLoadingRetryDelay: 3000,
+        levelLoadingTimeOut: 20000,
+        levelLoadingMaxRetry: 6,
+        levelLoadingRetryDelay: 3000,
       });
       hls.attachMedia(video);
       hls.loadSource(initialUrl);
@@ -710,17 +713,20 @@
           var quality = window._vodyCurrentQuality || defaultQuality;
           var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
           var newHls = new Hls({
-            lowLatencyMode: true,
-            liveSyncDurationCount: 3,
-            liveMaxLatencyDurationCount: 5,
-            backBufferLength: 0,
+            lowLatencyMode: false,
+            liveSyncDurationCount: 4,
+            liveMaxLatencyDurationCount: 8,
+            backBufferLength: 15,
             enableWorker: true,
-            maxBufferLength: 10,
-            maxMaxBufferLength: 20,
-            maxBufferHole: 0.8,
-            fragLoadingTimeOut: 25000,
-            fragLoadingMaxRetry: 8,
-            fragLoadingRetryDelay: 1500,
+            maxBufferLength: 30,
+            maxMaxBufferLength: 60,
+            maxBufferHole: 1.5,
+            fragLoadingTimeOut: 45000,
+            fragLoadingMaxRetry: 6,
+            fragLoadingRetryDelay: 3000,
+            levelLoadingTimeOut: 20000,
+            levelLoadingMaxRetry: 6,
+            levelLoadingRetryDelay: 3000,
           });
           newHls.attachMedia(video);
           newHls.loadSource(url);
@@ -746,7 +752,21 @@
       }
 
       function handleHlsError(data) {
-        if (!data.fatal) return;
+        // Para erros não-fatais de buffer, tentar nudge suave antes de escalar
+        if (!data.fatal) {
+          if (data.details === 'bufferStalledError' && window._vodyHls && window._vodyHls.media) {
+            var vid = window._vodyHls.media;
+            var h = window._vodyHls;
+            // Se tem buffer à frente, pular o gap pra destravar o áudio
+            if (vid.buffered.length > 0 && h.liveSyncPosition) {
+              var bufEnd = vid.buffered.end(vid.buffered.length - 1);
+              if (bufEnd - vid.currentTime > 2) {
+                vid.currentTime = vid.currentTime + 0.5;
+              }
+            }
+          }
+          return;
+        }
 
         var now = Date.now();
         if (now - lastFatalTime < 10000) {
@@ -767,11 +787,11 @@
           console.warn('[STREAM] Network error, tentando reconectar...');
           setTimeout(function () {
             if (window._vodyHls) window._vodyHls.startLoad();
-          }, 3000);
+          }, 5000);
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           mediaRecoverAttempts++;
-          if (mediaRecoverAttempts <= 2) {
-            console.warn('[STREAM] Media error (' + mediaRecoverAttempts + '/2), recuperando...');
+          if (mediaRecoverAttempts <= 3) {
+            console.warn('[STREAM] Media error (' + mediaRecoverAttempts + '/3), recuperando...');
             if (window._vodyHls) window._vodyHls.recoverMediaError();
           } else {
             console.warn('[STREAM] Media error persistente — recriando player...');
