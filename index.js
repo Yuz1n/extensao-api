@@ -14,45 +14,37 @@ function getBrazilTimestamp() {
   return new Date().toLocaleString('sv-SE', { timeZone: 'America/Sao_Paulo' }).replace(' ', 'T') + '-03:00';
 }
 
-// ── Logger em arquivo (intercepta TODOS os console.log/warn/error) ──
-const LOG_DIR = path.join(__dirname, 'data', 'logs');
-if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+// ── Logger por live (um arquivo por live por streamer) ──
+const LIVES_LOG_DIR = path.join(__dirname, 'data', 'logs', 'lives');
+if (!fs.existsSync(LIVES_LOG_DIR)) fs.mkdirSync(LIVES_LOG_DIR, { recursive: true });
 
-function getLogPath() {
-  return path.join(LOG_DIR, `api_${getBrazilDate()}.log`);
+function createLiveLogPath(idStreamer) {
+  const date = getBrazilDate();
+  const prefix = `${date}_${idStreamer}_`;
+  const existing = fs.readdirSync(LIVES_LOG_DIR).filter(f => f.startsWith(prefix) && f.endsWith('.log'));
+  const n = existing.length + 1;
+  return path.join(LIVES_LOG_DIR, `${prefix}${n}.log`);
 }
 
-function logToFile(level, ...args) {
+function logToLive(idStreamer, level, ...args) {
+  const live = activeLives[idStreamer];
+  if (!live || !live.logPath) return;
   const timestamp = getBrazilTimestamp();
   const message = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
   const line = `[${timestamp}] [${level}] ${message}\n`;
   try {
-    fs.appendFileSync(getLogPath(), line);
+    fs.appendFileSync(live.logPath, line);
   } catch (e) { /* ignore */ }
 }
-
-// Interceptar console.log, console.warn, console.error
-const _originalLog = console.log.bind(console);
-const _originalWarn = console.warn.bind(console);
-const _originalError = console.error.bind(console);
-
-console.log = function (...args) {
-  _originalLog(...args);
-  logToFile('INFO', ...args);
-};
-console.warn = function (...args) {
-  _originalWarn(...args);
-  logToFile('WARN', ...args);
-};
-console.error = function (...args) {
-  _originalError(...args);
-  logToFile('ERROR', ...args);
-};
 
 const logger = {
   info: (...args) => console.log(...args),
   warn: (...args) => console.warn(...args),
   error: (...args) => console.error(...args),
+  live: (idStreamer, level, ...args) => {
+    console[level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'log'](...args);
+    logToLive(idStreamer, level, ...args);
+  },
 };
 
 // ── API Key secreta (só a extensão conhece) ──
@@ -504,7 +496,7 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
       }
     });
   } catch (err) {
-    console.error(`[VALIDATE] Erro:`, err.message);
+    logger.live(id_streamer, 'ERROR', `[VALIDATE] Erro:`, err.message);
     return res.status(500).json({ valid: false, message: 'Erro interno do servidor' });
   }
 });
@@ -534,7 +526,7 @@ app.post('/api/viewer/join', requireApiKey, async (req, res) => {
 
     // max_spectators = 0 significa sem limite
     if (maxSpectators > 0 && currentViewers >= maxSpectators) {
-      console.log(`[JOIN] Sala cheia para "${id_streamer}": ${currentViewers}/${maxSpectators}`);
+      logger.live(id_streamer, 'WARN', `[JOIN] Sala cheia para "${id_streamer}": ${currentViewers}/${maxSpectators}`);
       return res.status(403).json({
         message: 'Sala cheia',
         current_viewers: currentViewers,
@@ -547,7 +539,7 @@ app.post('/api/viewer/join', requireApiKey, async (req, res) => {
     updateLivePeak(id_streamer);
     const newCount = getViewerCount(id_streamer);
 
-    console.log(`[JOIN] Viewer ${viewer_uid.substring(0, 8)}... entrou em "${id_streamer}" | Viewers: ${newCount}/${maxSpectators || 'ilimitado'}`);
+    logger.live(id_streamer, 'INFO', `[JOIN] Viewer ${viewer_uid.substring(0, 8)}... entrou em "${id_streamer}" | Viewers: ${newCount}/${maxSpectators || 'ilimitado'}`);
 
     return res.json({
       joined: true,
@@ -555,7 +547,7 @@ app.post('/api/viewer/join', requireApiKey, async (req, res) => {
       max_spectators: maxSpectators
     });
   } catch (err) {
-    console.error('[JOIN] Erro:', err.message);
+    logger.live(id_streamer, 'ERROR', '[JOIN] Erro:', err.message);
     return res.status(500).json({ message: 'Erro interno do servidor' });
   }
 });
@@ -578,7 +570,7 @@ app.post('/api/viewer/heartbeat', requireApiKey, async (req, res) => {
       current_viewers: currentViewers
     });
   } catch (err) {
-    console.error('[HEARTBEAT] Erro:', err.message);
+    logger.live(id_streamer, 'ERROR', '[HEARTBEAT] Erro:', err.message);
     return res.status(500).json({ message: 'Erro interno do servidor' });
   }
 });
@@ -596,14 +588,14 @@ app.post('/api/viewer/leave', requireApiKey, async (req, res) => {
     removeViewer(id_streamer, viewer_uid);
     const currentViewers = getViewerCount(id_streamer);
 
-    console.log(`[LEAVE] Viewer ${viewer_uid.substring(0, 8)}... saiu de "${id_streamer}" | Viewers: ${currentViewers}`);
+    logger.live(id_streamer, 'INFO', `[LEAVE] Viewer ${viewer_uid.substring(0, 8)}... saiu de "${id_streamer}" | Viewers: ${currentViewers}`);
 
     return res.json({
       left: true,
       current_viewers: currentViewers
     });
   } catch (err) {
-    console.error('[LEAVE] Erro:', err.message);
+    logger.live(id_streamer, 'ERROR', '[LEAVE] Erro:', err.message);
     return res.status(500).json({ message: 'Erro interno do servidor' });
   }
 });
@@ -849,10 +841,11 @@ async function onLiveStart(idStreamer, streamerName) {
       [streamerName, idStreamer]
     );
     const liveId = result.rows[0].id;
-    activeLives[idStreamer] = { liveId, peakViewers: 0, viewerSessions: {} };
-    logger.info(`[LIVE] Iniciada: ${streamerName} (${idStreamer}) → live #${liveId}`);
+    const logPath = createLiveLogPath(idStreamer);
+    activeLives[idStreamer] = { liveId, peakViewers: 0, viewerSessions: {}, logPath };
+    logger.live(idStreamer, 'INFO', `[LIVE] Iniciada: ${streamerName} (${idStreamer}) → live #${liveId}`);
   } catch (e) {
-    logger.error('[LIVE] Erro ao iniciar:', e.message);
+    console.error('[LIVE] Erro ao iniciar:', e.message);
   }
 }
 
@@ -903,9 +896,9 @@ async function onLiveEnd(idStreamer) {
       [durationSeconds, live.peakViewers, uniqueIPs.size, avgViewers, mobileIPs.size, desktopIPs.size, avgViewersMobile, avgViewersDesktop, live.liveId]
     );
     await flushLiveViewerSessions(live);
-    logger.info(`[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} (M:${avgViewersMobile} D:${avgViewersDesktop}) | Únicos: ${uniqueIPs.size} (M:${mobileIPs.size} D:${desktopIPs.size})`);
+    logger.live(idStreamer, 'INFO', `[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} (M:${avgViewersMobile} D:${avgViewersDesktop}) | Únicos: ${uniqueIPs.size} (M:${mobileIPs.size} D:${desktopIPs.size})`);
   } catch (e) {
-    logger.error('[LIVE] Erro ao encerrar:', e.message);
+    logger.live(idStreamer, 'ERROR', '[LIVE] Erro ao encerrar:', e.message);
   }
   delete activeLives[idStreamer];
 }
@@ -1008,10 +1001,10 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
       || req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown';
     trackLiveViewer(id_streamer, viewer_uid, device_info, ip);
     updateLivePeak(id_streamer);
-    console.log(`[METRICS] Viewer ${ip} (${device_info?.kick_username || '?'}) entrou em ${id_streamer}`);
+    logger.live(id_streamer, 'INFO', `[METRICS] Viewer ${ip} (${device_info?.kick_username || '?'}) entrou em ${id_streamer}`);
     return res.json({ tracked: true });
   } catch (e) {
-    console.error('[METRICS] Erro join:', e.message);
+    logger.live(id_streamer, 'ERROR', '[METRICS] Erro join:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
@@ -1049,7 +1042,7 @@ app.post('/api/metrics/update', requireApiKey, (req, res) => {
     updateLivePeak(id_streamer);
     return res.json({ tracked: true });
   } catch (e) {
-    console.error('[METRICS] Erro update:', e.message);
+    logger.live(id_streamer, 'ERROR', '[METRICS] Erro update:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
@@ -1083,7 +1076,7 @@ app.get('/api/lives/:id_streamer', requireApiKey, async (req, res) => {
     }));
     return res.json({ streamer: id_streamer, total: lives.length, lives });
   } catch (e) {
-    console.error('[LIVES] Erro list:', e.message);
+    logger.live(id_streamer, 'ERROR', '[LIVES] Erro list:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
@@ -1127,7 +1120,7 @@ app.get('/api/lives/:id_streamer/:live_id', requireApiKey, async (req, res) => {
       },
     });
   } catch (e) {
-    console.error('[LIVES] Erro detail:', e.message);
+    logger.live(id_streamer, 'ERROR', '[LIVES] Erro detail:', e.message);
     return res.status(500).json({ message: 'Erro interno' });
   }
 });
@@ -1137,10 +1130,12 @@ async function restoreActiveLives() {
   try {
     const result = await pool.query("SELECT * FROM lives WHERE status = 'active'");
     for (const row of result.rows) {
-      activeLives[row.id_streamer.toLowerCase()] = { liveId: row.id, peakViewers: row.peak_viewers || 0, viewerSessions: {} };
+      const restoredKey = row.id_streamer.toLowerCase();
+      const logPath = createLiveLogPath(restoredKey);
+      activeLives[restoredKey] = { liveId: row.id, peakViewers: row.peak_viewers || 0, viewerSessions: {}, logPath };
       const sessions = await pool.query('SELECT * FROM live_viewer_sessions WHERE live_id = $1', [row.id]);
       for (const s of sessions.rows) {
-        activeLives[row.id_streamer.toLowerCase()].viewerSessions[s.viewer_uid] = {
+        activeLives[restoredKey].viewerSessions[s.viewer_uid] = {
           ip: s.ip, kick_username: s.kick_username, platform: s.platform, os: s.os,
           os_version: s.os_version, device_model: s.device_model, browser: s.browser,
           browser_version: s.browser_version, user_agent: s.user_agent, is_mobile: s.is_mobile,
@@ -1149,10 +1144,10 @@ async function restoreActiveLives() {
           quality_history: s.quality_history || [], player_health: s.player_health || {},
         };
       }
-      logger.info(`[LIVE] Restaurada: ${row.streamer} (${row.id_streamer}) → live #${row.id} | ${sessions.rows.length} viewers`);
+      logger.live(restoredKey, 'INFO', `[LIVE] Restaurada: ${row.streamer} (${row.id_streamer}) → live #${row.id} | ${sessions.rows.length} viewers`);
     }
   } catch (e) {
-    logger.warn('[LIVE] Erro ao restaurar lives:', e.message);
+    console.warn('[LIVE] Erro ao restaurar lives:', e.message);
   }
 }
 
@@ -1294,34 +1289,69 @@ app.put('/api/streamer/:id_streamer/commission', requireApiKey, async (req, res)
   }
 });
 
-// GET /api/logs — ler logs do dia (ou data específica)
+// GET /api/logs — ler logs de uma live específica
+// Query: ?streamer=beli21&date=2026-03-26&live=1&filter=JOIN&tail=100
 app.get('/api/logs', requireApiKey, (req, res) => {
   try {
+    const streamer = (req.query.streamer || '').toLowerCase();
+    if (!streamer) return res.status(400).json({ message: 'Query "streamer" obrigatória' });
+
     const date = req.query.date || getBrazilDate();
-    const logPath = path.join(LOG_DIR, `api_${date}.log`);
-    if (!fs.existsSync(logPath)) {
-      return res.json({ date, lines: [] });
-    }
+    const prefix = `${date}_${streamer}_`;
+
+    if (!fs.existsSync(LIVES_LOG_DIR)) return res.json({ date, streamer, lines: [] });
+
+    // Se live não informado, pegar o último
+    const files = fs.readdirSync(LIVES_LOG_DIR).filter(f => f.startsWith(prefix) && f.endsWith('.log')).sort();
+    if (files.length === 0) return res.json({ date, streamer, lines: [] });
+
+    const liveNum = parseInt(req.query.live) || files.length;
+    const targetFile = `${prefix}${liveNum}.log`;
+    const logPath = path.join(LIVES_LOG_DIR, targetFile);
+
+    if (!fs.existsSync(logPath)) return res.json({ date, streamer, live: liveNum, lines: [] });
+
     const content = fs.readFileSync(logPath, 'utf8');
     const lines = content.split('\n').filter(Boolean);
-    // Filtro opcional
     const filter = req.query.filter;
     const filtered = filter ? lines.filter(l => l.includes(filter)) : lines;
-    // Últimas N linhas
     const tail = parseInt(req.query.tail) || 100;
-    return res.json({ date, total: filtered.length, lines: filtered.slice(-tail) });
+
+    return res.json({ date, streamer, live: liveNum, total_lives: files.length, total: filtered.length, lines: filtered.slice(-tail) });
   } catch (e) {
     return res.status(500).json({ message: e.message });
   }
 });
 
-// GET /api/logs/dates — listar datas disponíveis
+// GET /api/logs/dates — listar datas e lives disponíveis por streamer
+// Query: ?streamer=beli21 (opcional)
 app.get('/api/logs/dates', requireApiKey, (req, res) => {
   try {
-    if (!fs.existsSync(LOG_DIR)) return res.json({ dates: [] });
-    const files = fs.readdirSync(LOG_DIR).filter(f => f.startsWith('api_') && f.endsWith('.log'));
-    const dates = files.map(f => f.replace('api_', '').replace('.log', '')).sort().reverse();
-    return res.json({ dates });
+    if (!fs.existsSync(LIVES_LOG_DIR)) return res.json({ dates: [] });
+    const streamer = (req.query.streamer || '').toLowerCase();
+    const files = fs.readdirSync(LIVES_LOG_DIR).filter(f => f.endsWith('.log'));
+
+    const result = {};
+    for (const f of files) {
+      // Formato: YYYY-MM-DD_streamer_N.log
+      const match = f.match(/^(\d{4}-\d{2}-\d{2})_(.+)_(\d+)\.log$/);
+      if (!match) continue;
+      const [, fDate, fStreamer, fNum] = match;
+      if (streamer && fStreamer !== streamer) continue;
+      if (!result[fDate]) result[fDate] = {};
+      if (!result[fDate][fStreamer]) result[fDate][fStreamer] = [];
+      result[fDate][fStreamer].push(parseInt(fNum));
+    }
+
+    // Ordenar
+    const dates = Object.keys(result).sort().reverse();
+    for (const d of dates) {
+      for (const s of Object.keys(result[d])) {
+        result[d][s].sort((a, b) => a - b);
+      }
+    }
+
+    return res.json({ dates, lives: result });
   } catch (e) {
     return res.status(500).json({ message: e.message });
   }
