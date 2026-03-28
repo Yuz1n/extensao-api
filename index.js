@@ -366,6 +366,7 @@ app.get('/health', (req, res) => {
 // ── Stream URL cache (evita rate limit da Cloudflare KV API) ──
 const streamUrlCache = {}; // { mediamtxPath: { url, timestamp } }
 const CACHE_TTL_MS = 30000; // 30 segundos
+const pendingKvRequests = {}; // { mediamtxPath: Promise } — deduplicação de requests
 
 async function getCachedStreamUrl(mediamtxPath) {
   const now = Date.now();
@@ -376,29 +377,40 @@ async function getCachedStreamUrl(mediamtxPath) {
     return cached.url;
   }
 
-  // Buscar do KV
-  try {
-    const kvResp = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_STREAM_PATHS}/values/path:${mediamtxPath}`,
-      { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` } }
-    );
-    if (kvResp.ok) {
-      const pathData = JSON.parse(await kvResp.text());
-      const url = `https://${CDN_DOMAIN}/${pathData.uuid}/${mediamtxPath}/master.m3u8`;
-      streamUrlCache[mediamtxPath] = { url, timestamp: now };
-      console.log(`[CACHE] Stream URL atualizado: ${mediamtxPath} → ${url}`);
-      return url;
-    } else {
-      console.warn(`[CACHE] KV retornou ${kvResp.status} para ${mediamtxPath}`);
-      // Se tem cache expirado, retorna ele em vez de vazio (graceful degradation)
+  // Se já tem uma request em andamento pro mesmo path, reusar a Promise
+  if (pendingKvRequests[mediamtxPath]) {
+    return pendingKvRequests[mediamtxPath];
+  }
+
+  // Buscar do KV (uma única request, compartilhada entre todos os viewers)
+  const kvPromise = (async () => {
+    try {
+      const kvResp = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_STREAM_PATHS}/values/path:${mediamtxPath}`,
+        { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` }, signal: AbortSignal.timeout(5000) }
+      );
+      if (kvResp.ok) {
+        const pathData = JSON.parse(await kvResp.text());
+        const url = `https://${CDN_DOMAIN}/${pathData.uuid}/${mediamtxPath}/master.m3u8`;
+        streamUrlCache[mediamtxPath] = { url, timestamp: Date.now() };
+        console.log(`[CACHE] Stream URL atualizado: ${mediamtxPath} → ${url}`);
+        return url;
+      } else {
+        console.warn(`[CACHE] KV retornou ${kvResp.status} para ${mediamtxPath}`);
+        if (cached) return cached.url;
+        return '';
+      }
+    } catch (err) {
+      console.warn(`[CACHE] Erro KV:`, err.message);
       if (cached) return cached.url;
       return '';
+    } finally {
+      delete pendingKvRequests[mediamtxPath];
     }
-  } catch (err) {
-    console.warn(`[CACHE] Erro KV:`, err.message);
-    if (cached) return cached.url;
-    return '';
-  }
+  })();
+
+  pendingKvRequests[mediamtxPath] = kvPromise;
+  return kvPromise;
 }
 
 // ── Cache de live status via KV ──
