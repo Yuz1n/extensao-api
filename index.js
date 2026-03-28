@@ -694,23 +694,33 @@ app.post('/api/streamer', requireApiKey, async (req, res) => {
   }
 });
 
-// ── PUT /api/streamer/:id_streamer (admin — atualizar max_spectators) ──
+// ── PUT /api/streamer/:id_streamer (admin — atualizar streamer) ──
 app.put('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
   try {
     const { id_streamer } = req.params;
     const { user, link, max_spectators, link_vps, id_mediamtx } = req.body;
 
-    console.log(`[UPDATE] Atualizando streamer: "${id_streamer}"`);
+    console.log(`[UPDATE] Atualizando streamer: "${id_streamer}" body:`, JSON.stringify(req.body));
 
+    // Build dynamic SET clause — only update fields that were sent
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    if (user !== undefined)           { fields.push(`"user" = $${idx++}`);          values.push(user); }
+    if (link !== undefined)           { fields.push(`link = $${idx++}`);            values.push(link); }
+    if (max_spectators !== undefined) { fields.push(`max_spectators = $${idx++}`);  values.push(max_spectators); }
+    if (link_vps !== undefined)       { fields.push(`link_vps = $${idx++}`);        values.push(link_vps); }
+    if (id_mediamtx !== undefined)    { fields.push(`id_mediamtx = $${idx++}`);     values.push(id_mediamtx); }
+
+    if (fields.length === 0) {
+      return res.status(400).json({ message: 'Nenhum campo para atualizar' });
+    }
+
+    values.push(id_streamer);
     const result = await pool.query(
-      `UPDATE streamer SET
-        "user" = COALESCE($1, "user"),
-        link = COALESCE($2, link),
-        max_spectators = COALESCE($3, max_spectators),
-        link_vps = COALESCE($4, link_vps),
-        id_mediamtx = COALESCE($5, id_mediamtx)
-      WHERE LOWER(id_streamer) = LOWER($6) RETURNING *`,
-      [user || null, link || null, max_spectators !== undefined ? max_spectators : null, link_vps !== undefined ? link_vps : null, id_mediamtx !== undefined ? id_mediamtx : null, id_streamer]
+      `UPDATE streamer SET ${fields.join(', ')} WHERE LOWER(id_streamer) = LOWER($${idx}) RETURNING *`,
+      values
     );
 
     if (result.rows.length === 0) {
