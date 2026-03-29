@@ -380,7 +380,7 @@
   function startPathCheck(streamerCode) {
     if (pathCheckInterval) clearInterval(pathCheckInterval);
     pathCheckInterval = setInterval(function () {
-      fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode), {
+      fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?mode=pathcheck&viewer_uid=' + encodeURIComponent(viewerUid), {
         headers: { 'X-Api-Key': API_KEY },
       })
       .then(function (r) { return r.json(); })
@@ -517,69 +517,51 @@
   // AUTH + CONNECT (API antiga + CDN stream URL)
   // ════════════════════════════════════════════════════════════════════════════
 
-  document.getElementById('os-btn').onclick = async function () {
-    var streamerCode = document.getElementById('os-code').value.trim();
-    var btn = this;
-
-    if (!streamerCode) { setStatus('Preencha o codigo do Streamer', '#f44336'); return; }
-
-    btn.disabled = true;
-    btn.textContent = 'Validando...';
-    setStatus('Verificando streamer...', '#00d4ff');
-
+  // ── Função que processa o validate response e continua o fluxo ──
+  function handleValidateSuccess(data, streamerCode, btn) {
+    // 2. Validar URL — viewer está no canal certo do Kick?
+    var dbLink = data.streamer.link || '';
+    var dbUsername = '';
     try {
-      // 1. Validar streamer na API antiga
-      var resp = await fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode), {
-        headers: { 'X-Api-Key': API_KEY },
+      dbUsername = new URL(dbLink).pathname.split('/').filter(Boolean)[0] || '';
+    } catch (e) {
+      dbUsername = dbLink.replace(/^https?:\/\/(www\.)?kick\.com\/?/i, '').split('/')[0];
+    }
+
+    if (dbUsername.toLowerCase() !== kickUsername.toLowerCase()) {
+      setStatus('Voce nao esta no canal deste streamer', '#f44336');
+      btn.disabled = false;
+      btn.textContent = 'Conectar';
+      return;
+    }
+
+    // 3. Buscar stream URL via CDN (API monta a URL com UUID rotativo)
+    var streamUrl = data.streamer.stream_url || '';
+    if (!streamUrl) {
+      setStatus('Stream offline no momento', '#ff9800');
+      btn.disabled = false;
+      btn.textContent = 'Conectar';
+      return;
+    }
+
+    // 4. Entrar na sala (limite de viewers)
+    setStatus('Entrando na sala...', '#00d4ff');
+    fetch(API_URL + '/api/viewer/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Api-Key': API_KEY },
+      body: JSON.stringify({ id_streamer: streamerCode, viewer_uid: viewerUid }),
+    })
+    .then(function (joinResp) {
+      return joinResp.json().then(function (joinData) {
+        return { ok: joinResp.ok, status: joinResp.status, data: joinData };
       });
-      var data = await resp.json();
-
-      if (!resp.ok || !data.valid) {
-        setStatus('Streamer nao encontrado no sistema', '#f44336');
-        btn.disabled = false;
-        btn.textContent = 'Conectar';
-        return;
-      }
-
-      // 2. Validar URL — viewer está no canal certo do Kick?
-      var dbLink = data.streamer.link || '';
-      var dbUsername = '';
-      try {
-        dbUsername = new URL(dbLink).pathname.split('/').filter(Boolean)[0] || '';
-      } catch (e) {
-        dbUsername = dbLink.replace(/^https?:\/\/(www\.)?kick\.com\/?/i, '').split('/')[0];
-      }
-
-      if (dbUsername.toLowerCase() !== kickUsername.toLowerCase()) {
-        setStatus('Voce nao esta no canal deste streamer', '#f44336');
-        btn.disabled = false;
-        btn.textContent = 'Conectar';
-        return;
-      }
-
-      // 3. Buscar stream URL via CDN (API monta a URL com UUID rotativo)
-      var streamUrl = data.streamer.stream_url || '';
-      if (!streamUrl) {
-        setStatus('Stream offline no momento', '#ff9800');
-        btn.disabled = false;
-        btn.textContent = 'Conectar';
-        return;
-      }
-
-      // 4. Entrar na sala (limite de viewers)
-      setStatus('Entrando na sala...', '#00d4ff');
-      var joinResp = await fetch(API_URL + '/api/viewer/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Api-Key': API_KEY },
-        body: JSON.stringify({ id_streamer: streamerCode, viewer_uid: viewerUid }),
-      });
-      var joinData = await joinResp.json();
-
-      if (!joinResp.ok) {
-        if (joinResp.status === 403) {
-          setStatus('Sala cheia! ' + joinData.current_viewers + '/' + joinData.max_spectators, '#f44336');
+    })
+    .then(function (join) {
+      if (!join.ok) {
+        if (join.status === 403) {
+          setStatus('Sala cheia! ' + join.data.current_viewers + '/' + join.data.max_spectators, '#f44336');
         } else {
-          setStatus(joinData.message || 'Erro ao entrar na sala', '#f44336');
+          setStatus(join.data.message || 'Erro ao entrar na sala', '#f44336');
         }
         btn.disabled = false;
         btn.textContent = 'Conectar';
@@ -617,11 +599,114 @@
         sendMetricsJoin(streamerCode);
         startHeartbeat(streamerCode);
         startPathCheck(streamerCode);
-        // startViewerCounter(streamerCode, player); // DESABILITADO TEMPORARIAMENTE
 
         setStatus('Conectado!', '#4caf50');
         setTimeout(function () { overlay.remove(); }, 1500);
       });
+    })
+    .catch(function () {
+      setStatus('Erro de conexao com o servidor', '#f44336');
+      btn.disabled = false;
+      btn.textContent = 'Conectar';
+    });
+  }
+
+  // ── Polling da fila ──
+  function pollQueue(streamerCode, btn) {
+    var queuePollTimer = setInterval(function () {
+      fetch(API_URL + '/api/queue/status/' + encodeURIComponent(streamerCode) + '?viewer_uid=' + encodeURIComponent(viewerUid), {
+        headers: { 'X-Api-Key': API_KEY },
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (qData) {
+        if (qData.status === 'ready') {
+          // Sua vez! Chamar validate com ticket
+          clearInterval(queuePollTimer);
+          btn.textContent = 'Validando...';
+          setStatus('Sua vez! Conectando...', '#00d4ff');
+
+          fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?ticket=' + encodeURIComponent(qData.ticket) + '&viewer_uid=' + encodeURIComponent(viewerUid), {
+            headers: { 'X-Api-Key': API_KEY },
+          })
+          .then(function (r) {
+            return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+          })
+          .then(function (result) {
+            if (!result.ok || !result.data.valid) {
+              setStatus('Streamer nao encontrado no sistema', '#f44336');
+              btn.disabled = false;
+              btn.textContent = 'Conectar';
+              return;
+            }
+            handleValidateSuccess(result.data, streamerCode, btn);
+          })
+          .catch(function () {
+            setStatus('Erro de conexao com o servidor', '#f44336');
+            btn.disabled = false;
+            btn.textContent = 'Conectar';
+          });
+
+        } else if (qData.status === 'queued') {
+          setStatus('Posicao na Fila: ' + qData.position + '/' + qData.total, '#ff8c00');
+        } else {
+          // not_found = expirou
+          clearInterval(queuePollTimer);
+          setStatus('Tempo na fila expirado. Tente novamente.', '#f44336');
+          btn.disabled = false;
+          btn.textContent = 'Conectar';
+        }
+      })
+      .catch(function () {
+        // Erro de rede, continua tentando
+      });
+    }, 2000);
+  }
+
+  // ── Handler do botão Conectar ──
+  document.getElementById('os-btn').onclick = async function () {
+    var streamerCode = document.getElementById('os-code').value.trim();
+    var btn = this;
+
+    if (!streamerCode) { setStatus('Preencha o codigo do Streamer', '#f44336'); return; }
+
+    btn.disabled = true;
+    btn.textContent = 'Validando...';
+    setStatus('Verificando streamer...', '#00d4ff');
+
+    try {
+      // 1. Validar streamer (com viewer_uid para a fila)
+      var resp = await fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?viewer_uid=' + encodeURIComponent(viewerUid), {
+        headers: { 'X-Api-Key': API_KEY },
+      });
+
+      // Enfileirado — entrar no polling
+      if (resp.status === 202) {
+        var queueData = await resp.json();
+        btn.textContent = 'Na fila...';
+        setStatus('Posicao na Fila: ' + queueData.position + '/' + queueData.total, '#ff8c00');
+        pollQueue(streamerCode, btn);
+        return;
+      }
+
+      // Fila cheia
+      if (resp.status === 503) {
+        setStatus('Servidor lotado. Tente novamente em instantes.', '#f44336');
+        btn.disabled = false;
+        btn.textContent = 'Conectar';
+        return;
+      }
+
+      var data = await resp.json();
+
+      if (!resp.ok || !data.valid) {
+        setStatus('Streamer nao encontrado no sistema', '#f44336');
+        btn.disabled = false;
+        btn.textContent = 'Conectar';
+        return;
+      }
+
+      // Passou direto (sem fila) — continuar fluxo normal
+      handleValidateSuccess(data, streamerCode, btn);
 
     } catch (e) {
       console.error('[STREAM] Erro:', e);

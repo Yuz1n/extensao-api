@@ -14,6 +14,41 @@ function getBrazilTimestamp() {
   return new Date().toLocaleString('sv-SE', { timeZone: 'America/Sao_Paulo' }).replace(' ', 'T') + '-03:00';
 }
 
+// ── Log geral diário (rotaciona à meia-noite GMT-3) ──
+const GENERAL_LOG_DIR = path.join(__dirname, 'data', 'logs', 'general');
+if (!fs.existsSync(GENERAL_LOG_DIR)) fs.mkdirSync(GENERAL_LOG_DIR, { recursive: true });
+
+let currentLogDate = getBrazilDate();
+let generalLogStream = fs.createWriteStream(
+  path.join(GENERAL_LOG_DIR, `${currentLogDate}.log`),
+  { flags: 'a' }
+);
+
+function writeGeneralLog(level, args) {
+  const today = getBrazilDate();
+  // Rotação de dia — se passou de meia-noite GMT-3, criar novo arquivo
+  if (today !== currentLogDate) {
+    generalLogStream.end();
+    currentLogDate = today;
+    generalLogStream = fs.createWriteStream(
+      path.join(GENERAL_LOG_DIR, `${currentLogDate}.log`),
+      { flags: 'a' }
+    );
+  }
+  const timestamp = getBrazilTimestamp();
+  const message = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+  generalLogStream.write(`[${timestamp}] [${level}] ${message}\n`);
+}
+
+// Sobrescrever console.log/warn/error para escrever no log geral também
+const _origLog = console.log.bind(console);
+const _origWarn = console.warn.bind(console);
+const _origError = console.error.bind(console);
+
+console.log = (...args) => { _origLog(...args); writeGeneralLog('INFO', args); };
+console.warn = (...args) => { _origWarn(...args); writeGeneralLog('WARN', args); };
+console.error = (...args) => { _origError(...args); writeGeneralLog('ERROR', args); };
+
 // ── Logger por live (um arquivo por live por streamer) ──
 const LIVES_LOG_DIR = path.join(__dirname, 'data', 'logs', 'lives');
 if (!fs.existsSync(LIVES_LOG_DIR)) fs.mkdirSync(LIVES_LOG_DIR, { recursive: true });
@@ -221,6 +256,156 @@ function removeViewer(idStreamer, viewerUid) {
     }
   }
 }
+
+// ══════════════════════════════════════════════
+// ── FILA DE ENTRADA (proteção contra raids) ──
+// ══════════════════════════════════════════════
+
+// Estrutura: { "id_streamer": { processing: 0, queue: [{uid, addedAt}], ready: {uid: ticket} } }
+const entryQueues = {};
+
+// Tickets válidos: { "ticket_string": { streamer: "id", expiresAt: timestamp } }
+const validTickets = {};
+
+const QUEUE_CONFIG = {
+  MAX_CONCURRENT: 10,       // máx validate simultâneos por streamer
+  MAX_QUEUE_SIZE: 10000,    // máx viewers na fila
+  QUEUE_TIMEOUT_MS: 60000,  // expira da fila após 60s
+  POLL_RETRY_MS: 2000,      // cliente polls a cada 2s
+  TICKET_TTL_MS: 15000,     // ticket válido por 15s
+};
+
+function getOrCreateQueue(idStreamer) {
+  const key = idStreamer.toLowerCase();
+  if (!entryQueues[key]) {
+    entryQueues[key] = { processing: 0, queue: [], ready: {} };
+  }
+  return entryQueues[key];
+}
+
+function enqueueViewer(idStreamer, viewerUid) {
+  const q = getOrCreateQueue(idStreamer);
+
+  // Deduplica por uid — se já está na fila, retorna posição atual
+  const existing = q.queue.findIndex(e => e.uid === viewerUid);
+  if (existing !== -1) {
+    return { position: existing + 1, total: q.queue.length };
+  }
+
+  if (q.queue.length >= QUEUE_CONFIG.MAX_QUEUE_SIZE) {
+    return null; // fila cheia
+  }
+
+  q.queue.push({ uid: viewerUid, addedAt: Date.now() });
+  return { position: q.queue.length, total: q.queue.length };
+}
+
+function generateTicket(idStreamer) {
+  const ticket = Math.random().toString(36).substring(2) + Date.now().toString(36);
+  validTickets[ticket] = {
+    streamer: idStreamer.toLowerCase(),
+    expiresAt: Date.now() + QUEUE_CONFIG.TICKET_TTL_MS,
+  };
+  return ticket;
+}
+
+function consumeTicket(ticket, idStreamer) {
+  const t = validTickets[ticket];
+  if (!t) return false;
+  if (t.streamer !== idStreamer.toLowerCase()) return false;
+  if (Date.now() > t.expiresAt) {
+    delete validTickets[ticket];
+    return false;
+  }
+  delete validTickets[ticket];
+  return true;
+}
+
+function dequeueNext(idStreamer) {
+  const key = idStreamer.toLowerCase();
+  const q = entryQueues[key];
+  if (!q || q.queue.length === 0) return;
+
+  const next = q.queue.shift();
+  const ticket = generateTicket(idStreamer);
+  q.ready[next.uid] = ticket;
+}
+
+function getQueuePosition(idStreamer, viewerUid) {
+  const key = idStreamer.toLowerCase();
+  const q = entryQueues[key];
+  if (!q) return null;
+
+  // Checar se já está pronto (tem ticket)
+  if (q.ready[viewerUid]) {
+    const ticket = q.ready[viewerUid];
+    if (validTickets[ticket]) {
+      delete q.ready[viewerUid];
+      return { status: 'ready', ticket };
+    }
+    delete q.ready[viewerUid];
+  }
+
+  // Checar posição na fila
+  const idx = q.queue.findIndex(e => e.uid === viewerUid);
+  if (idx === -1) return null;
+
+  return { status: 'queued', position: idx + 1, total: q.queue.length };
+}
+
+function releaseProcessing(idStreamer) {
+  const key = idStreamer.toLowerCase();
+  const q = entryQueues[key];
+  if (!q) return;
+
+  q.processing = Math.max(0, q.processing - 1);
+
+  // Promover próximo da fila
+  if (q.queue.length > 0 && q.processing < QUEUE_CONFIG.MAX_CONCURRENT) {
+    dequeueNext(idStreamer);
+  }
+}
+
+// Cleanup da fila a cada 10 segundos
+setInterval(() => {
+  const now = Date.now();
+
+  // Limpar tickets expirados
+  for (const ticket in validTickets) {
+    if (now > validTickets[ticket].expiresAt) {
+      delete validTickets[ticket];
+    }
+  }
+
+  for (const key in entryQueues) {
+    const q = entryQueues[key];
+
+    // Remover viewers que esperaram demais
+    const before = q.queue.length;
+    q.queue = q.queue.filter(e => now - e.addedAt < QUEUE_CONFIG.QUEUE_TIMEOUT_MS);
+    const removed = before - q.queue.length;
+    if (removed > 0) {
+      console.log(`[QUEUE] Removidos ${removed} viewers expirados da fila de "${key}"`);
+    }
+
+    // Limpar ready expirados
+    for (const uid in q.ready) {
+      if (!validTickets[q.ready[uid]]) {
+        delete q.ready[uid];
+      }
+    }
+
+    // Promover viewers se tem slots livres
+    while (q.queue.length > 0 && q.processing < QUEUE_CONFIG.MAX_CONCURRENT) {
+      dequeueNext(key);
+    }
+
+    // Remover fila vazia
+    if (q.queue.length === 0 && q.processing === 0 && Object.keys(q.ready).length === 0) {
+      delete entryQueues[key];
+    }
+  }
+}, 10 * 1000);
 
 // ══════════════════════════════════════════════
 
@@ -445,10 +630,88 @@ async function getCachedLiveStatus(mediamtxPath) {
   }
 }
 
+// ── GET /api/queue/status/:id_streamer — Posição na fila (zero DB) ──
+app.get('/api/queue/status/:id_streamer', requireApiKey, (req, res) => {
+  const id_streamer = req.params.id_streamer.toLowerCase();
+  const viewer_uid = req.query.viewer_uid;
+
+  if (!viewer_uid) {
+    return res.status(400).json({ message: 'viewer_uid obrigatorio' });
+  }
+
+  const result = getQueuePosition(id_streamer, viewer_uid);
+
+  if (!result) {
+    return res.json({ status: 'not_found' });
+  }
+
+  if (result.status === 'ready') {
+    return res.json({ status: 'ready', ticket: result.ticket });
+  }
+
+  return res.json({
+    status: 'queued',
+    position: result.position,
+    total: result.total,
+    retry_ms: QUEUE_CONFIG.POLL_RETRY_MS,
+  });
+});
+
 // ── GET /api/streamer/validate/:id_streamer ──
 app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) => {
+  const id_streamer = req.params.id_streamer.toLowerCase();
+
+  // ── Bypass 1: Path check de viewer já conectado (não enfileira) ──
+  if (req.query.mode === 'pathcheck') {
+    const pcUid = req.query.viewer_uid;
+    if (pcUid && activeViewers[id_streamer] && activeViewers[id_streamer][pcUid]) {
+      // Viewer já está conectado, processar direto sem fila
+      return processValidate(id_streamer, req, res);
+    }
+  }
+
+  // ── Bypass 2: Viewer com ticket válido (já passou pela fila) ──
+  if (req.query.ticket) {
+    if (consumeTicket(req.query.ticket, id_streamer)) {
+      return processValidate(id_streamer, req, res);
+    }
+    // Ticket inválido/expirado — cai no fluxo normal da fila
+  }
+
+  // ── Gate da fila ──
+  const q = getOrCreateQueue(id_streamer);
+  if (q.processing < QUEUE_CONFIG.MAX_CONCURRENT) {
+    // Tem slot livre — processar agora
+    q.processing++;
+    try {
+      await processValidate(id_streamer, req, res);
+    } finally {
+      releaseProcessing(id_streamer);
+    }
+    return;
+  }
+
+  // Sem slot — enfileirar o viewer
+  const viewerUid = req.query.viewer_uid || 'anon_' + (req.headers['x-forwarded-for'] || req.connection.remoteAddress);
+  const pos = enqueueViewer(id_streamer, viewerUid);
+
+  if (!pos) {
+    // Fila cheia
+    return res.status(503).json({ message: 'Fila cheia, tente novamente em instantes' });
+  }
+
+  console.log(`[QUEUE] Viewer ${viewerUid.substring(0, 8)}... enfileirado em "${id_streamer}" | Posição: ${pos.position}/${pos.total}`);
+  return res.status(202).json({
+    queued: true,
+    position: pos.position,
+    total: pos.total,
+    retry_ms: QUEUE_CONFIG.POLL_RETRY_MS,
+  });
+});
+
+// ── Lógica real do validate (extraída para reuso) ──
+async function processValidate(id_streamer, req, res) {
   try {
-    const id_streamer = req.params.id_streamer.toLowerCase();
     console.log(`[VALIDATE] Validando streamer: "${id_streamer}"`);
 
     const result = await pool.query(
@@ -486,16 +749,13 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
 
     // Se status = "ended" e tem live ativa → encerrar live
     if (liveStatus === 'ended' && activeLives[id_streamer]) {
-      // Setar flag para overlay fazer reload
       endedStreamers[id_streamer.toLowerCase()] = true;
       await onLiveEnd(id_streamer);
-      // Limpar flag após 5 min
       setTimeout(() => { delete endedStreamers[id_streamer.toLowerCase()]; }, 300000);
     }
 
     updateLivePeak(id_streamer);
 
-    // Verificar se stream acabou
     const streamEnded = endedStreamers[id_streamer.toLowerCase()] || false;
 
     return res.json({
@@ -508,10 +768,10 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
       }
     });
   } catch (err) {
-    logger.live(id_streamer, 'ERROR', `[VALIDATE] Erro:`, err.message);
+    console.error(`[VALIDATE] Erro:`, err.message);
     return res.status(500).json({ valid: false, message: 'Erro interno do servidor' });
   }
-});
+}
 
 // ── POST /api/viewer/join — Viewer entra na sala ──
 app.post('/api/viewer/join', requireApiKey, async (req, res) => {
@@ -707,11 +967,13 @@ app.put('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
     const values = [];
     let idx = 1;
 
-    if (user !== undefined)           { fields.push(`"user" = $${idx++}`);          values.push(user); }
-    if (link !== undefined)           { fields.push(`link = $${idx++}`);            values.push(link); }
-    if (max_spectators !== undefined) { fields.push(`max_spectators = $${idx++}`);  values.push(max_spectators); }
-    if (link_vps !== undefined)       { fields.push(`link_vps = $${idx++}`);        values.push(link_vps); }
-    if (id_mediamtx !== undefined)    { fields.push(`id_mediamtx = $${idx++}`);     values.push(id_mediamtx); }
+    const new_id_streamer = req.body.id_streamer;
+    if (new_id_streamer !== undefined) { fields.push(`id_streamer = $${idx++}`);     values.push(new_id_streamer); }
+    if (user !== undefined)            { fields.push(`"user" = $${idx++}`);          values.push(user); }
+    if (link !== undefined)            { fields.push(`link = $${idx++}`);            values.push(link); }
+    if (max_spectators !== undefined)  { fields.push(`max_spectators = $${idx++}`);  values.push(max_spectators); }
+    if (link_vps !== undefined)        { fields.push(`link_vps = $${idx++}`);        values.push(link_vps); }
+    if (id_mediamtx !== undefined)     { fields.push(`id_mediamtx = $${idx++}`);     values.push(id_mediamtx); }
 
     if (fields.length === 0) {
       return res.status(400).json({ message: 'Nenhum campo para atualizar' });
@@ -1379,6 +1641,42 @@ app.get('/api/logs/dates', requireApiKey, (req, res) => {
   }
 });
 
+// GET /api/logs/general — ler log geral do dia
+// Query: ?date=2026-03-28&filter=ERROR&tail=200
+app.get('/api/logs/general', requireApiKey, (req, res) => {
+  try {
+    const date = req.query.date || getBrazilDate();
+    const logPath = path.join(GENERAL_LOG_DIR, `${date}.log`);
+
+    if (!fs.existsSync(logPath)) return res.json({ date, total: 0, lines: [] });
+
+    const content = fs.readFileSync(logPath, 'utf8');
+    const lines = content.split('\n').filter(Boolean);
+    const filter = req.query.filter;
+    const filtered = filter ? lines.filter(l => l.includes(filter)) : lines;
+    const tail = parseInt(req.query.tail) || 200;
+
+    return res.json({ date, total: filtered.length, lines: filtered.slice(-tail) });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+// GET /api/logs/general/dates — listar datas disponíveis
+app.get('/api/logs/general/dates', requireApiKey, (req, res) => {
+  try {
+    if (!fs.existsSync(GENERAL_LOG_DIR)) return res.json({ dates: [] });
+    const files = fs.readdirSync(GENERAL_LOG_DIR)
+      .filter(f => f.endsWith('.log'))
+      .map(f => f.replace('.log', ''))
+      .sort()
+      .reverse();
+    return res.json({ dates: files });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
 // ── Start ──
 const PORT = process.env.PORT || 3000;
 
@@ -1392,6 +1690,7 @@ initDB().then(() => restoreActiveLives()).then(() => {
     console.log(`   POST   /api/streamer`);
     console.log(`   PUT    /api/streamer/:id_streamer`);
     console.log(`   DELETE /api/streamer/:id_streamer`);
+    console.log(`   GET    /api/queue/status/:id_streamer`);
     console.log(`   POST   /api/viewer/join`);
     console.log(`   POST   /api/viewer/heartbeat`);
     console.log(`   POST   /api/viewer/leave`);
