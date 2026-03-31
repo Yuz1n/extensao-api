@@ -538,11 +538,33 @@
     // 3. Buscar stream URL via CDN (API monta a URL com UUID rotativo)
     var streamUrl = data.streamer.stream_url || '';
     if (!streamUrl) {
-      setStatus('Stream offline no momento', '#ff9800');
-      btn.disabled = false;
-      btn.textContent = 'Conectar';
+      // Retry com backoff exponencial — stream pode estar iniciando
+      var retryCount = window._vodyConnectRetries || 0;
+      if (retryCount < 5) {
+        var delay = Math.min(3000 * Math.pow(2, retryCount), 30000); // 3s, 6s, 12s, 24s, 30s
+        window._vodyConnectRetries = retryCount + 1;
+        setStatus('Stream iniciando... tentativa ' + (retryCount + 1) + '/5 (' + Math.round(delay/1000) + 's)', '#ff9800');
+        setTimeout(function () {
+          fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?viewer_uid=' + encodeURIComponent(viewerUid), {
+            headers: { 'X-Api-Key': API_KEY },
+          })
+          .then(function (r) { return r.json(); })
+          .then(function (retryData) { handleValidateSuccess(retryData, streamerCode, btn); })
+          .catch(function () {
+            setStatus('Erro de conexao. Tente novamente.', '#f44336');
+            btn.disabled = false;
+            btn.textContent = 'Conectar';
+          });
+        }, delay);
+      } else {
+        window._vodyConnectRetries = 0;
+        setStatus('Stream offline no momento', '#ff9800');
+        btn.disabled = false;
+        btn.textContent = 'Conectar';
+      }
       return;
     }
+    window._vodyConnectRetries = 0;
 
     // 4. Entrar na sala (limite de viewers)
     setStatus('Entrando na sala...', '#00d4ff');

@@ -122,6 +122,9 @@ const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 60; // aumentado pra 60 por causa dos heartbeats
 
 function rateLimiter(req, res, next) {
+  // Bypass para stress test (header secreto)
+  if (req.headers['x-stress-test'] === 'vdo-stress-2026') return next();
+
   const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
   const now = Date.now();
 
@@ -550,7 +553,7 @@ app.get('/health', (req, res) => {
 
 // ── Stream URL cache (evita rate limit da Cloudflare KV API) ──
 const streamUrlCache = {}; // { mediamtxPath: { url, timestamp } }
-const CACHE_TTL_MS = 30000; // 30 segundos
+const CACHE_TTL_MS = 300000; // 5 minutos — UUID rotaciona a cada 1h, não precisa buscar a cada 30s
 const pendingKvRequests = {}; // { mediamtxPath: Promise } — deduplicação de requests
 
 async function getCachedStreamUrl(mediamtxPath) {
@@ -709,17 +712,42 @@ app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) =
   });
 });
 
+// ── Cache de streamers do banco (carregado no boot, invalidado apenas em escrita) ──
+// Streamers quase nunca mudam e sempre com streamer offline, então cache permanente em memória.
+// Invalidado por: POST/PUT/DELETE /api/streamer
+const streamerCache = {}; // { id_streamer_lower: streamer_row }
+let streamerCacheLoaded = false;
+
+async function loadStreamerCache() {
+  const result = await pool.query(
+    'SELECT id, "user", link, id_streamer, max_spectators, link_vps, id_mediamtx FROM streamer'
+  );
+  // Limpar cache antes de recarregar
+  for (const key in streamerCache) delete streamerCache[key];
+  for (const row of result.rows) {
+    streamerCache[row.id_streamer.toLowerCase()] = row;
+  }
+  streamerCacheLoaded = true;
+  console.log(`[CACHE] Streamers carregados em memória: ${result.rows.length}`);
+}
+
+function invalidateStreamerCache() {
+  streamerCacheLoaded = false;
+}
+
+async function getCachedStreamer(id_streamer) {
+  if (!streamerCacheLoaded) await loadStreamerCache();
+  return streamerCache[id_streamer.toLowerCase()] || null;
+}
+
 // ── Lógica real do validate (extraída para reuso) ──
 async function processValidate(id_streamer, req, res) {
   try {
     console.log(`[VALIDATE] Validando streamer: "${id_streamer}"`);
 
-    const result = await pool.query(
-      'SELECT id, "user", link, id_streamer, max_spectators, link_vps, id_mediamtx FROM streamer WHERE LOWER(id_streamer) = LOWER($1)',
-      [id_streamer]
-    );
+    const streamer = await getCachedStreamer(id_streamer);
 
-    if (result.rows.length === 0) {
+    if (!streamer) {
       console.log(`[VALIDATE] Streamer "${id_streamer}" nao encontrado`);
       return res.status(404).json({
         valid: false,
@@ -727,7 +755,6 @@ async function processValidate(id_streamer, req, res) {
       });
     }
 
-    const streamer = result.rows[0];
     const currentViewers = getViewerCount(id_streamer);
 
     console.log(`[VALIDATE] Streamer encontrado: ${streamer.user} | Viewers: ${currentViewers}/${streamer.max_spectators}`);
@@ -943,6 +970,7 @@ app.post('/api/streamer', requireApiKey, async (req, res) => {
     );
 
     console.log(`[CREATE] Streamer cadastrado com sucesso: ID ${result.rows[0].id}`);
+    invalidateStreamerCache();
     return res.status(201).json(result.rows[0]);
   } catch (err) {
     if (err.code === '23505') {
@@ -990,6 +1018,7 @@ app.put('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
     }
 
     console.log(`[UPDATE] Streamer atualizado: ${JSON.stringify(result.rows[0])}`);
+    invalidateStreamerCache();
     return res.json(result.rows[0]);
   } catch (err) {
     console.error('[UPDATE] Erro:', err.message);
@@ -1017,6 +1046,7 @@ app.delete('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
     delete activeViewers[key];
 
     console.log(`[DELETE] Streamer removido: ${JSON.stringify(result.rows[0])}`);
+    invalidateStreamerCache();
     return res.json({ message: 'Streamer removido', streamer: result.rows[0] });
   } catch (err) {
     console.error('[DELETE] Erro:', err.message);
@@ -1063,6 +1093,11 @@ app.post('/api/live/start', async (req, res) => {
 
     // Limpar flag de ended
     delete endedStreamers[idStreamer];
+
+    // Invalidar cache do KV pra forçar busca do novo UUID
+    const mediamtxPath = id_mediamtx.toLowerCase();
+    delete streamUrlCache[mediamtxPath];
+    delete liveStatusCache[mediamtxPath];
 
     await onLiveStart(idStreamer, streamer.user);
     return res.json({ started: true, live_id: activeLives[idStreamer]?.liveId });
@@ -1566,6 +1601,7 @@ app.put('/api/streamer/:id_streamer/commission', requireApiKey, async (req, res)
       [commission, id_streamer]
     );
     if (result.rows.length === 0) return res.status(404).json({ message: 'Streamer não encontrado' });
+    invalidateStreamerCache();
     return res.json({ updated: true, streamer: result.rows[0].user, commission: commission });
   } catch (e) {
     console.error('[COMMISSION] Erro:', e.message);
@@ -1680,7 +1716,7 @@ app.get('/api/logs/general/dates', requireApiKey, (req, res) => {
 // ── Start ──
 const PORT = process.env.PORT || 3000;
 
-initDB().then(() => restoreActiveLives()).then(() => {
+initDB().then(() => loadStreamerCache()).then(() => restoreActiveLives()).then(() => {
   app.listen(PORT, () => {
     console.log(`[SERVER] API rodando na porta ${PORT}`);
     console.log(`[SERVER] Endpoints disponíveis:`);
