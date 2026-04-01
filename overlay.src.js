@@ -269,7 +269,6 @@
 
   var heartbeatInterval = null;
   var segmentsLoaded = 0;
-  var pathCheckInterval = null;
 
   // Player health tracking
   var playerHealth = {
@@ -351,12 +350,31 @@
   function startHeartbeat(streamerCode) {
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(function () {
-      // Heartbeat
+      // Heartbeat — response inclui stream_url atual para detectar rotação de UUID
       fetch(API_URL + '/api/viewer/heartbeat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Api-Key': API_KEY },
         body: JSON.stringify({ id_streamer: streamerCode, viewer_uid: viewerUid }),
-      }).catch(function () {});
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data.stream_url) return;
+        var newBase = data.stream_url.replace(/\/master\.m3u8$/, '');
+        var oldBase = window._vodyStreamBase;
+        if (newBase && oldBase && newBase !== oldBase) {
+          console.log('[STREAM] UUID rotacionou via heartbeat, trocando fonte...');
+          window._vodyStreamBase = newBase;
+          var hls = window._vodyHls;
+          if (hls) {
+            var quality = window._vodyCurrentQuality || '720p';
+            hls.stopLoad();
+            hls.loadSource(newBase + '/' + quality + '/stream.m3u8');
+            hls.startLoad(-1);
+            console.log('[STREAM] Fonte trocada para: ' + newBase);
+          }
+        }
+      })
+      .catch(function () {});
 
       // Metrics update com player health
       var video = window._vodyVideo;
@@ -375,60 +393,12 @@
     }, 30000);
   }
 
-  var consecutiveEmptyUrl = 0;
-
-  function startPathCheck(streamerCode) {
-    if (pathCheckInterval) clearInterval(pathCheckInterval);
-    pathCheckInterval = setInterval(function () {
-      fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?mode=pathcheck&viewer_uid=' + encodeURIComponent(viewerUid), {
-        headers: { 'X-Api-Key': API_KEY },
-      })
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        // Stream encerrado pelo servidor (VPS chamou /api/live/end)
-        if (data.stream_ended) {
-          console.log('[STREAM] Stream encerrado pelo servidor. Recarregando...');
-          showStreamEnded();
-          return;
-        }
-
-        // Stream encerrado — URL vazia
-        if (!data.valid || !data.streamer.stream_url) {
-          consecutiveEmptyUrl++;
-          console.warn('[STREAM] stream_url vazio (' + consecutiveEmptyUrl + '/5)');
-          if (consecutiveEmptyUrl >= 5) {
-            showStreamEnded();
-          }
-          return;
-        }
-        consecutiveEmptyUrl = 0;
-
-        // Atualizar contador de viewers (sem request extra) — DESABILITADO TEMPORARIAMENTE
-        // if (data.streamer.current_viewers !== undefined) {
-        //   var el = document.getElementById('stream-viewer-count-text');
-        //   if (el) el.textContent = data.streamer.current_viewers + ' assistindo';
-        // }
-
-        var newBase = data.streamer.stream_url.replace(/\/master\.m3u8$/, '');
-        var oldBase = window._vodyStreamBase;
-        if (newBase && oldBase && newBase !== oldBase) {
-          console.log('[STREAM] UUID rotacionou, reconectando...');
-          window._vodyStreamBase = newBase;
-          var hls = window._vodyHls;
-          if (hls) {
-            var quality = window._vodyCurrentQuality || '720p';
-            hls.loadSource(newBase + '/' + quality + '/stream.m3u8');
-            console.log('[STREAM] Reconectado: ' + newBase);
-          }
-        }
-      })
-      .catch(function () {});
-    }, 60000);
-  }
-
   // ── Stream encerrado — limpa tudo ──
   function showStreamEnded() {
     console.log('[STREAM] Stream encerrado. Limpando tudo.');
+
+    // Parar simulador de viewer do Kick (mobile)
+    stopKickViewerSim();
 
     // Parar HLS
     if (window._vodyHls) {
@@ -438,7 +408,6 @@
 
     // Parar intervalos
     if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
-    if (pathCheckInterval) { clearInterval(pathCheckInterval); pathCheckInterval = null; }
 
     // Leave
     var code = localStorage.getItem('overlay_active_streamer');
@@ -617,10 +586,9 @@
           injectDesktop(player, kickVideo, streamUrl);
         }
 
-        // 6. Métricas + heartbeat + path check
+        // 6. Métricas + heartbeat (stream_url inclusa no response — detecta rotação de UUID)
         sendMetricsJoin(streamerCode);
         startHeartbeat(streamerCode);
-        startPathCheck(streamerCode);
 
         setStatus('Conectado!', '#4caf50');
         setTimeout(function () { overlay.remove(); }, 1500);
@@ -1034,9 +1002,119 @@
   // PLAYER MOBILE — overlay sobre Kick
   // ════════════════════════════════════════════════════════════════════════════
 
+  // ════════════════════════════════════════════════════════════════════════════
+  // KICK VIEWER SIMULATOR (mobile only)
+  // Quando o overlay pausa o player do Kick no mobile, o frontend para de
+  // enviar channel_handshake e user_event via WebSocket. Isso faz o viewer
+  // deixar de ser contado na Kick. Este simulador intercepta o WS existente
+  // e continua enviando os eventos pra manter o viewer contando.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  function startKickViewerSim() {
+    var sim = { ws: null, handshakeTimer: null, trackingTimer: null, channelId: null, livestreamId: null };
+
+    // Interceptar WebSocket existente
+    var originalSend = WebSocket.prototype.send;
+    WebSocket.prototype.send = function (data) {
+      try {
+        if (this.url && this.url.indexOf('websockets.kick.com') !== -1) {
+          if (!sim.ws) {
+            sim.ws = this;
+            console.log('[KICK-SIM] WebSocket existente capturado');
+          }
+          try {
+            var msg = JSON.parse(data);
+            if (msg.type === 'channel_handshake' && msg.data && msg.data.message && msg.data.message.channelId) {
+              sim.channelId = msg.data.message.channelId;
+            }
+            if (msg.type === 'user_event' && msg.data && msg.data.message && msg.data.message.livestream_id) {
+              sim.livestreamId = msg.data.message.livestream_id;
+            }
+          } catch (e) {}
+
+          if (sim.ws && sim.channelId) {
+            WebSocket.prototype.send = originalSend;
+            console.log('[KICK-SIM] Interceptação completa — channelId: ' + sim.channelId);
+            startSimLoops();
+          }
+        }
+      } catch (e) {}
+      return originalSend.call(this, data);
+    };
+
+    // Fallback: buscar dados da API pública se interceptação demorar
+    var slug = window.location.pathname.split('/').filter(Boolean)[0];
+    if (slug) {
+      fetch('https://kick.com/api/v2/channels/' + encodeURIComponent(slug))
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (data) {
+          if (data) {
+            if (!sim.channelId && data.id) sim.channelId = String(data.id);
+            if (!sim.livestreamId && data.livestream && data.livestream.id) sim.livestreamId = data.livestream.id;
+            console.log('[KICK-SIM] API fallback: channelId=' + sim.channelId + ' livestreamId=' + sim.livestreamId);
+          }
+        })
+        .catch(function () {});
+    }
+
+    function startSimLoops() {
+      // Aguardar o player ser pausado pelo overlay
+      setTimeout(function () {
+        // channel_handshake a cada ~15s
+        var sendHandshake = function () {
+          if (sim.ws && sim.ws.readyState === 1 && sim.channelId) {
+            sim.ws.send(JSON.stringify({
+              type: 'channel_handshake',
+              data: { message: { channelId: String(sim.channelId) } }
+            }));
+          }
+          var jitter = (Math.random() - 0.5) * 1000;
+          sim.handshakeTimer = setTimeout(sendHandshake, 15000 + jitter);
+        };
+        sendHandshake();
+
+        // user_event a cada ~120s
+        if (sim.livestreamId) {
+          var sendTracking = function () {
+            if (sim.ws && sim.ws.readyState === 1) {
+              sim.ws.send(JSON.stringify({
+                type: 'user_event',
+                data: { message: { name: 'tracking.user.watch.livestream', channel_id: Number(sim.channelId), livestream_id: Number(sim.livestreamId) } }
+              }));
+            }
+            var jitter = (Math.random() - 0.5) * 10000;
+            sim.trackingTimer = setTimeout(sendTracking, 120000 + jitter);
+          };
+          setTimeout(sendTracking, 3000);
+        }
+
+        console.log('[KICK-SIM] Simulador ativo — handshake ~15s, tracking ~120s');
+      }, 2000);
+    }
+
+    // Expor pra cleanup
+    window._vodyKickSim = sim;
+  }
+
+  function stopKickViewerSim() {
+    var sim = window._vodyKickSim;
+    if (sim) {
+      if (sim.handshakeTimer) clearTimeout(sim.handshakeTimer);
+      if (sim.trackingTimer) clearTimeout(sim.trackingTimer);
+      sim.handshakeTimer = null;
+      sim.trackingTimer = null;
+      console.log('[KICK-SIM] Simulador parado');
+    }
+    window._vodyKickSim = null;
+  }
+
   function injectMobile(player, kickVideo, streamUrl) {
     var old = document.getElementById('hls-overlay');
     if (old) old.remove();
+
+    // Iniciar interceptação do WS ANTES de pausar o player
+    // (precisa capturar enquanto o frontend ainda envia mensagens)
+    startKickViewerSim();
 
     // Espera Kick carregar e pausa
     var checkCount = 0;

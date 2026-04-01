@@ -864,9 +864,21 @@ app.post('/api/viewer/heartbeat', requireApiKey, async (req, res) => {
     registerViewer(id_streamer, viewer_uid);
     const currentViewers = getViewerCount(id_streamer);
 
+    // Incluir stream_url atual no response para o overlay detectar rotação de UUID
+    // Só busca se houver live ativa — getCachedStreamUrl usa cache em memória (2min TTL)
+    let stream_url = null;
+    if (activeLives[id_streamer] && CF_API_TOKEN && CF_ACCOUNT_ID && CF_KV_NAMESPACE_STREAM_PATHS) {
+      const streamer = await getCachedStreamer(id_streamer);
+      if (streamer) {
+        const mediamtxPath = streamer.id_mediamtx || streamer.id_streamer;
+        stream_url = await getCachedStreamUrl(mediamtxPath);
+      }
+    }
+
     return res.json({
       active: true,
-      current_viewers: currentViewers
+      current_viewers: currentViewers,
+      stream_url,
     });
   } catch (err) {
     logger.live(id_streamer, 'ERROR', '[HEARTBEAT] Erro:', err.message);
@@ -1155,6 +1167,20 @@ async function onLiveStart(idStreamer, streamerName) {
   idStreamer = idStreamer.toLowerCase();
   if (activeLives[idStreamer]) return;
   try {
+    // Checar no banco antes de inserir — previne registro duplicado se API reiniciou
+    // durante uma live (race condition entre restoreActiveLives e primeira chamada de validate)
+    const existing = await pool.query(
+      "SELECT id FROM lives WHERE id_streamer = $1 AND status = 'active' ORDER BY started_at DESC LIMIT 1",
+      [idStreamer]
+    );
+    if (existing.rows.length > 0) {
+      const liveId = existing.rows[0].id;
+      const logPath = createLiveLogPath(idStreamer);
+      activeLives[idStreamer] = { liveId, peakViewers: 0, viewerSessions: {}, logPath };
+      logger.live(idStreamer, 'INFO', `[LIVE] Live já ativa no DB, restaurada em memória: live #${liveId}`);
+      return;
+    }
+
     const result = await pool.query(
       `INSERT INTO lives (streamer, id_streamer, started_at, status) VALUES ($1, $2, NOW(), 'active') RETURNING id`,
       [streamerName, idStreamer]
