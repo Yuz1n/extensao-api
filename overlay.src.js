@@ -358,6 +358,13 @@
       })
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        // Stream encerrado — API sinalizou via flag endedStreamers
+        if (data.stream_ended) {
+          console.log('[STREAM] Stream encerrado detectado via heartbeat.');
+          showStreamEnded();
+          return;
+        }
+
         if (!data.stream_url) return;
         var newBase = data.stream_url.replace(/\/master\.m3u8$/, '');
         var oldBase = window._vodyStreamBase;

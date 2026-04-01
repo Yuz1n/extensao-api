@@ -875,10 +875,13 @@ app.post('/api/viewer/heartbeat', requireApiKey, async (req, res) => {
       }
     }
 
+    const stream_ended = endedStreamers[id_streamer] || false;
+
     return res.json({
       active: true,
       current_viewers: currentViewers,
       stream_url,
+      stream_ended,
     });
   } catch (err) {
     logger.live(id_streamer, 'ERROR', '[HEARTBEAT] Erro:', err.message);
