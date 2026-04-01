@@ -1252,31 +1252,48 @@ async function onLiveEnd(idStreamer) {
 }
 
 // Flush sessões de viewer pro banco
+// Executa em lotes paralelos de FLUSH_BATCH_SIZE para ser rápido no SIGTERM
+// sem sobrecarregar o pool (max: 5 conexões).
+const FLUSH_BATCH_SIZE = 5;
+
 async function flushLiveViewerSessions(live) {
+  const entries = Object.entries(live.viewerSessions);
+  if (entries.length === 0) return;
+
   let count = 0;
-  for (const [viewerUid, s] of Object.entries(live.viewerSessions)) {
-    try {
-      await pool.query(`
-        INSERT INTO live_viewer_sessions (live_id, ip, kick_username, platform, os, os_version, device_model, browser, browser_version, user_agent, is_mobile, joined_at, last_seen, total_seconds, segments_loaded, estimated_mb, quality_history, player_health, viewer_uid)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-        ON CONFLICT (live_id, viewer_uid) DO UPDATE SET
-          kick_username = EXCLUDED.kick_username, last_seen = EXCLUDED.last_seen,
-          total_seconds = EXCLUDED.total_seconds, segments_loaded = EXCLUDED.segments_loaded,
-          estimated_mb = EXCLUDED.estimated_mb, quality_history = EXCLUDED.quality_history,
-          player_health = EXCLUDED.player_health
-      `, [
-        live.liveId, s.ip, s.kick_username || '', s.platform || 'unknown', s.os || 'unknown',
-        s.os_version || '', s.device_model || '', s.browser || 'unknown', s.browser_version || '',
-        s.user_agent || '', s.is_mobile || false, s.joined_at, s.last_seen,
-        s.total_seconds || 0, s.segments_loaded || 0, s.estimated_mb || 0,
-        JSON.stringify(s.quality_history || []), JSON.stringify(s.player_health || {}), viewerUid,
-      ]);
-      count++;
-    } catch (e) {
-      logger.warn(`[LIVE] Erro flush viewer ${viewerUid}:`, e.message);
+  let errors = 0;
+
+  // Processar em lotes de FLUSH_BATCH_SIZE (respeita pool.max = 5)
+  for (let i = 0; i < entries.length; i += FLUSH_BATCH_SIZE) {
+    const batch = entries.slice(i, i + FLUSH_BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map(([viewerUid, s]) =>
+        pool.query(`
+          INSERT INTO live_viewer_sessions (live_id, ip, kick_username, platform, os, os_version, device_model, browser, browser_version, user_agent, is_mobile, joined_at, last_seen, total_seconds, segments_loaded, estimated_mb, quality_history, player_health, viewer_uid)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+          ON CONFLICT (live_id, viewer_uid) DO UPDATE SET
+            kick_username = EXCLUDED.kick_username, last_seen = EXCLUDED.last_seen,
+            total_seconds = EXCLUDED.total_seconds, segments_loaded = EXCLUDED.segments_loaded,
+            estimated_mb = EXCLUDED.estimated_mb, quality_history = EXCLUDED.quality_history,
+            player_health = EXCLUDED.player_health
+        `, [
+          live.liveId, s.ip, s.kick_username || '', s.platform || 'unknown', s.os || 'unknown',
+          s.os_version || '', s.device_model || '', s.browser || 'unknown', s.browser_version || '',
+          s.user_agent || '', s.is_mobile || false, s.joined_at, s.last_seen,
+          s.total_seconds || 0, s.segments_loaded || 0, s.estimated_mb || 0,
+          JSON.stringify(s.quality_history || []), JSON.stringify(s.player_health || {}), viewerUid,
+        ])
+      )
+    );
+    for (const r of results) {
+      if (r.status === 'fulfilled') count++;
+      else { errors++; logger.warn(`[FLUSH] Erro batch live #${live.liveId}:`, r.reason?.message); }
     }
   }
-  if (count > 0) console.log(`[FLUSH] Live #${live.liveId}: ${count} viewers`);
+
+  if (count > 0 || errors > 0) {
+    console.log(`[FLUSH] Live #${live.liveId}: ${count} viewers salvos${errors ? `, ${errors} erros` : ''}`);
+  }
 }
 
 // Registrar viewer na live ativa
@@ -1327,12 +1344,17 @@ setInterval(async () => {
   await flushActiveLives();
 }, FLUSH_INTERVAL);
 
-// Encerrar lives ativas ao desligar
+// Graceful shutdown — SIGTERM é enviado pelo squarecloud no deploy
+// Apenas salvar sessões em andamento; NÃO encerrar as lives no banco.
+// Assim, ao reiniciar, restoreActiveLives() retoma de onde parou.
 process.on('SIGTERM', async () => {
-  for (const id of Object.keys(activeLives)) await onLiveEnd(id);
+  console.log('[SIGTERM] Recebido — salvando sessões antes de reiniciar...');
+  try { await flushActiveLives(); } catch (e) { console.error('[SIGTERM] Erro flush:', e.message); }
   process.exit(0);
 });
+// SIGINT (Ctrl+C manual) — aí sim encerrar as lives corretamente
 process.on('SIGINT', async () => {
+  console.log('[SIGINT] Recebido — encerrando lives...');
   for (const id of Object.keys(activeLives)) await onLiveEnd(id);
   process.exit(0);
 });
