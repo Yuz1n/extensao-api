@@ -1165,6 +1165,39 @@ app.post('/api/live/end', async (req, res) => {
   }
 });
 
+// POST /api/admin/live/force-end/:id_streamer — Forçar fim de live manualmente
+app.post('/api/admin/live/force-end/:id_streamer', requireApiKey, async (req, res) => {
+  const idStreamer = req.params.id_streamer.toLowerCase();
+  try {
+    const inMemory = !!activeLives[idStreamer];
+
+    // Setar flag de ended para o overlay detectar e ejetar os viewers
+    endedStreamers[idStreamer] = true;
+    setTimeout(() => { delete endedStreamers[idStreamer]; }, 300000);
+
+    if (inMemory) {
+      // Live ainda está em memória → encerrar normalmente (salva stats + flush sessões)
+      await onLiveEnd(idStreamer);
+      return res.json({ ended: true, source: 'memory' });
+    }
+
+    // Live não está em memória mas pode estar presa no banco como 'active'
+    const result = await pool.query(
+      "UPDATE lives SET ended_at = NOW(), status = 'ended', duration_seconds = EXTRACT(EPOCH FROM (NOW() - started_at))::int WHERE id_streamer = $1 AND status = 'active' RETURNING id",
+      [idStreamer]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ ended: false, reason: 'no_active_live_found' });
+    }
+
+    return res.json({ ended: true, source: 'db_only', live_id: result.rows[0].id });
+  } catch (e) {
+    logger.error('[ADMIN] Erro force-end:', e.message);
+    return res.status(500).json({ message: 'Erro interno', error: e.message });
+  }
+});
+
 // Iniciar live (chamado internamente)
 async function onLiveStart(idStreamer, streamerName) {
   idStreamer = idStreamer.toLowerCase();
