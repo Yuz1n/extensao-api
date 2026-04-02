@@ -23,7 +23,7 @@
 
   var API_URL = '__OVERLAY_API_URL__';
   var API_KEY = '__OVERLAY_API_KEY__';
-  var HLS_CDN = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js';
+  var HLS_CDN = 'https://cdn.jsdelivr.net/npm/hls.js@1.6.15/dist/hls.light.min.js';
 
   // ════════════════════════════════════════════════════════════════════════════
   // DETECÇÃO
@@ -746,8 +746,10 @@
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
       var hls = new Hls({
         lowLatencyMode: false,
-        liveSyncDurationCount: 4,
-        liveMaxLatencyDurationCount: 8,
+        liveSyncDurationCount: 2,
+        liveMaxLatencyDurationCount: 5,
+        liveSyncOnStallIncrease: 0,
+        maxLiveSyncPlaybackRate: 1.5,
         backBufferLength: 15,
         enableWorker: true,
         maxBufferLength: 30,
@@ -796,8 +798,10 @@
           var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
           var newHls = new Hls({
             lowLatencyMode: false,
-            liveSyncDurationCount: 4,
-            liveMaxLatencyDurationCount: 8,
+            liveSyncDurationCount: 2,
+            liveMaxLatencyDurationCount: 5,
+            liveSyncOnStallIncrease: 0,
+            maxLiveSyncPlaybackRate: 1.5,
             backBufferLength: 15,
             enableWorker: true,
             maxBufferLength: 30,

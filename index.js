@@ -553,7 +553,7 @@ app.get('/health', (req, res) => {
 
 // ── Stream URL cache (evita rate limit da Cloudflare KV API) ──
 const streamUrlCache = {}; // { mediamtxPath: { url, timestamp } }
-const CACHE_TTL_MS = 120000; // 2 minutos — UUID rotaciona a cada 1h com overlap de 3min
+const CACHE_TTL_MS = 30000; // 30s — garante que novo UUID é entregue com folga antes do overlap terminar
 const pendingKvRequests = {}; // { mediamtxPath: Promise } — deduplicação de requests
 
 async function getCachedStreamUrl(mediamtxPath) {
