@@ -148,11 +148,11 @@ function rateLimiter(req, res, next) {
 setInterval(() => {
   const now = Date.now();
   for (const ip in rateLimit) {
-    if (now - rateLimit[ip].start > RATE_LIMIT_WINDOW * 2) {
+    if (now - rateLimit[ip].start > RATE_LIMIT_WINDOW) {
       delete rateLimit[ip];
     }
   }
-}, 5 * 60 * 1000);
+}, 60 * 1000);
 
 app.use(rateLimiter);
 
@@ -248,6 +248,25 @@ function registerViewer(idStreamer, viewerUid) {
     activeViewers[key] = {};
   }
   activeViewers[key][viewerUid] = Date.now();
+}
+
+// Registrar viewer com check atômico de max_spectators (previne race condition)
+// Retorna { allowed: true } ou { allowed: false, current, max }
+function registerViewerIfAllowed(idStreamer, viewerUid, maxSpectators) {
+  const key = idStreamer.toLowerCase();
+  if (!activeViewers[key]) activeViewers[key] = {};
+  // Se ilimitado ou viewer já está registrado, sempre permite
+  if (maxSpectators <= 0 || activeViewers[key][viewerUid]) {
+    activeViewers[key][viewerUid] = Date.now();
+    return { allowed: true };
+  }
+  // Check + register atômico (single-threaded JS garante atomicidade)
+  const current = Object.keys(activeViewers[key]).length;
+  if (current >= maxSpectators) {
+    return { allowed: false, current, max: maxSpectators };
+  }
+  activeViewers[key][viewerUid] = Date.now();
+  return { allowed: true };
 }
 
 // Remover viewer
@@ -822,20 +841,18 @@ app.post('/api/viewer/join', requireApiKey, async (req, res) => {
     }
 
     const maxSpectators = result.rows[0].max_spectators;
-    const currentViewers = getViewerCount(id_streamer);
 
-    // max_spectators = 0 significa sem limite
-    if (maxSpectators > 0 && currentViewers >= maxSpectators) {
-      logger.live(id_streamer, 'WARN', `[JOIN] Sala cheia para "${id_streamer}": ${currentViewers}/${maxSpectators}`);
+    // Check + register atômico (previne race condition em requests concorrentes)
+    const joinResult = registerViewerIfAllowed(id_streamer, viewer_uid, maxSpectators);
+    if (!joinResult.allowed) {
+      logger.live(id_streamer, 'WARN', `[JOIN] Sala cheia para "${id_streamer}": ${joinResult.current}/${joinResult.max}`);
       return res.status(403).json({
         message: 'Sala cheia',
-        current_viewers: currentViewers,
-        max_spectators: maxSpectators
+        current_viewers: joinResult.current,
+        max_spectators: joinResult.max
       });
     }
 
-    // Registrar viewer
-    registerViewer(id_streamer, viewer_uid);
     updateLivePeak(id_streamer);
     const newCount = getViewerCount(id_streamer);
 
@@ -1289,6 +1306,7 @@ async function onLiveEnd(idStreamer) {
     logger.live(idStreamer, 'ERROR', '[LIVE] Erro ao encerrar:', e.message);
   }
   delete activeLives[idStreamer];
+  delete activeViewers[idStreamer];
 }
 
 // Flush sessões de viewer pro banco
@@ -1306,28 +1324,42 @@ async function flushLiveViewerSessions(live) {
   // Processar em lotes de FLUSH_BATCH_SIZE (respeita pool.max = 5)
   for (let i = 0; i < entries.length; i += FLUSH_BATCH_SIZE) {
     const batch = entries.slice(i, i + FLUSH_BATCH_SIZE);
-    const results = await Promise.allSettled(
-      batch.map(([viewerUid, s]) =>
-        pool.query(`
-          INSERT INTO live_viewer_sessions (live_id, ip, kick_username, platform, os, os_version, device_model, browser, browser_version, user_agent, is_mobile, joined_at, last_seen, total_seconds, segments_loaded, estimated_mb, quality_history, player_health, viewer_uid)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-          ON CONFLICT (live_id, viewer_uid) DO UPDATE SET
-            kick_username = EXCLUDED.kick_username, last_seen = EXCLUDED.last_seen,
-            total_seconds = EXCLUDED.total_seconds, segments_loaded = EXCLUDED.segments_loaded,
-            estimated_mb = EXCLUDED.estimated_mb, quality_history = EXCLUDED.quality_history,
-            player_health = EXCLUDED.player_health
-        `, [
-          live.liveId, s.ip, s.kick_username || '', s.platform || 'unknown', s.os || 'unknown',
-          s.os_version || '', s.device_model || '', s.browser || 'unknown', s.browser_version || '',
-          s.user_agent || '', s.is_mobile || false, s.joined_at, s.last_seen,
-          s.total_seconds || 0, s.segments_loaded || 0, s.estimated_mb || 0,
-          JSON.stringify(s.quality_history || []), JSON.stringify(s.player_health || {}), viewerUid,
-        ])
-      )
-    );
-    for (const r of results) {
-      if (r.status === 'fulfilled') count++;
-      else { errors++; logger.warn(`[FLUSH] Erro batch live #${live.liveId}:`, r.reason?.message); }
+
+    // Tentar até 2x por batch (retry com 1s de delay se falhar)
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const results = await Promise.allSettled(
+        batch.map(([viewerUid, s]) =>
+          pool.query(`
+            INSERT INTO live_viewer_sessions (live_id, ip, kick_username, platform, os, os_version, device_model, browser, browser_version, user_agent, is_mobile, joined_at, last_seen, total_seconds, segments_loaded, estimated_mb, quality_history, player_health, viewer_uid)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+            ON CONFLICT (live_id, viewer_uid) DO UPDATE SET
+              kick_username = EXCLUDED.kick_username, last_seen = EXCLUDED.last_seen,
+              total_seconds = EXCLUDED.total_seconds, segments_loaded = EXCLUDED.segments_loaded,
+              estimated_mb = EXCLUDED.estimated_mb, quality_history = EXCLUDED.quality_history,
+              player_health = EXCLUDED.player_health
+          `, [
+            live.liveId, s.ip, s.kick_username || '', s.platform || 'unknown', s.os || 'unknown',
+            s.os_version || '', s.device_model || '', s.browser || 'unknown', s.browser_version || '',
+            s.user_agent || '', s.is_mobile || false, s.joined_at, s.last_seen,
+            s.total_seconds || 0, s.segments_loaded || 0, s.estimated_mb || 0,
+            JSON.stringify(s.quality_history || []), JSON.stringify(s.player_health || {}), viewerUid,
+          ])
+        )
+      );
+      let batchErrors = 0;
+      for (const r of results) {
+        if (r.status === 'fulfilled') count++;
+        else batchErrors++;
+      }
+      if (batchErrors === 0) break; // batch inteiro OK, prosseguir
+      errors += batchErrors;
+      if (attempt < 2) {
+        logger.warn(`[FLUSH] Batch live #${live.liveId} falhou (${batchErrors} erros), retentando em 1s...`);
+        await new Promise(r => setTimeout(r, 1000));
+        count -= (batch.length - batchErrors); // descontar os que já contou como OK
+      } else {
+        logger.warn(`[FLUSH] Batch live #${live.liveId}: ${batchErrors} erros após retry`);
+      }
     }
   }
 
@@ -1556,6 +1588,7 @@ async function restoreActiveLives() {
           joined_at: s.joined_at, last_seen: s.last_seen, total_seconds: s.total_seconds,
           segments_loaded: s.segments_loaded, estimated_mb: s.estimated_mb,
           quality_history: s.quality_history || [], player_health: s.player_health || {},
+          _lastSeenMs: Date.now(),
         };
       }
       logger.live(restoredKey, 'INFO', `[LIVE] Restaurada: ${row.streamer} (${row.id_streamer}) → live #${row.id} | ${sessions.rows.length} viewers`);

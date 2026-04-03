@@ -14,8 +14,8 @@
 (function () {
   'use strict';
 
-  // Evita duplicar
-  if (document.getElementById('overlay-stream-ui')) return;
+  // Evita duplicar (checa UI e player HLS ativo)
+  if (document.getElementById('overlay-stream-ui') || window._vodyHls) return;
 
   // ════════════════════════════════════════════════════════════════════════════
   // ANTI-DEVTOOLS
@@ -200,10 +200,11 @@
 
   var isMobile = (function () {
     var hasTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
-    var smallScreen = window.innerWidth <= 768;
-    var uaCheck = /Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    var smallScreen = window.innerWidth <= 1024;
+    var isPhone = /iPhone|iPod|Android.*Mobile|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     var isIPad = navigator.maxTouchPoints > 1 && /Macintosh/i.test(navigator.userAgent);
-    return uaCheck || (hasTouch && smallScreen) || isIPad;
+    // Phones: sempre mobile. Tablets (iPad, Android tablet): tratar como desktop (tela grande)
+    return isPhone || (hasTouch && smallScreen && !isIPad);
   })();
 
   function getKickUsername() {
@@ -437,6 +438,7 @@
   // ════════════════════════════════════════════════════════════════════════════
 
   var heartbeatInterval = null;
+  var queuePollTimer = null;
   var segmentsLoaded = 0;
 
   // Player health tracking
@@ -533,6 +535,11 @@
           showStreamEnded();
           return;
         }
+        // Atualizar contador de viewers
+        if (data.current_viewers !== undefined) {
+          var countEl = document.getElementById('stream-viewer-count-text');
+          if (countEl) countEl.textContent = data.current_viewers + ' assistindo';
+        }
       })
       .catch(function () {});
 
@@ -573,6 +580,7 @@
 
     // Parar intervalos
     if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+    if (queuePollTimer) { clearInterval(queuePollTimer); queuePollTimer = null; }
 
     // Leave
     var code = localStorage.getItem('overlay_active_streamer');
@@ -769,7 +777,8 @@
 
   // ── Polling da fila ──
   function pollQueue(streamerCode, btn) {
-    var queuePollTimer = setInterval(function () {
+    if (queuePollTimer) clearInterval(queuePollTimer);
+    queuePollTimer = setInterval(function () {
       fetch(API_URL + '/api/queue/status/' + encodeURIComponent(streamerCode) + '?viewer_uid=' + encodeURIComponent(viewerUid), {
         headers: { 'X-Api-Key': API_KEY },
       })
@@ -941,9 +950,11 @@
       });
       hls.on(Hls.Events.FRAG_LOADED, function () {
         segmentsLoaded++;
+        lastFragLoadedTime = Date.now();
       });
       var consecutiveFatalErrors = 0;
       var lastFatalTime = 0;
+      var lastFragLoadedTime = Date.now();
       var mediaRecoverAttempts = 0;
       var isRecreating = false;
 
@@ -989,6 +1000,7 @@
           });
           newHls.on(Hls.Events.FRAG_LOADED, function () {
             segmentsLoaded++;
+            lastFragLoadedTime = Date.now();
             consecutiveFatalErrors = 0;
             mediaRecoverAttempts = 0;
           });
@@ -1028,8 +1040,9 @@
         lastFatalTime = now;
 
         // Stream realmente encerrado (muitos erros seguidos por muito tempo)
-        if (consecutiveFatalErrors >= 30) {
-          console.warn('[STREAM] 30+ erros fatais consecutivos — stream provavelmente encerrado');
+        // Só declarar se último fragment carregou há mais de 2 minutos (evita falso positivo em rede instável)
+        if (consecutiveFatalErrors >= 50 && (Date.now() - lastFragLoadedTime > 120000)) {
+          console.warn('[STREAM] 50+ erros fatais + 2min sem fragments — stream provavelmente encerrado');
           showStreamEnded();
           return;
         }
@@ -1475,15 +1488,18 @@
           if (!base) { menu.classList.remove('open'); menuOpen = false; return; }
           var hls = window._vodyHls;
           if (hls && hls.levels && hls.levels.length > 0) {
-            // Trocar qualidade via hls.currentLevel (sem recarregar source)
+            // Trocar qualidade via hls.currentLevel — pegar nível mais próximo
+            var targetHeight = (q === '1080p') ? 1080 : 720;
+            var bestIdx = -1;
+            var bestDiff = Infinity;
             for (var li = 0; li < hls.levels.length; li++) {
-              var lh = hls.levels[li].height;
-              if ((q === '1080p' && lh >= 1080) ||
-                  (q === '720p' && lh >= 700 && lh <= 800)) {
-                hls.currentLevel = li;
-                break;
+              var diff = Math.abs(hls.levels[li].height - targetHeight);
+              if (diff < bestDiff) {
+                bestDiff = diff;
+                bestIdx = li;
               }
             }
+            if (bestIdx >= 0) hls.currentLevel = bestIdx;
           } else if (window._vodyIsNativeHLS && window._vodyVideo) {
             var base = window._vodyStreamBase;
             var vid = window._vodyVideo;
