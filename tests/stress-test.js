@@ -15,8 +15,20 @@
  *   4. POST /leave (sair)
  */
 
-const API_URL = 'https://extensao-api.squareweb.app';
-const API_KEY = 'vdo-overlay-k8x2m9p4q7w1';
+// Ler variáveis do .env.overlay
+const fs = require('fs');
+const path = require('path');
+const envVars = {};
+fs.readFileSync(path.join(__dirname, '..', '.env.overlay'), 'utf8').split('\n').forEach(line => {
+  line = line.trim();
+  if (!line || line.startsWith('#')) return;
+  const [key, ...rest] = line.split('=');
+  envVars[key.trim()] = rest.join('=').trim();
+});
+
+const API_URL = envVars.OVERLAY_API_URL || 'https://extensao-api.squareweb.app';
+const API_KEY = envVars.OVERLAY_API_KEY || '';
+const STRESS_KEY = envVars.STRESS_TEST_KEY || '';
 
 const TOTAL_VIEWERS = parseInt(process.argv[2]) || 100;
 const STREAMER = process.argv[3] || 'tteuw21';
@@ -42,7 +54,7 @@ async function timedFetch(url, options = {}) {
   try {
     const resp = await fetch(url, {
       ...options,
-      headers: { 'X-Api-Key': API_KEY, 'Content-Type': 'application/json', 'X-Stress-Test': 'vdo-stress-2026', ...options.headers },
+      headers: { 'X-Api-Key': API_KEY, 'Content-Type': 'application/json', ...(STRESS_KEY ? { 'X-Stress-Test': STRESS_KEY } : {}), ...options.headers },
       signal: AbortSignal.timeout(15000),
     });
     const ms = Date.now() - start;

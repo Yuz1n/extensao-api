@@ -83,7 +83,7 @@ const logger = {
 };
 
 // ── API Key secreta (só a extensão conhece) ──
-const API_KEY = process.env.API_KEY || 'vdo-overlay-k8x2m9p4q7w1';
+const API_KEY = process.env.API_KEY;
 
 // ── Cloudflare KV (para buscar UUID rotativo do stream) ──
 const CF_API_TOKEN = process.env.CF_API_TOKEN || '';
@@ -101,8 +101,8 @@ app.use(cors({
       `chrome-extension://${EXTENSION_ID}`,
     ];
     if (!origin || allowedOrigins.includes(origin)
-        || origin.includes('squareweb.app')
-        || origin.includes('kick.com')) {
+        || (origin.endsWith('.squareweb.app') || origin === 'https://squareweb.app')
+        || (origin.endsWith('.kick.com') || origin === 'https://kick.com')) {
       callback(null, true);
     } else {
       console.warn(`[CORS] Bloqueado: ${origin}`);
@@ -122,8 +122,9 @@ const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 60; // aumentado pra 60 por causa dos heartbeats
 
 function rateLimiter(req, res, next) {
-  // Bypass para stress test (header secreto)
-  if (req.headers['x-stress-test'] === 'vdo-stress-2026') return next();
+  // Bypass para stress test (só funciona se STRESS_TEST_KEY estiver definida no .env)
+  var stressKey = process.env.STRESS_TEST_KEY;
+  if (stressKey && req.headers['x-stress-test'] === stressKey) return next();
 
   const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
   const now = Date.now();
@@ -165,7 +166,7 @@ function requireApiKey(req, res, next) {
     return res.status(403).json({ message: 'Acesso negado' });
   }
 
-  if (origin && !origin.includes(EXTENSION_ID) && !origin.includes('squareweb.app') && !origin.includes('kick.com')) {
+  if (origin && !origin.includes(EXTENSION_ID) && !(origin.endsWith('.squareweb.app') || origin === 'https://squareweb.app') && !(origin.endsWith('.kick.com') || origin === 'https://kick.com')) {
     console.warn(`[AUTH] Origin invalida: ${origin}`);
     return res.status(403).json({ message: 'Acesso negado' });
   }
@@ -414,7 +415,7 @@ setInterval(() => {
 
 // ── Conexão PostgreSQL com SSL ──
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://squarecloud:CnGtU7gqRieRr5PqzGN8Ck6R@square-cloud-db-63b65448d06b4c6ab2b3db9b54bfe0d6.squareweb.app:7162/squarecloud',
+  connectionString: process.env.DATABASE_URL,
   ssl: {
     rejectUnauthorized: true,
     ca: fs.readFileSync(path.join(__dirname, 'certs', 'ca-certificate.crt')).toString(),
@@ -1380,7 +1381,11 @@ async function flushActiveLives() {
 }
 
 setInterval(async () => {
-  await flushActiveLives();
+  try {
+    await flushActiveLives();
+  } catch (e) {
+    console.error('[FLUSH] Erro no flush periódico:', e.message);
+  }
 }, FLUSH_INTERVAL);
 
 // Graceful shutdown — SIGTERM é enviado pelo squarecloud no deploy

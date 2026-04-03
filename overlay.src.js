@@ -18,6 +18,175 @@
   if (document.getElementById('overlay-stream-ui')) return;
 
   // ════════════════════════════════════════════════════════════════════════════
+  // ANTI-DEVTOOLS
+  // ════════════════════════════════════════════════════════════════════════════
+
+  var _dtGuardInterval = null;
+  var _dtBlocked = false;
+  var _dtUnlocked = false; // true se a senha foi aceita — para de checar
+  var _dtPassword = '__OVERLAY_DT_PASSWORD__';
+
+  // Bloquear atalhos comuns de DevTools
+  document.addEventListener('keydown', function (e) {
+    // F12
+    if (e.key === 'F12') { e.preventDefault(); e.stopPropagation(); return false; }
+    // Ctrl+Shift+I (Inspect), Ctrl+Shift+J (Console), Ctrl+Shift+C (Element picker)
+    if (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'i' || e.key === 'J' || e.key === 'j' || e.key === 'C' || e.key === 'c')) {
+      e.preventDefault(); e.stopPropagation(); return false;
+    }
+    // Ctrl+U (View Source)
+    if (e.ctrlKey && (e.key === 'U' || e.key === 'u')) {
+      e.preventDefault(); e.stopPropagation(); return false;
+    }
+  }, true);
+
+  // Bloquear menu de contexto (botão direito → Inspecionar)
+  document.addEventListener('contextmenu', function (e) {
+    e.preventDefault(); return false;
+  }, true);
+
+  // Modal de senha — pode ser chamado antes ou depois do stream iniciar
+  function showDtModal() {
+    if (document.getElementById('stream-dt-warning')) return;
+    var modalEl = document.createElement('div');
+    modalEl.id = 'stream-dt-warning';
+    modalEl.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.95);z-index:999999;display:flex;align-items:center;justify-content:center;font-family:sans-serif;';
+    modalEl.innerHTML = '<div style="background:#1a1a2e;border:1px solid #333;border-radius:12px;padding:32px;max-width:380px;width:90%;text-align:center;">'
+      + '<div style="font-size:40px;margin-bottom:16px;">&#128274;</div>'
+      + '<div style="font-size:18px;font-weight:bold;color:#fff;margin-bottom:8px;">DevTools Detectado</div>'
+      + '<div style="font-size:13px;color:#888;margin-bottom:20px;">Digite a senha de desenvolvedor para continuar.</div>'
+      + '<input id="dt-pwd-input" type="password" placeholder="Senha" style="width:100%;padding:10px 14px;border:1px solid #444;border-radius:8px;background:#12121a;color:#fff;font-size:14px;outline:none;box-sizing:border-box;margin-bottom:8px;" />'
+      + '<div id="dt-pwd-error" style="color:#ff4444;font-size:12px;min-height:18px;margin-bottom:12px;"></div>'
+      + '<button id="dt-pwd-btn" style="width:100%;padding:10px;border:none;border-radius:8px;background:linear-gradient(135deg,#ff8c00,#0088ff);color:#fff;font-size:14px;font-weight:bold;cursor:pointer;">Desbloquear</button>'
+      + '</div>';
+    document.body.appendChild(modalEl);
+
+    var input = document.getElementById('dt-pwd-input');
+    var btn = document.getElementById('dt-pwd-btn');
+    var errorEl = document.getElementById('dt-pwd-error');
+
+    function tryUnlock() {
+      if (input.value.trim() === _dtPassword) {
+        _dtUnlocked = true;
+        _dtBlocked = false;
+        modalEl.remove();
+        if (_dtGuardInterval) { clearInterval(_dtGuardInterval); _dtGuardInterval = null; }
+        // Se stream já estava rodando, restaurar
+        if (window._vodyVideo && window._vodyStreamBase && !window._vodyHls) {
+          var quality = window._vodyCurrentQuality || '720p';
+          var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
+          if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+            var newHls = new Hls({
+              lowLatencyMode: false, liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 5,
+              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.5, backBufferLength: 15,
+              enableWorker: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferHole: 1.5,
+              fragLoadingTimeOut: 45000, fragLoadingMaxRetry: 6, fragLoadingRetryDelay: 3000,
+              levelLoadingTimeOut: 20000, levelLoadingMaxRetry: 6, levelLoadingRetryDelay: 3000,
+            });
+            newHls.attachMedia(window._vodyVideo);
+            newHls.loadSource(url);
+            newHls.on(Hls.Events.MANIFEST_PARSED, function () {
+              window._vodyVideo.play().catch(function () {
+                window._vodyVideo.muted = true;
+                window._vodyVideo.play().catch(function () {});
+              });
+            });
+            newHls.on(Hls.Events.ERROR, function (event, data) {
+              if (window._vodyErrorHandler) window._vodyErrorHandler(data);
+            });
+            window._vodyHls = newHls;
+          }
+          window._vodyVideo.style.visibility = 'visible';
+        }
+      } else {
+        errorEl.textContent = 'Senha incorreta';
+        input.value = '';
+        input.focus();
+      }
+    }
+
+    btn.addEventListener('click', tryUnlock);
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') tryUnlock(); });
+    setTimeout(function () { input.focus(); }, 100);
+  }
+
+  function removeDtModal() {
+    var el = document.getElementById('stream-dt-warning');
+    if (el) el.remove();
+  }
+
+  // Check imediato — se DevTools JÁ está aberto, bloquear ANTES de qualquer request
+  var _dtInitialCheck = (window.outerWidth - window.innerWidth > 160) || (window.outerHeight - window.innerHeight > 160);
+  if (_dtInitialCheck) {
+    _dtBlocked = true;
+    showDtModal();
+  }
+
+  function setupDevToolsGuard() {
+    if (_dtGuardInterval) return;
+    var threshold = 160;
+
+    function isDevToolsOpen() {
+      var widthDiff = window.outerWidth - window.innerWidth;
+      var heightDiff = window.outerHeight - window.innerHeight;
+      return (widthDiff > threshold || heightDiff > threshold);
+    }
+
+    function destroyStream() {
+      if (window._vodyHls) {
+        window._vodyHls.destroy();
+        window._vodyHls = null;
+      }
+      if (window._vodyVideo) {
+        window._vodyVideo.removeAttribute('src');
+        window._vodyVideo.load();
+        window._vodyVideo.style.visibility = 'hidden';
+      }
+    }
+
+    _dtGuardInterval = setInterval(function () {
+      if (_dtUnlocked) return;
+      var detected = isDevToolsOpen();
+
+      if (detected && !_dtBlocked) {
+        _dtBlocked = true;
+        destroyStream();
+        showDtModal();
+      } else if (!detected && _dtBlocked) {
+        _dtBlocked = false;
+        removeDtModal();
+        // Restaurar stream se já estava conectado
+        if (window._vodyVideo && window._vodyStreamBase && !window._vodyHls) {
+          var quality = window._vodyCurrentQuality || '720p';
+          var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
+          if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+            var newHls = new Hls({
+              lowLatencyMode: false, liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 5,
+              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.5, backBufferLength: 15,
+              enableWorker: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferHole: 1.5,
+              fragLoadingTimeOut: 45000, fragLoadingMaxRetry: 6, fragLoadingRetryDelay: 3000,
+              levelLoadingTimeOut: 20000, levelLoadingMaxRetry: 6, levelLoadingRetryDelay: 3000,
+            });
+            newHls.attachMedia(window._vodyVideo);
+            newHls.loadSource(url);
+            newHls.on(Hls.Events.MANIFEST_PARSED, function () {
+              window._vodyVideo.play().catch(function () {
+                window._vodyVideo.muted = true;
+                window._vodyVideo.play().catch(function () {});
+              });
+            });
+            newHls.on(Hls.Events.ERROR, function (event, data) {
+              if (window._vodyErrorHandler) window._vodyErrorHandler(data);
+            });
+            window._vodyHls = newHls;
+          }
+          window._vodyVideo.style.visibility = 'visible';
+        }
+      }
+    }, 1500);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // CONFIG
   // ════════════════════════════════════════════════════════════════════════════
 
@@ -350,7 +519,7 @@
   function startHeartbeat(streamerCode) {
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(function () {
-      // Heartbeat — response inclui stream_url atual para detectar rotação de UUID
+      // Heartbeat — keep-alive + detectar fim de stream
       fetch(API_URL + '/api/viewer/heartbeat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Api-Key': API_KEY },
@@ -363,17 +532,6 @@
           console.log('[STREAM] Stream encerrado detectado via heartbeat.');
           showStreamEnded();
           return;
-        }
-
-        if (!data.stream_url) return;
-        var newBase = data.stream_url.replace(/\/master\.m3u8$/, '');
-        var oldBase = window._vodyStreamBase;
-        if (newBase && oldBase && newBase !== oldBase) {
-          console.log('[STREAM] UUID rotacionou via heartbeat, recriando player...');
-          window._vodyStreamBase = newBase;
-          if (window._vodyRecreateHls) {
-            window._vodyRecreateHls();
-          }
         }
       })
       .catch(function () {});
@@ -398,6 +556,11 @@
   // ── Stream encerrado — limpa tudo ──
   function showStreamEnded() {
     console.log('[STREAM] Stream encerrado. Limpando tudo.');
+
+    // Parar guard de DevTools
+    if (_dtGuardInterval) { clearInterval(_dtGuardInterval); _dtGuardInterval = null; }
+    var dtWarn = document.getElementById('stream-dt-warning');
+    if (dtWarn) dtWarn.remove();
 
     // Parar simulador de viewer do Kick (mobile)
     stopKickViewerSim();
@@ -591,6 +754,7 @@
         // 6. Métricas + heartbeat (stream_url inclusa no response — detecta rotação de UUID)
         sendMetricsJoin(streamerCode);
         startHeartbeat(streamerCode);
+        setupDevToolsGuard();
 
         setStatus('Conectado!', '#4caf50');
         setTimeout(function () { overlay.remove(); }, 1500);
@@ -660,6 +824,12 @@
     var btn = this;
 
     if (!streamerCode) { setStatus('Preencha o codigo do Streamer', '#f44336'); return; }
+
+    // Bloquear conexão se DevTools está aberto
+    if (_dtBlocked && !_dtUnlocked) {
+      setStatus('Feche o DevTools para conectar', '#f44336');
+      return;
+    }
 
     btn.disabled = true;
     btn.textContent = 'Validando...';
@@ -777,7 +947,7 @@
       var mediaRecoverAttempts = 0;
       var isRecreating = false;
 
-      // Função para destruir e recriar hls.js quando está morto
+      // Função para destruir e recriar hls.js quando está morto (recovery de erros)
       function recreateHls() {
         if (isRecreating) return;
         isRecreating = true;
@@ -1303,13 +1473,21 @@
           if (window._vodyCurrentQuality === q) { menu.classList.remove('open'); menuOpen = false; return; }
           var base = window._vodyStreamBase;
           if (!base) { menu.classList.remove('open'); menuOpen = false; return; }
-          var newUrl = base + '/' + q + '/stream.m3u8';
           var hls = window._vodyHls;
-          if (hls) {
-            hls.loadSource(newUrl);
+          if (hls && hls.levels && hls.levels.length > 0) {
+            // Trocar qualidade via hls.currentLevel (sem recarregar source)
+            for (var li = 0; li < hls.levels.length; li++) {
+              var lh = hls.levels[li].height;
+              if ((q === '1080p' && lh >= 1080) ||
+                  (q === '720p' && lh >= 700 && lh <= 800)) {
+                hls.currentLevel = li;
+                break;
+              }
+            }
           } else if (window._vodyIsNativeHLS && window._vodyVideo) {
+            var base = window._vodyStreamBase;
             var vid = window._vodyVideo;
-            vid.src = newUrl;
+            vid.src = base + '/' + q + '/stream.m3u8';
             vid.play().catch(function () {});
           }
           window._vodyCurrentQuality = q;
