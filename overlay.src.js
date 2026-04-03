@@ -369,15 +369,10 @@
         var newBase = data.stream_url.replace(/\/master\.m3u8$/, '');
         var oldBase = window._vodyStreamBase;
         if (newBase && oldBase && newBase !== oldBase) {
-          console.log('[STREAM] UUID rotacionou via heartbeat, trocando fonte...');
+          console.log('[STREAM] UUID rotacionou via heartbeat, recriando player...');
           window._vodyStreamBase = newBase;
-          var hls = window._vodyHls;
-          if (hls) {
-            var quality = window._vodyCurrentQuality || '720p';
-            hls.stopLoad();
-            hls.loadSource(newBase + '/' + quality + '/stream.m3u8');
-            hls.startLoad(-1);
-            console.log('[STREAM] Fonte trocada para: ' + newBase);
+          if (window._vodyRecreateHls) {
+            window._vodyRecreateHls();
           }
         }
       })
@@ -896,6 +891,7 @@
         mediaRecoverAttempts = 0;
       });
       window._vodyHls = hls;
+      window._vodyRecreateHls = recreateHls;
 
       // Sincronização com live edge — evita loop/atraso
       setInterval(function () {

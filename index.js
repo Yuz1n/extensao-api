@@ -1078,6 +1078,9 @@ const FLUSH_INTERVAL = 30000; // 30s
 // Em memória: lives ativas { id_streamer: { liveId, peakViewers, viewerSessions: {} } }
 const activeLives = {};
 
+// Mutex para onLiveStart — evita race condition com múltiplos validates simultâneos
+const startingLives = new Set();
+
 // Flag de streams encerrados (para forçar refresh no overlay)
 const endedStreamers = {};
 
@@ -1201,7 +1204,8 @@ app.post('/api/admin/live/force-end/:id_streamer', requireApiKey, async (req, re
 // Iniciar live (chamado internamente)
 async function onLiveStart(idStreamer, streamerName) {
   idStreamer = idStreamer.toLowerCase();
-  if (activeLives[idStreamer]) return;
+  if (activeLives[idStreamer] || startingLives.has(idStreamer)) return;
+  startingLives.add(idStreamer);
   try {
     // Checar no banco antes de inserir — previne registro duplicado se API reiniciou
     // durante uma live (race condition entre restoreActiveLives e primeira chamada de validate)
@@ -1227,6 +1231,8 @@ async function onLiveStart(idStreamer, streamerName) {
     logger.live(idStreamer, 'INFO', `[LIVE] Iniciada: ${streamerName} (${idStreamer}) → live #${liveId}`);
   } catch (e) {
     console.error('[LIVE] Erro ao iniciar:', e.message);
+  } finally {
+    startingLives.delete(idStreamer);
   }
 }
 
