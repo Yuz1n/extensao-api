@@ -115,8 +115,28 @@
     if (el) el.remove();
   }
 
+  // Detecta DevTools: tamanho da janela OU modo responsivo (emulação mobile com UA desktop)
+  // Detecta se é PC real (navigator.platform não é alterado pelo modo responsivo do DevTools)
+  var _dtIsPC = /Win|Mac|Linux x86/i.test(navigator.platform || navigator.userAgent);
+
+  function _dtDetect() {
+    // Mobile não checa DevTools (não existe no celular)
+    if (!_dtIsPC) return false;
+    // PC: técnica 1 — diferença de tamanho da janela (DevTools docked)
+    var widthDiff = window.outerWidth - window.innerWidth;
+    var heightDiff = window.outerHeight - window.innerHeight;
+    if (widthDiff > 160 || heightDiff > 160) return true;
+    // PC: técnica 2 — modo responsivo (viewport mobile mas é PC)
+    if (window.innerWidth < 500) return true;
+    // PC: técnica 3 — debugger timing (pega DevTools em qualquer modo)
+    var before = performance.now();
+    debugger;
+    if (performance.now() - before > 50) return true;
+    return false;
+  }
+
   // Check imediato — se DevTools JÁ está aberto, bloquear ANTES de qualquer request
-  var _dtInitialCheck = (window.outerWidth - window.innerWidth > 160) || (window.outerHeight - window.innerHeight > 160);
+  var _dtInitialCheck = _dtDetect();
   if (_dtInitialCheck) {
     _dtBlocked = true;
     showDtModal();
@@ -127,9 +147,7 @@
     var threshold = 160;
 
     function isDevToolsOpen() {
-      var widthDiff = window.outerWidth - window.innerWidth;
-      var heightDiff = window.outerHeight - window.innerHeight;
-      return (widthDiff > threshold || heightDiff > threshold);
+      return _dtDetect();
     }
 
     function destroyStream() {
@@ -942,9 +960,16 @@
         var playPromise = video.play();
         if (playPromise) {
           playPromise.catch(function () {
-            // Autoplay bloqueado — iniciar mutado e tentar de novo
+            // Autoplay bloqueado — iniciar mutado e desmutar no próximo click
             video.muted = true;
             video.play().catch(function () {});
+            function unmuteOnInteraction() {
+              video.muted = false;
+              document.removeEventListener('click', unmuteOnInteraction, true);
+              document.removeEventListener('touchstart', unmuteOnInteraction, true);
+            }
+            document.addEventListener('click', unmuteOnInteraction, true);
+            document.addEventListener('touchstart', unmuteOnInteraction, true);
           });
         }
       });

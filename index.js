@@ -1127,13 +1127,14 @@ app.post('/api/live/start', async (req, res) => {
       return res.json({ started: false, reason: 'already_active', live_id: activeLives[idStreamer].liveId });
     }
 
-    // Limpar flag de ended
+    // Limpar flag de ended (todas as variações de case)
     delete endedStreamers[idStreamer];
+    delete endedStreamers[idStreamer.toLowerCase()];
 
-    // Invalidar cache do KV pra forçar busca do novo UUID
+    // Invalidar cache do KV e forçar status active (evita validate re-setar o flag)
     const mediamtxPath = id_mediamtx.toLowerCase();
     delete streamUrlCache[mediamtxPath];
-    delete liveStatusCache[mediamtxPath];
+    liveStatusCache[mediamtxPath] = { status: 'active', timestamp: Date.now() };
 
     await onLiveStart(idStreamer, streamer.user);
     return res.json({ started: true, live_id: activeLives[idStreamer]?.liveId });
