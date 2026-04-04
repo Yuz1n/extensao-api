@@ -77,8 +77,8 @@
           var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
           if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             var newHls = new Hls({
-              lowLatencyMode: false, liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 5,
-              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.5, backBufferLength: 15,
+              lowLatencyMode: false, liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8,
+              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.5, backBufferLength: 30,
               enableWorker: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferHole: 1.5,
               fragLoadingTimeOut: 45000, fragLoadingMaxRetry: 6, fragLoadingRetryDelay: 3000,
               levelLoadingTimeOut: 20000, levelLoadingMaxRetry: 6, levelLoadingRetryDelay: 3000,
@@ -175,8 +175,8 @@
           var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
           if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             var newHls = new Hls({
-              lowLatencyMode: false, liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 5,
-              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.5, backBufferLength: 15,
+              lowLatencyMode: false, liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8,
+              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.5, backBufferLength: 30,
               enableWorker: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferHole: 1.5,
               fragLoadingTimeOut: 45000, fragLoadingMaxRetry: 6, fragLoadingRetryDelay: 3000,
               levelLoadingTimeOut: 20000, levelLoadingMaxRetry: 6, levelLoadingRetryDelay: 3000,
@@ -934,11 +934,11 @@
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
       var hls = new Hls({
         lowLatencyMode: false,
-        liveSyncDurationCount: 2,
-        liveMaxLatencyDurationCount: 5,
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 8,
         liveSyncOnStallIncrease: 0,
         maxLiveSyncPlaybackRate: 1.5,
-        backBufferLength: 15,
+        backBufferLength: 30,
         enableWorker: true,
         maxBufferLength: 30,
         maxMaxBufferLength: 60,
@@ -995,11 +995,11 @@
           var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
           var newHls = new Hls({
             lowLatencyMode: false,
-            liveSyncDurationCount: 2,
-            liveMaxLatencyDurationCount: 5,
+            liveSyncDurationCount: 3,
+            liveMaxLatencyDurationCount: 8,
             liveSyncOnStallIncrease: 0,
             maxLiveSyncPlaybackRate: 1.5,
-            backBufferLength: 15,
+            backBufferLength: 30,
             enableWorker: true,
             maxBufferLength: 30,
             maxMaxBufferLength: 60,
