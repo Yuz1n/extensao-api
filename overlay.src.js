@@ -125,7 +125,7 @@
     // PC: técnica 1 — diferença de tamanho da janela (DevTools docked)
     var widthDiff = window.outerWidth - window.innerWidth;
     var heightDiff = window.outerHeight - window.innerHeight;
-    if (widthDiff > 160 || heightDiff > 160) return true;
+    if (widthDiff > 300 || heightDiff > 300) return true;
     // PC: técnica 2 — modo responsivo (viewport mobile mas é PC)
     if (window.innerWidth < 500) return true;
     return false;
@@ -140,7 +140,7 @@
 
   function setupDevToolsGuard() {
     if (_dtGuardInterval) return;
-    var threshold = 160;
+    var threshold = 300;
 
     function isDevToolsOpen() {
       return _dtDetect();
