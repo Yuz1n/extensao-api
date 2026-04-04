@@ -128,10 +128,6 @@
     if (widthDiff > 160 || heightDiff > 160) return true;
     // PC: técnica 2 — modo responsivo (viewport mobile mas é PC)
     if (window.innerWidth < 500) return true;
-    // PC: técnica 3 — debugger timing (pega DevTools em qualquer modo)
-    var before = performance.now();
-    debugger;
-    if (performance.now() - before > 50) return true;
     return false;
   }
 
