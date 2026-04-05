@@ -18,23 +18,20 @@
   if (document.getElementById('overlay-stream-ui') || window._vodyHls) return;
 
   // ════════════════════════════════════════════════════════════════════════════
-  // ANTI-DEVTOOLS
+  // ANTI-DEVTOOLS (detecção por tamanho de janela + bloqueio de atalhos)
   // ════════════════════════════════════════════════════════════════════════════
 
   var _dtGuardInterval = null;
   var _dtBlocked = false;
-  var _dtUnlocked = false; // true se a senha foi aceita — para de checar
+  var _dtUnlocked = false;
   var _dtPassword = '__OVERLAY_DT_PASSWORD__';
 
   // Bloquear atalhos comuns de DevTools
   document.addEventListener('keydown', function (e) {
-    // F12
     if (e.key === 'F12') { e.preventDefault(); e.stopPropagation(); return false; }
-    // Ctrl+Shift+I (Inspect), Ctrl+Shift+J (Console), Ctrl+Shift+C (Element picker)
     if (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'i' || e.key === 'J' || e.key === 'j' || e.key === 'C' || e.key === 'c')) {
       e.preventDefault(); e.stopPropagation(); return false;
     }
-    // Ctrl+U (View Source)
     if (e.ctrlKey && (e.key === 'U' || e.key === 'u')) {
       e.preventDefault(); e.stopPropagation(); return false;
     }
@@ -45,7 +42,7 @@
     e.preventDefault(); return false;
   }, true);
 
-  // Modal de senha — pode ser chamado antes ou depois do stream iniciar
+  // Modal de senha
   function showDtModal() {
     if (document.getElementById('stream-dt-warning')) return;
     var modalEl = document.createElement('div');
@@ -71,7 +68,6 @@
         _dtBlocked = false;
         modalEl.remove();
         if (_dtGuardInterval) { clearInterval(_dtGuardInterval); _dtGuardInterval = null; }
-        // Se stream já estava rodando, restaurar
         if (window._vodyVideo && window._vodyStreamBase && !window._vodyHls) {
           var quality = window._vodyCurrentQuality || '720p';
           var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
@@ -115,36 +111,25 @@
     if (el) el.remove();
   }
 
-  // Detecta DevTools: tamanho da janela OU modo responsivo (emulação mobile com UA desktop)
-  // Detecta se é PC real (navigator.platform não é alterado pelo modo responsivo do DevTools)
+  // Detecta DevTools apenas por tamanho de janela (sem viewport check)
   var _dtIsPC = /Win|Mac|Linux x86/i.test(navigator.platform || navigator.userAgent);
 
   function _dtDetect() {
-    // Mobile não checa DevTools (não existe no celular)
     if (!_dtIsPC) return false;
-    // PC: técnica 1 — diferença de tamanho da janela (DevTools docked)
     var widthDiff = window.outerWidth - window.innerWidth;
     var heightDiff = window.outerHeight - window.innerHeight;
     if (widthDiff > 300 || heightDiff > 300) return true;
-    // PC: técnica 2 — modo responsivo (viewport mobile mas é PC)
-    if (window.innerWidth < 500) return true;
     return false;
   }
 
-  // Check imediato — se DevTools JÁ está aberto, bloquear ANTES de qualquer request
-  var _dtInitialCheck = _dtDetect();
-  if (_dtInitialCheck) {
+  // Check imediato
+  if (_dtDetect()) {
     _dtBlocked = true;
     showDtModal();
   }
 
   function setupDevToolsGuard() {
     if (_dtGuardInterval) return;
-    var threshold = 300;
-
-    function isDevToolsOpen() {
-      return _dtDetect();
-    }
 
     function destroyStream() {
       if (window._vodyHls) {
@@ -160,7 +145,7 @@
 
     _dtGuardInterval = setInterval(function () {
       if (_dtUnlocked) return;
-      var detected = isDevToolsOpen();
+      var detected = _dtDetect();
 
       if (detected && !_dtBlocked) {
         _dtBlocked = true;
@@ -169,7 +154,6 @@
       } else if (!detected && _dtBlocked) {
         _dtBlocked = false;
         removeDtModal();
-        // Restaurar stream se já estava conectado
         if (window._vodyVideo && window._vodyStreamBase && !window._vodyHls) {
           var quality = window._vodyCurrentQuality || '720p';
           var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
@@ -199,6 +183,7 @@
       }
     }, 1500);
   }
+
 
   // ════════════════════════════════════════════════════════════════════════════
   // CONFIG
