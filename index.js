@@ -1220,6 +1220,32 @@ app.post('/api/admin/live/force-end/:id_streamer', requireApiKey, async (req, re
   }
 });
 
+// DELETE /api/admin/live/:live_id — Excluir live e todas as sessões vinculadas
+app.delete('/api/admin/live/:live_id', requireApiKey, async (req, res) => {
+  const liveId = parseInt(req.params.live_id);
+  if (!liveId || isNaN(liveId)) {
+    return res.status(400).json({ message: 'live_id inválido' });
+  }
+  try {
+    // Não permitir excluir live ativa
+    const check = await pool.query('SELECT id, id_streamer, status FROM lives WHERE id = $1', [liveId]);
+    if (check.rows.length === 0) {
+      return res.status(404).json({ message: 'Live não encontrada' });
+    }
+    if (check.rows[0].status === 'active') {
+      return res.status(400).json({ message: 'Não é possível excluir uma live ativa. Encerre primeiro.' });
+    }
+
+    // ON DELETE CASCADE remove live_viewer_sessions automaticamente
+    await pool.query('DELETE FROM lives WHERE id = $1', [liveId]);
+    logger.info(`[ADMIN] Live #${liveId} excluída (streamer: ${check.rows[0].id_streamer})`);
+    return res.json({ deleted: true, live_id: liveId });
+  } catch (e) {
+    logger.error('[ADMIN] Erro ao excluir live:', e.message);
+    return res.status(500).json({ message: 'Erro interno', error: e.message });
+  }
+});
+
 // Iniciar live (chamado internamente)
 async function onLiveStart(idStreamer, streamerName) {
   idStreamer = idStreamer.toLowerCase();
