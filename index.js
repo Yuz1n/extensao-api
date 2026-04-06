@@ -1422,6 +1422,11 @@ app.post('/api/live/end', async (req, res) => {
     // Setar flag de ended (overlay vai detectar e forçar refresh)
     endedStreamers[idStreamer.toLowerCase()] = true;
 
+    // Forçar cache de live status para 'ended' (evita validate criar live fantasma)
+    const mediamtxPath = id_mediamtx.toLowerCase();
+    liveStatusCache[mediamtxPath] = { status: 'ended', timestamp: Date.now() };
+    delete streamUrlCache[mediamtxPath];
+
     // Encerrar a live
     await onLiveEnd(idStreamer);
 
