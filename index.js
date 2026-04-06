@@ -3,6 +3,12 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const fs = require('fs');
 const path = require('path');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'udhyog-jwt-secret-change-me';
+const ADMIN_USER = process.env.ADMIN_USER || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 
 const app = express();
 
@@ -172,6 +178,39 @@ function requireApiKey(req, res, next) {
   }
 
   next();
+}
+
+// ── Middleware de autenticação por JWT ──
+function requireAuth(req, res, next) {
+  const authHeader = req.headers['authorization'] || '';
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return res.status(401).json({ message: 'Token não fornecido' });
+  }
+  try {
+    const decoded = jwt.verify(match[1], JWT_SECRET);
+    req.auth = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ message: 'Token inválido ou expirado' });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  requireAuth(req, res, () => {
+    if (req.auth.role !== 'admin') {
+      return res.status(403).json({ message: 'Acesso restrito a administradores' });
+    }
+    next();
+  });
+}
+
+// Aceita API Key OU JWT (backwards compatible com overlay/VPS)
+function requireApiKeyOrAuth(req, res, next) {
+  if (req.headers['authorization'] && req.headers['authorization'].startsWith('Bearer ')) {
+    return requireAuth(req, res, next);
+  }
+  return requireApiKey(req, res, next);
 }
 
 // ── Logger middleware ──
@@ -476,13 +515,23 @@ async function initDB() {
       ALTER TABLE streamer ADD COLUMN IF NOT EXISTS max_spectators INTEGER NOT NULL DEFAULT 0
     `);
     await pool.query(`
-      ALTER TABLE streamer ADD COLUMN IF NOT EXISTS link_vps VARCHAR(500)
-    `);
-    await pool.query(`
       ALTER TABLE streamer ADD COLUMN IF NOT EXISTS id_mediamtx VARCHAR(255)
     `);
     await pool.query(`
       ALTER TABLE streamer ADD COLUMN IF NOT EXISTS commission REAL DEFAULT 0
+    `);
+    await pool.query(`
+      ALTER TABLE streamer ADD COLUMN IF NOT EXISTS login VARCHAR(255) UNIQUE
+    `);
+    await pool.query(`
+      ALTER TABLE streamer ADD COLUMN IF NOT EXISTS senha VARCHAR(255)
+    `);
+    await pool.query(`
+      ALTER TABLE streamer ADD COLUMN IF NOT EXISTS value_per_view_hour REAL DEFAULT 0
+    `);
+    // Remover link_vps se existir (deprecated)
+    await pool.query(`
+      ALTER TABLE streamer DROP COLUMN IF EXISTS link_vps
     `);
 
     console.log('[DB] Tabela streamer pronta');
@@ -556,6 +605,200 @@ async function initDB() {
 // ══════════════════════════════════════════════
 // ── ROTAS ──
 // ══════════════════════════════════════════════
+
+// ── POST /api/auth/login ──
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { login, senha } = req.body;
+    if (!login || !senha) {
+      return res.status(400).json({ message: 'Login e senha são obrigatórios' });
+    }
+
+    // Check admin credentials (env vars)
+    if (ADMIN_USER && login === ADMIN_USER && senha === ADMIN_PASSWORD) {
+      const token = jwt.sign({ role: 'admin', login }, JWT_SECRET, { expiresIn: '7d' });
+      return res.json({ token, role: 'admin', user: 'Admin', id_streamer: null });
+    }
+
+    // Check streamer credentials (DB)
+    const result = await pool.query(
+      'SELECT id, "user", id_streamer, login, senha FROM streamer WHERE login = $1',
+      [login]
+    );
+    if (result.rows.length === 0) {
+      return res.status(401).json({ message: 'Login ou senha incorretos' });
+    }
+
+    const streamer = result.rows[0];
+    if (!streamer.senha) {
+      return res.status(401).json({ message: 'Senha não configurada para este streamer' });
+    }
+
+    const valid = await bcrypt.compare(senha, streamer.senha);
+    if (!valid) {
+      return res.status(401).json({ message: 'Login ou senha incorretos' });
+    }
+
+    const token = jwt.sign(
+      { role: 'streamer', id_streamer: streamer.id_streamer, login: streamer.login },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    return res.json({ token, role: 'streamer', user: streamer.user, id_streamer: streamer.id_streamer });
+  } catch (e) {
+    console.error('[AUTH] Erro no login:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// ── Streamer endpoints (área do streamer autenticado) ──
+
+// GET /api/streamer/me/lives — lives do streamer autenticado
+app.get('/api/streamer/me/lives', requireAuth, async (req, res) => {
+  try {
+    if (req.auth.role !== 'streamer' || !req.auth.id_streamer) {
+      return res.status(403).json({ message: 'Apenas streamers podem acessar' });
+    }
+    const limit = parseInt(req.query.limit) || 50;
+    const result = await pool.query(
+      'SELECT * FROM lives WHERE LOWER(id_streamer) = LOWER($1) ORDER BY started_at DESC LIMIT $2',
+      [req.auth.id_streamer, limit]
+    );
+    return res.json({ lives: result.rows });
+  } catch (e) {
+    console.error('[STREAMER] Erro lives:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// GET /api/streamer/me/lives/:live_id — detalhe de live sem dados sensíveis
+app.get('/api/streamer/me/lives/:live_id', requireAuth, async (req, res) => {
+  try {
+    if (req.auth.role !== 'streamer' || !req.auth.id_streamer) {
+      return res.status(403).json({ message: 'Apenas streamers podem acessar' });
+    }
+    const { live_id } = req.params;
+    const liveResult = await pool.query(
+      'SELECT * FROM lives WHERE id = $1 AND LOWER(id_streamer) = LOWER($2)',
+      [live_id, req.auth.id_streamer]
+    );
+    if (liveResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Live não encontrada' });
+    }
+
+    const viewersResult = await pool.query(
+      `SELECT kick_username, platform, is_mobile, total_seconds, segments_loaded, estimated_mb,
+              quality_history, joined_at, last_seen
+       FROM live_viewer_sessions WHERE live_id = $1 ORDER BY joined_at ASC`,
+      [live_id]
+    );
+
+    return res.json({
+      live: liveResult.rows[0],
+      viewers: viewersResult.rows,
+    });
+  } catch (e) {
+    console.error('[STREAMER] Erro live detail:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// GET /api/streamer/me/payment — cálculo de pagamento do streamer
+app.get('/api/streamer/me/payment', requireAuth, async (req, res) => {
+  try {
+    if (req.auth.role !== 'streamer' || !req.auth.id_streamer) {
+      return res.status(403).json({ message: 'Apenas streamers podem acessar' });
+    }
+
+    const { start_date, end_date, platform_filter } = req.query;
+    if (!start_date || !end_date) {
+      return res.status(400).json({ message: 'start_date e end_date obrigatórios' });
+    }
+
+    const pf = platform_filter || 'all';
+
+    // Buscar value_per_view_hour e commission do streamer
+    const streamerResult = await pool.query(
+      'SELECT value_per_view_hour, commission FROM streamer WHERE LOWER(id_streamer) = LOWER($1)',
+      [req.auth.id_streamer]
+    );
+    if (streamerResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Streamer não encontrado' });
+    }
+    const vpvh = streamerResult.rows[0].value_per_view_hour || 0;
+    const commissionPct = streamerResult.rows[0].commission || 0;
+
+    // Buscar lives no período
+    const livesResult = await pool.query(
+      `SELECT l.id, l.started_at, l.ended_at, l.duration_seconds,
+              l.peak_viewers, l.total_unique_viewers, l.avg_viewers,
+              l.avg_viewers_mobile, l.avg_viewers_desktop, l.status,
+              COALESCE(SUM(CASE WHEN vs.is_mobile = true THEN vs.total_seconds ELSE 0 END), 0)::INTEGER as mobile_seconds,
+              COALESCE(SUM(CASE WHEN vs.is_mobile = false THEN vs.total_seconds ELSE 0 END), 0)::INTEGER as desktop_seconds,
+              COALESCE(SUM(vs.total_seconds), 0)::INTEGER as all_seconds
+       FROM lives l
+       LEFT JOIN live_viewer_sessions vs ON vs.live_id = l.id
+       WHERE LOWER(l.id_streamer) = LOWER($1) AND l.started_at >= $2 AND l.started_at <= $3
+       GROUP BY l.id
+       ORDER BY l.started_at ASC`,
+      [req.auth.id_streamer, start_date, end_date + 'T23:59:59']
+    );
+
+    let totalRevenue = 0;
+    let totalHours = 0;
+    const lives = [];
+
+    for (const live of livesResult.rows) {
+      const durationSeconds = live.duration_seconds || 0;
+      const durationHours = durationSeconds / 3600;
+      const avgAll = durationSeconds > 0 ? Math.ceil((live.all_seconds / durationSeconds) * 10) / 10 : (live.avg_viewers || 0);
+      const avgMobile = durationSeconds > 0 ? Math.ceil((live.mobile_seconds / durationSeconds) * 10) / 10 : 0;
+      const avgDesktop = durationSeconds > 0 ? Math.ceil((live.desktop_seconds / durationSeconds) * 10) / 10 : 0;
+
+      let avgForRevenue;
+      if (pf === 'mobile') avgForRevenue = avgMobile;
+      else if (pf === 'desktop') avgForRevenue = avgDesktop;
+      else avgForRevenue = avgAll;
+
+      const revenue = avgForRevenue * durationHours * vpvh;
+
+      lives.push({
+        live_id: live.id,
+        started_at: live.started_at,
+        ended_at: live.ended_at,
+        duration_seconds: durationSeconds,
+        duration_hours: Math.round(durationHours * 100) / 100,
+        avg_viewers: Math.ceil(avgAll),
+        avg_viewers_mobile: Math.ceil(avgMobile),
+        avg_viewers_desktop: Math.ceil(avgDesktop),
+        peak_viewers: live.peak_viewers,
+        total_unique_viewers: live.total_unique_viewers,
+        revenue: Math.round(revenue * 100) / 100,
+        status: live.status,
+      });
+
+      totalHours += durationHours;
+      totalRevenue += revenue;
+    }
+
+    const totalCommission = totalRevenue * (commissionPct / 100);
+
+    return res.json({
+      value_per_view_hour: vpvh,
+      commission_pct: commissionPct,
+      period: { start: start_date, end: end_date },
+      platform_filter: pf,
+      total_hours: Math.round(totalHours * 100) / 100,
+      total_revenue: Math.round(totalRevenue * 100) / 100,
+      total_commission: Math.round(totalCommission * 100) / 100,
+      your_earnings: Math.round(totalCommission * 100) / 100,
+      lives,
+    });
+  } catch (e) {
+    console.error('[STREAMER] Erro payment:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
 
 // ── GET /health ──
 app.get('/health', (req, res) => {
@@ -740,7 +983,7 @@ let streamerCacheLoaded = false;
 
 async function loadStreamerCache() {
   const result = await pool.query(
-    'SELECT id, "user", link, id_streamer, max_spectators, link_vps, id_mediamtx FROM streamer'
+    'SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx FROM streamer'
   );
   // Limpar cache antes de recarregar
   for (const key in streamerCache) delete streamerCache[key];
@@ -968,10 +1211,10 @@ app.get('/api/viewer/count/:id_streamer', requireApiKey, async (req, res) => {
 });
 
 // ── GET /api/streamers (admin) ──
-app.get('/api/streamers', requireApiKey, async (req, res) => {
+app.get('/api/streamers', requireApiKeyOrAuth, async (req, res) => {
   try {
     console.log('[LIST] Listando todos os streamers');
-    const result = await pool.query('SELECT id, "user", link, id_streamer, max_spectators, link_vps, id_mediamtx, commission FROM streamer ORDER BY id');
+    const result = await pool.query('SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, commission, login, value_per_view_hour FROM streamer ORDER BY id');
 
     // Adicionar contagem de viewers ativos a cada streamer
     const streamers = result.rows.map(s => ({
@@ -988,18 +1231,20 @@ app.get('/api/streamers', requireApiKey, async (req, res) => {
 });
 
 // ── POST /api/streamer (admin) ──
-app.post('/api/streamer', requireApiKey, async (req, res) => {
+app.post('/api/streamer', requireApiKeyOrAuth, async (req, res) => {
   try {
-    const { user, link, id_streamer, max_spectators, link_vps, id_mediamtx } = req.body;
-    console.log(`[CREATE] Cadastrando streamer: user="${user}", id_streamer="${id_streamer}", max=${max_spectators || 0}, mediamtx="${id_mediamtx || ''}"`);
+    const { user, link, id_streamer, max_spectators, id_mediamtx, login, senha, value_per_view_hour } = req.body;
+    console.log(`[CREATE] Cadastrando streamer: user="${user}", id_streamer="${id_streamer}", max=${max_spectators || 0}, mediamtx="${id_mediamtx || ''}", login="${login || ''}"`);
 
     if (!user || !id_streamer) {
       return res.status(400).json({ message: 'Campos "user" e "id_streamer" sao obrigatorios' });
     }
 
+    const hashedSenha = senha ? await bcrypt.hash(senha, 10) : null;
+
     const result = await pool.query(
-      'INSERT INTO streamer ("user", link, id_streamer, max_spectators, link_vps, id_mediamtx) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [user, link || null, id_streamer, max_spectators || 0, link_vps || null, id_mediamtx || null]
+      'INSERT INTO streamer ("user", link, id_streamer, max_spectators, id_mediamtx, login, senha, value_per_view_hour) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+      [user, link || null, id_streamer, max_spectators || 0, id_mediamtx || null, login || null, hashedSenha, value_per_view_hour || 0]
     );
 
     console.log(`[CREATE] Streamer cadastrado com sucesso: ID ${result.rows[0].id}`);
@@ -1016,10 +1261,10 @@ app.post('/api/streamer', requireApiKey, async (req, res) => {
 });
 
 // ── PUT /api/streamer/:id_streamer (admin — atualizar streamer) ──
-app.put('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
+app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { id_streamer } = req.params;
-    const { user, link, max_spectators, link_vps, id_mediamtx } = req.body;
+    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour } = req.body;
 
     console.log(`[UPDATE] Atualizando streamer: "${id_streamer}" body:`, JSON.stringify(req.body));
 
@@ -1033,8 +1278,10 @@ app.put('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
     if (user !== undefined)            { fields.push(`"user" = $${idx++}`);          values.push(user); }
     if (link !== undefined)            { fields.push(`link = $${idx++}`);            values.push(link); }
     if (max_spectators !== undefined)  { fields.push(`max_spectators = $${idx++}`);  values.push(max_spectators); }
-    if (link_vps !== undefined)        { fields.push(`link_vps = $${idx++}`);        values.push(link_vps); }
     if (id_mediamtx !== undefined)     { fields.push(`id_mediamtx = $${idx++}`);     values.push(id_mediamtx); }
+    if (login !== undefined)           { fields.push(`login = $${idx++}`);           values.push(login); }
+    if (senha !== undefined && senha)  { fields.push(`senha = $${idx++}`);           values.push(await bcrypt.hash(senha, 10)); }
+    if (value_per_view_hour !== undefined) { fields.push(`value_per_view_hour = $${idx++}`); values.push(value_per_view_hour); }
 
     if (fields.length === 0) {
       return res.status(400).json({ message: 'Nenhum campo para atualizar' });
@@ -1060,7 +1307,7 @@ app.put('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
 });
 
 // ── DELETE /api/streamer/:id_streamer (admin) ──
-app.delete('/api/streamer/:id_streamer', requireApiKey, async (req, res) => {
+app.delete('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { id_streamer } = req.params;
     console.log(`[DELETE] Removendo streamer: "${id_streamer}"`);
@@ -1302,13 +1549,13 @@ async function onLiveEnd(idStreamer) {
     const totalDesktopSeconds = totalWatchSeconds - totalMobileSeconds;
 
     const avgViewers = durationSeconds > 0
-      ? Math.round((totalWatchSeconds / durationSeconds) * 10) / 10
+      ? Math.ceil((totalWatchSeconds / durationSeconds) * 10) / 10
       : 0;
     const avgViewersMobile = durationSeconds > 0
-      ? Math.round((totalMobileSeconds / durationSeconds) * 10) / 10
+      ? Math.ceil((totalMobileSeconds / durationSeconds) * 10) / 10
       : 0;
     const avgViewersDesktop = durationSeconds > 0
-      ? Math.round((totalDesktopSeconds / durationSeconds) * 10) / 10
+      ? Math.ceil((totalDesktopSeconds / durationSeconds) * 10) / 10
       : 0;
 
     // Contar viewers únicos mobile vs desktop (por IP)
@@ -1626,7 +1873,7 @@ async function restoreActiveLives() {
 }
 
 // ── POST /api/revenue — Cálculo de receita e comissão ──
-app.post('/api/revenue', requireApiKey, async (req, res) => {
+app.post('/api/revenue', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { value_per_view_hour, start_date, end_date, platform_filter } = req.body;
     if (!value_per_view_hour || !start_date || !end_date) {
@@ -1682,9 +1929,9 @@ app.post('/api/revenue', requireApiKey, async (req, res) => {
       const durationHours = durationSeconds / 3600;
 
       // Calcular avg_viewers por plataforma a partir dos seconds (funciona pra dados historicos)
-      const avgAll = durationSeconds > 0 ? Math.round((live.all_seconds / durationSeconds) * 10) / 10 : (live.avg_viewers || 0);
-      const avgMobile = durationSeconds > 0 ? Math.round((live.mobile_seconds / durationSeconds) * 10) / 10 : 0;
-      const avgDesktop = durationSeconds > 0 ? Math.round((live.desktop_seconds / durationSeconds) * 10) / 10 : 0;
+      const avgAll = durationSeconds > 0 ? Math.ceil((live.all_seconds / durationSeconds) * 10) / 10 : (live.avg_viewers || 0);
+      const avgMobile = durationSeconds > 0 ? Math.ceil((live.mobile_seconds / durationSeconds) * 10) / 10 : 0;
+      const avgDesktop = durationSeconds > 0 ? Math.ceil((live.desktop_seconds / durationSeconds) * 10) / 10 : 0;
 
       // Escolher avg baseado no filtro de plataforma
       let avgForRevenue;
@@ -1701,9 +1948,9 @@ app.post('/api/revenue', requireApiKey, async (req, res) => {
         ended_at: live.ended_at,
         duration_hours: Math.round(durationHours * 100) / 100,
         duration_formatted: formatTime(durationSeconds),
-        avg_viewers: Math.round(avgAll),
-        avg_viewers_mobile: Math.round(avgMobile),
-        avg_viewers_desktop: Math.round(avgDesktop),
+        avg_viewers: Math.ceil(avgAll),
+        avg_viewers_mobile: Math.ceil(avgMobile),
+        avg_viewers_desktop: Math.ceil(avgDesktop),
         peak_viewers: live.peak_viewers,
         total_unique_viewers: live.total_unique_viewers,
         revenue: Math.round(revenue * 100) / 100,
@@ -1744,7 +1991,7 @@ app.post('/api/revenue', requireApiKey, async (req, res) => {
 });
 
 // ── PUT /api/streamer/:id_streamer/commission — Atualizar comissão ──
-app.put('/api/streamer/:id_streamer/commission', requireApiKey, async (req, res) => {
+app.put('/api/streamer/:id_streamer/commission', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { id_streamer } = req.params;
     const { commission } = req.body;
