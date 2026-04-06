@@ -6,7 +6,7 @@ const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'udhyog-jwt-secret-change-me';
+const JWT_SECRET = process.env.JWT_SECRET || '';
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 
@@ -687,7 +687,7 @@ app.get('/api/streamer/me/lives/:live_id', requireAuth, async (req, res) => {
     }
 
     const viewersResult = await pool.query(
-      `SELECT kick_username, platform, is_mobile, total_seconds, segments_loaded, estimated_mb,
+      `SELECT kick_username, platform, browser, is_mobile, total_seconds, segments_loaded, estimated_mb,
               quality_history, joined_at, last_seen
        FROM live_viewer_sessions WHERE live_id = $1 ORDER BY joined_at ASC`,
       [live_id]
@@ -760,7 +760,8 @@ app.get('/api/streamer/me/payment', requireAuth, async (req, res) => {
       else if (pf === 'desktop') avgForRevenue = avgDesktop;
       else avgForRevenue = avgAll;
 
-      const revenue = avgForRevenue * durationHours * vpvh;
+      const vpvs = vpvh / 3600; // value per view/second
+      const revenue = avgForRevenue * durationSeconds * vpvs;
 
       lives.push({
         live_id: live.id,
@@ -1876,15 +1877,16 @@ async function restoreActiveLives() {
 app.post('/api/revenue', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { value_per_view_hour, start_date, end_date, platform_filter } = req.body;
-    if (!value_per_view_hour || !start_date || !end_date) {
-      return res.status(400).json({ message: 'Campos obrigatórios: value_per_view_hour, start_date, end_date' });
+    if (!start_date || !end_date) {
+      return res.status(400).json({ message: 'Campos obrigatórios: start_date, end_date' });
     }
 
     const pf = platform_filter || 'all'; // 'all' | 'mobile' | 'desktop'
+    const globalVpvh = value_per_view_hour ? parseFloat(value_per_view_hour) : null;
 
-    // Buscar todos os streamers com comissão
+    // Buscar todos os streamers com comissão e value_per_view_hour
     const streamersResult = await pool.query(
-      'SELECT id, "user", id_streamer, commission FROM streamer ORDER BY id'
+      'SELECT id, "user", id_streamer, commission, value_per_view_hour FROM streamer ORDER BY id'
     );
 
     // Buscar lives no período com watch-seconds por plataforma (via JOIN)
@@ -1903,17 +1905,18 @@ app.post('/api/revenue', requireApiKeyOrAuth, async (req, res) => {
       [start_date, end_date + 'T23:59:59']
     );
 
-    const vpvh = parseFloat(value_per_view_hour);
     let totalRevenue = 0;
     let totalCommission = 0;
 
-    // Agrupar lives por streamer
+    // Agrupar lives por streamer (usa value_per_view_hour individual ou global)
     const streamerData = {};
     for (const s of streamersResult.rows) {
+      const vpvh = globalVpvh ?? s.value_per_view_hour ?? 0;
       streamerData[s.id_streamer.toLowerCase()] = {
         user: s.user,
         id_streamer: s.id_streamer,
         commission_pct: s.commission || 0,
+        value_per_view_hour: vpvh,
         lives: [],
         total_hours: 0,
         total_revenue: 0,
@@ -1939,7 +1942,9 @@ app.post('/api/revenue', requireApiKeyOrAuth, async (req, res) => {
       else if (pf === 'desktop') avgForRevenue = avgDesktop;
       else avgForRevenue = avgAll;
 
-      const revenue = avgForRevenue * durationHours * vpvh;
+      const streamerVpvh = streamerData[key].value_per_view_hour;
+      const streamerVpvs = streamerVpvh / 3600; // value per view/second
+      const revenue = avgForRevenue * durationSeconds * streamerVpvs;
 
       streamerData[key].lives.push({
         live_id: live.id,
@@ -1977,7 +1982,7 @@ app.post('/api/revenue', requireApiKeyOrAuth, async (req, res) => {
 
     return res.json({
       period: { start: start_date, end: end_date },
-      value_per_view_hour: vpvh,
+      value_per_view_hour: globalVpvh ?? 'individual',
       platform_filter: pf,
       total_revenue: Math.round(totalRevenue * 100) / 100,
       total_commission: Math.round(totalCommission * 100) / 100,
