@@ -1369,13 +1369,8 @@ app.post('/api/live/start', async (req, res) => {
     const streamer = result.rows[0];
     const idStreamer = streamer.id_streamer.toLowerCase();
 
-    // Proteção: se já tem live ativa, ignorar
-    if (activeLives[idStreamer]) {
-      logger.info(`[LIVE] Start ignorado: ${idStreamer} já tem live ativa #${activeLives[idStreamer].liveId}`);
-      return res.json({ started: false, reason: 'already_active', live_id: activeLives[idStreamer].liveId });
-    }
-
-    // Limpar flag de ended (todas as variações de case)
+    // Limpar flag de ended SEMPRE (antes do early return) — evita stuck stream_ended:true
+    // quando o start é chamado durante o cooldown de 5min do end anterior
     delete endedStreamers[idStreamer];
     delete endedStreamers[idStreamer.toLowerCase()];
 
@@ -1383,6 +1378,12 @@ app.post('/api/live/start', async (req, res) => {
     const mediamtxPath = id_mediamtx.toLowerCase();
     delete streamUrlCache[mediamtxPath];
     liveStatusCache[mediamtxPath] = { status: 'active', timestamp: Date.now() };
+
+    // Proteção: se já tem live ativa, ignorar (mas o flag já foi limpo acima)
+    if (activeLives[idStreamer]) {
+      logger.info(`[LIVE] Start ignorado: ${idStreamer} já tem live ativa #${activeLives[idStreamer].liveId}`);
+      return res.json({ started: false, reason: 'already_active', live_id: activeLives[idStreamer].liveId });
+    }
 
     await onLiveStart(idStreamer, streamer.user);
     return res.json({ started: true, live_id: activeLives[idStreamer]?.liveId });
