@@ -1030,19 +1030,17 @@ async function processValidate(id_streamer, req, res) {
       stream_url = await getCachedStreamUrl(mediamtxPath);
     }
 
-    // Detectar início/fim de live via KV (live:{mediamtxPath})
+    // Detectar início de live via KV (live:{mediamtxPath})
+    // NOTA: o end de live é tratado APENAS via /api/live/end (uploader autoritativo).
+    // A lógica de end automático baseado em leitura do KV foi removida porque o
+    // Cloudflare KV tem eventual consistency: PUTs podem demorar até ~60s para
+    // propagar globalmente, e leituras stale retornando "ended" causavam encerramento
+    // prematuro de lives ativas (ver bug brkk live 248 → 249 em 2026-04-08).
     const liveStatus = await getCachedLiveStatus(mediamtxPath);
 
     // Se status = "active" e não tem live ativa → iniciar live
     if (liveStatus === 'active' && stream_url && !activeLives[id_streamer]) {
       await onLiveStart(id_streamer, streamer.user);
-    }
-
-    // Se status = "ended" e tem live ativa → encerrar live
-    if (liveStatus === 'ended' && activeLives[id_streamer]) {
-      endedStreamers[id_streamer.toLowerCase()] = true;
-      await onLiveEnd(id_streamer);
-      setTimeout(() => { delete endedStreamers[id_streamer.toLowerCase()]; }, 300000);
     }
 
     updateLivePeak(id_streamer);
