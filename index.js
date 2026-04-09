@@ -607,6 +607,8 @@ async function initDB() {
 
     // Coluna de bloqueio no streamer
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS billing_type VARCHAR(20) DEFAULT 'view_hours'`);
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS fixed_weekly_value REAL DEFAULT 0`);
 
     // Índices para queries rápidas
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_lives_streamer ON lives(id_streamer)`);
@@ -873,9 +875,6 @@ app.put('/api/streamer/me/password', requireAuth, async (req, res) => {
 // Gera cobrança pra um streamer específico num período
 async function generateInvoiceForStreamer(streamer, periodStart, periodEnd) {
   try {
-    const vpvh = streamer.value_per_view_hour || 0;
-    if (vpvh <= 0) return false;
-
     // Checar duplicata pra esse streamer+período
     const dup = await pool.query(
       'SELECT id FROM invoices WHERE LOWER(id_streamer) = LOWER($1) AND period_start = $2 AND period_end = $3 LIMIT 1',
@@ -883,38 +882,62 @@ async function generateInvoiceForStreamer(streamer, periodStart, periodEnd) {
     );
     if (dup.rows.length > 0) return false;
 
-    const livesResult = await pool.query(
-      `SELECT l.id, l.duration_seconds,
-              COALESCE(SUM(vs.total_seconds), 0)::INTEGER as all_seconds
-       FROM lives l
-       LEFT JOIN live_viewer_sessions vs ON vs.live_id = l.id
-       WHERE LOWER(l.id_streamer) = LOWER($1)
-         AND l.started_at >= $2 AND l.started_at <= $3
-       GROUP BY l.id`,
-      [streamer.id_streamer, periodStart, periodEnd + 'T23:59:59']
-    );
-
+    const billingType = streamer.billing_type || 'view_hours';
     let totalRevenue = 0;
     let totalHours = 0;
-    for (const live of livesResult.rows) {
-      const dur = live.duration_seconds || 0;
-      if (dur <= 0) continue;
-      const avgViewers = Math.ceil((live.all_seconds / dur) * 10) / 10;
-      totalRevenue += avgViewers * dur * (vpvh / 3600);
-      totalHours += dur / 3600;
-    }
+    let amountDue = 0;
 
-    totalRevenue = Math.round(totalRevenue * 100) / 100;
-    totalHours = Math.round(totalHours * 100) / 100;
-    const commissionPct = streamer.commission || 0;
-    const amountDue = Math.round(totalRevenue * (commissionPct / 100) * 100) / 100;
+    if (billingType === 'fixed') {
+      // Valor fixo semanal — não precisa calcular view hours
+      amountDue = streamer.fixed_weekly_value || 0;
+      if (amountDue <= 0) return false;
+
+      // Buscar horas apenas pra informação (não afeta o valor)
+      const livesResult = await pool.query(
+        `SELECT COALESCE(SUM(l.duration_seconds), 0)::INTEGER as total_seconds
+         FROM lives l
+         WHERE LOWER(l.id_streamer) = LOWER($1)
+           AND l.started_at >= $2 AND l.started_at <= $3`,
+        [streamer.id_streamer, periodStart, periodEnd + 'T23:59:59']
+      );
+      totalHours = Math.round((livesResult.rows[0]?.total_seconds || 0) / 3600 * 100) / 100;
+      totalRevenue = amountDue;
+    } else {
+      // Cálculo por view hours (padrão)
+      const vpvh = streamer.value_per_view_hour || 0;
+      if (vpvh <= 0) return false;
+
+      const livesResult = await pool.query(
+        `SELECT l.id, l.duration_seconds,
+                COALESCE(SUM(vs.total_seconds), 0)::INTEGER as all_seconds
+         FROM lives l
+         LEFT JOIN live_viewer_sessions vs ON vs.live_id = l.id
+         WHERE LOWER(l.id_streamer) = LOWER($1)
+           AND l.started_at >= $2 AND l.started_at <= $3
+         GROUP BY l.id`,
+        [streamer.id_streamer, periodStart, periodEnd + 'T23:59:59']
+      );
+
+      for (const live of livesResult.rows) {
+        const dur = live.duration_seconds || 0;
+        if (dur <= 0) continue;
+        const avgViewers = Math.ceil((live.all_seconds / dur) * 10) / 10;
+        totalRevenue += avgViewers * dur * (vpvh / 3600);
+        totalHours += dur / 3600;
+      }
+
+      totalRevenue = Math.round(totalRevenue * 100) / 100;
+      totalHours = Math.round(totalHours * 100) / 100;
+      const commissionPct = streamer.commission || 0;
+      amountDue = Math.round(totalRevenue * (commissionPct / 100) * 100) / 100;
+    }
 
     await pool.query(
       `INSERT INTO invoices (id_streamer, period_start, period_end, total_hours, total_revenue, amount_due, status)
        VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
       [streamer.id_streamer.toLowerCase(), periodStart, periodEnd, totalHours, totalRevenue, amountDue]
     );
-    console.log(`[BILLING] Cobrança gerada: ${streamer.user} (${streamer.id_streamer}) | ${periodStart}→${periodEnd} | Revenue: $${totalRevenue} | Due: $${amountDue}`);
+    console.log(`[BILLING] Cobrança gerada (${billingType}): ${streamer.user} | ${periodStart}→${periodEnd} | Due: $${amountDue}`);
     return true;
   } catch (e) {
     console.error(`[BILLING] Erro gerando cobrança para ${streamer.id_streamer}:`, e.message);
@@ -954,7 +977,7 @@ async function generateWeeklyInvoices() {
     }
 
     // Buscar todos os streamers e gerar cobrança pra cada um
-    const streamers = await pool.query('SELECT id, "user", id_streamer, value_per_view_hour, commission FROM streamer');
+    const streamers = await pool.query('SELECT id, "user", id_streamer, value_per_view_hour, commission, billing_type, fixed_weekly_value FROM streamer');
     let generated = 0;
     for (const s of streamers.rows) {
       const ok = await generateInvoiceForStreamer(s, periodStart, periodEnd);
@@ -1008,7 +1031,7 @@ app.post('/api/admin/invoices/generate', requireApiKey, async (req, res) => {
       return res.status(400).json({ message: 'Campos obrigatórios: id_streamer, start_date, end_date' });
     }
     const streamer = await pool.query(
-      'SELECT id, "user", id_streamer, value_per_view_hour, commission FROM streamer WHERE LOWER(id_streamer) = LOWER($1)',
+      'SELECT id, "user", id_streamer, value_per_view_hour, commission, billing_type, fixed_weekly_value FROM streamer WHERE LOWER(id_streamer) = LOWER($1)',
       [id_streamer]
     );
     if (streamer.rows.length === 0) return res.status(404).json({ message: 'Streamer não encontrado' });
@@ -1576,7 +1599,7 @@ app.post('/api/streamer', requireApiKeyOrAuth, async (req, res) => {
 app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { id_streamer } = req.params;
-    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour } = req.body;
+    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour, billing_type, fixed_weekly_value } = req.body;
 
     console.log(`[UPDATE] Atualizando streamer: "${id_streamer}" body:`, JSON.stringify(req.body));
 
@@ -1593,7 +1616,9 @@ app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
     if (id_mediamtx !== undefined)     { fields.push(`id_mediamtx = $${idx++}`);     values.push(id_mediamtx); }
     if (login !== undefined)           { fields.push(`login = $${idx++}`);           values.push(login); }
     if (senha !== undefined && senha)  { fields.push(`senha = $${idx++}`);           values.push(await bcrypt.hash(senha, 10)); }
-    if (value_per_view_hour !== undefined) { fields.push(`value_per_view_hour = $${idx++}`); values.push(value_per_view_hour); }
+    if (value_per_view_hour !== undefined)  { fields.push(`value_per_view_hour = $${idx++}`);  values.push(value_per_view_hour); }
+    if (billing_type !== undefined)         { fields.push(`billing_type = $${idx++}`);         values.push(billing_type); }
+    if (fixed_weekly_value !== undefined)   { fields.push(`fixed_weekly_value = $${idx++}`);   values.push(fixed_weekly_value); }
 
     if (fields.length === 0) {
       return res.status(400).json({ message: 'Nenhum campo para atualizar' });
@@ -2201,9 +2226,9 @@ app.post('/api/revenue', requireApiKeyOrAuth, async (req, res) => {
     const pf = platform_filter || 'all'; // 'all' | 'mobile' | 'desktop'
     const globalVpvh = value_per_view_hour ? parseFloat(value_per_view_hour) : null;
 
-    // Buscar todos os streamers com comissão e value_per_view_hour
+    // Buscar todos os streamers com comissão, value_per_view_hour e billing_type
     const streamersResult = await pool.query(
-      'SELECT id, "user", id_streamer, commission, value_per_view_hour FROM streamer ORDER BY id'
+      'SELECT id, "user", id_streamer, commission, value_per_view_hour, billing_type, fixed_weekly_value FROM streamer ORDER BY id'
     );
 
     // Buscar lives no período com watch-seconds por plataforma (via JOIN)
@@ -2234,6 +2259,8 @@ app.post('/api/revenue', requireApiKeyOrAuth, async (req, res) => {
         id_streamer: s.id_streamer,
         commission_pct: s.commission || 0,
         value_per_view_hour: vpvh,
+        billing_type: s.billing_type || 'view_hours',
+        fixed_weekly_value: s.fixed_weekly_value || 0,
         lives: [],
         total_hours: 0,
         total_revenue: 0,
@@ -2283,16 +2310,22 @@ app.post('/api/revenue', requireApiKeyOrAuth, async (req, res) => {
       streamerData[key].total_revenue += revenue;
     }
 
-    // Calcular comissão por streamer
+    // Calcular comissão por streamer (diferencia view_hours vs fixed)
     const streamers = [];
     for (const key of Object.keys(streamerData)) {
       const s = streamerData[key];
       s.total_hours = Math.round(s.total_hours * 100) / 100;
       s.total_revenue = Math.round(s.total_revenue * 100) / 100;
-      s.total_commission = Math.round(s.total_revenue * (s.commission_pct / 100) * 100) / 100;
+      if (s.billing_type === 'fixed') {
+        // Fixo: comissão = valor fixo semanal (não depende de view hours)
+        s.total_commission = s.fixed_weekly_value;
+      } else {
+        // View hours: comissão = % sobre receita
+        s.total_commission = Math.round(s.total_revenue * (s.commission_pct / 100) * 100) / 100;
+      }
       totalRevenue += s.total_revenue;
       totalCommission += s.total_commission;
-      if (s.lives.length > 0 || s.commission_pct > 0) {
+      if (s.lives.length > 0 || s.commission_pct > 0 || s.billing_type === 'fixed') {
         streamers.push(s);
       }
     }
