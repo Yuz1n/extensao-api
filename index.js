@@ -801,6 +801,47 @@ app.get('/api/streamer/me/payment', requireAuth, async (req, res) => {
   }
 });
 
+// ── PUT /api/streamer/me/password — Streamer troca a própria senha ──
+app.put('/api/streamer/me/password', requireAuth, async (req, res) => {
+  try {
+    if (req.auth.role !== 'streamer') {
+      return res.status(403).json({ message: 'Apenas streamers podem trocar a senha por aqui' });
+    }
+
+    const { senha_atual, nova_senha } = req.body;
+    if (!senha_atual || !nova_senha) {
+      return res.status(400).json({ message: 'Campos "senha_atual" e "nova_senha" são obrigatórios' });
+    }
+    if (nova_senha.length < 6) {
+      return res.status(400).json({ message: 'A nova senha deve ter no mínimo 6 caracteres' });
+    }
+
+    const result = await pool.query(
+      'SELECT senha FROM streamer WHERE LOWER(id_streamer) = LOWER($1)',
+      [req.auth.id_streamer]
+    );
+    if (result.rows.length === 0 || !result.rows[0].senha) {
+      return res.status(404).json({ message: 'Streamer não encontrado ou sem senha configurada' });
+    }
+
+    const valid = await bcrypt.compare(senha_atual, result.rows[0].senha);
+    if (!valid) {
+      return res.status(401).json({ message: 'Senha atual incorreta' });
+    }
+
+    const hashed = await bcrypt.hash(nova_senha, 10);
+    await pool.query(
+      'UPDATE streamer SET senha = $1 WHERE LOWER(id_streamer) = LOWER($2)',
+      [hashed, req.auth.id_streamer]
+    );
+
+    return res.json({ updated: true });
+  } catch (e) {
+    console.error('[STREAMER] Erro ao trocar senha:', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
 // ── GET /health ──
 app.get('/health', (req, res) => {
   const stats = {};
