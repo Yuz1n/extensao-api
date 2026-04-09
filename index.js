@@ -587,13 +587,36 @@ async function initDB() {
       )
     `);
 
+    // Tabela de cobranças semanais
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS invoices (
+        id SERIAL PRIMARY KEY,
+        id_streamer VARCHAR(255) NOT NULL,
+        period_start DATE NOT NULL,
+        period_end DATE NOT NULL,
+        total_hours REAL DEFAULT 0,
+        total_revenue REAL DEFAULT 0,
+        amount_due REAL DEFAULT 0,
+        status VARCHAR(20) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT NOW(),
+        paid_at TIMESTAMP,
+        confirmed_at TIMESTAMP,
+        confirmed_by VARCHAR(255)
+      )
+    `);
+
+    // Coluna de bloqueio no streamer
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT false`);
+
     // Índices para queries rápidas
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_lives_streamer ON lives(id_streamer)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_lives_status ON lives(status)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_live_viewer_sessions_live ON live_viewer_sessions(live_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_live_viewer_sessions_ip ON live_viewer_sessions(ip)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_streamer ON invoices(id_streamer)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)`);
 
-    console.log('[DB] Tabelas streamer, lives, live_viewer_sessions prontas');
+    console.log('[DB] Tabelas streamer, lives, live_viewer_sessions, invoices prontas');
 
     const count = await pool.query('SELECT COUNT(*) FROM streamer');
     console.log(`[DB] Streamers cadastrados: ${count.rows[0].count}`);
@@ -842,6 +865,244 @@ app.put('/api/streamer/me/password', requireAuth, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════
+// ── SISTEMA DE COBRANÇA SEMANAL (QUINTA A QUINTA) ──
+// ══════════════════════════════════════════════
+
+// Gera cobranças automáticas pra todos os streamers
+// Gera cobrança pra um streamer específico num período
+async function generateInvoiceForStreamer(streamer, periodStart, periodEnd) {
+  try {
+    const vpvh = streamer.value_per_view_hour || 0;
+    if (vpvh <= 0) return false;
+
+    // Checar duplicata pra esse streamer+período
+    const dup = await pool.query(
+      'SELECT id FROM invoices WHERE LOWER(id_streamer) = LOWER($1) AND period_start = $2 AND period_end = $3 LIMIT 1',
+      [streamer.id_streamer, periodStart, periodEnd]
+    );
+    if (dup.rows.length > 0) return false;
+
+    const livesResult = await pool.query(
+      `SELECT l.id, l.duration_seconds,
+              COALESCE(SUM(vs.total_seconds), 0)::INTEGER as all_seconds
+       FROM lives l
+       LEFT JOIN live_viewer_sessions vs ON vs.live_id = l.id
+       WHERE LOWER(l.id_streamer) = LOWER($1)
+         AND l.started_at >= $2 AND l.started_at <= $3
+       GROUP BY l.id`,
+      [streamer.id_streamer, periodStart, periodEnd + 'T23:59:59']
+    );
+
+    let totalRevenue = 0;
+    let totalHours = 0;
+    for (const live of livesResult.rows) {
+      const dur = live.duration_seconds || 0;
+      if (dur <= 0) continue;
+      const avgViewers = Math.ceil((live.all_seconds / dur) * 10) / 10;
+      totalRevenue += avgViewers * dur * (vpvh / 3600);
+      totalHours += dur / 3600;
+    }
+
+    totalRevenue = Math.round(totalRevenue * 100) / 100;
+    totalHours = Math.round(totalHours * 100) / 100;
+    const commissionPct = streamer.commission || 0;
+    const amountDue = Math.round(totalRevenue * (commissionPct / 100) * 100) / 100;
+
+    await pool.query(
+      `INSERT INTO invoices (id_streamer, period_start, period_end, total_hours, total_revenue, amount_due, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+      [streamer.id_streamer.toLowerCase(), periodStart, periodEnd, totalHours, totalRevenue, amountDue]
+    );
+    console.log(`[BILLING] Cobrança gerada: ${streamer.user} (${streamer.id_streamer}) | ${periodStart}→${periodEnd} | Revenue: $${totalRevenue} | Due: $${amountDue}`);
+    return true;
+  } catch (e) {
+    console.error(`[BILLING] Erro gerando cobrança para ${streamer.id_streamer}:`, e.message);
+    return false;
+  }
+}
+
+// Gera cobranças automáticas pra todos os streamers
+async function generateWeeklyInvoices() {
+  try {
+    // Calcular período: quinta passada → quinta de ontem (roda na sexta 00h, pega quinta a quinta)
+    // Ex: roda sexta 10/04 → período 03/04 (quinta) até 09/04 (quinta)
+    const now = new Date();
+    const brNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+    // endDate = quinta mais recente (ontem se hoje é sexta)
+    const dayOfWeek = brNow.getDay(); // 0=dom, 5=sex
+    const endDate = new Date(brNow);
+    // Voltar pro dia da semana 4 (quinta) mais recente
+    const daysBack = (dayOfWeek + 3) % 7; // sex=1, sab=2, dom=3, seg=4, ter=5, qua=6, qui=0
+    endDate.setDate(endDate.getDate() - daysBack);
+    endDate.setHours(0, 0, 0, 0);
+    // startDate = 7 dias antes do endDate (quinta anterior)
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 7);
+
+    const periodStart = startDate.toISOString().split('T')[0];
+    const periodEnd = endDate.toISOString().split('T')[0];
+
+    // Checar se já gerou pra esse período
+    const existing = await pool.query(
+      'SELECT id FROM invoices WHERE period_start = $1 AND period_end = $2 LIMIT 1',
+      [periodStart, periodEnd]
+    );
+    if (existing.rows.length > 0) {
+      console.log(`[BILLING] Cobranças já geradas para ${periodStart} → ${periodEnd}, pulando.`);
+      return;
+    }
+
+    // Buscar todos os streamers e gerar cobrança pra cada um
+    const streamers = await pool.query('SELECT id, "user", id_streamer, value_per_view_hour, commission FROM streamer');
+    let generated = 0;
+    for (const s of streamers.rows) {
+      const ok = await generateInvoiceForStreamer(s, periodStart, periodEnd);
+      if (ok) generated++;
+    }
+    console.log(`[BILLING] ${generated} cobranças geradas para ${periodStart} → ${periodEnd}`);
+  } catch (e) {
+    console.error('[BILLING] Erro ao gerar cobranças:', e.message);
+  }
+}
+
+// Cron interno: checar a cada minuto se é sexta-feira 00:00 BRT
+// Gera cobranças referentes à semana quinta→quinta que acabou de fechar
+let _lastBillingCheck = '';
+setInterval(() => {
+  const brNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+  const day = brNow.getDay(); // 5 = sexta
+  const hour = brNow.getHours();
+  const minute = brNow.getMinutes();
+  const key = `${brNow.getFullYear()}-${brNow.getMonth()}-${brNow.getDate()}`;
+  if (day === 5 && hour === 0 && minute < 2 && _lastBillingCheck !== key) {
+    _lastBillingCheck = key;
+    generateWeeklyInvoices();
+  }
+}, 60000);
+
+// ── GET /api/admin/invoices — Listar cobranças (admin) ──
+app.get('/api/admin/invoices', requireApiKey, async (req, res) => {
+  try {
+    const { status, id_streamer } = req.query;
+    let q = `SELECT i.*, s."user" as streamer_name FROM invoices i
+             LEFT JOIN streamer s ON LOWER(s.id_streamer) = LOWER(i.id_streamer)`;
+    const conditions = [];
+    const values = [];
+    if (status) { conditions.push(`i.status = $${values.length + 1}`); values.push(status); }
+    if (id_streamer) { conditions.push(`LOWER(i.id_streamer) = LOWER($${values.length + 1})`); values.push(id_streamer); }
+    if (conditions.length) q += ' WHERE ' + conditions.join(' AND ');
+    q += ' ORDER BY i.created_at DESC';
+    const result = await pool.query(q, values);
+    return res.json({ total: result.rows.length, invoices: result.rows });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/admin/invoices/generate — Gerar cobrança manual pra um streamer (admin) ──
+app.post('/api/admin/invoices/generate', requireApiKey, async (req, res) => {
+  try {
+    const { id_streamer, start_date, end_date } = req.body;
+    if (!id_streamer || !start_date || !end_date) {
+      return res.status(400).json({ message: 'Campos obrigatórios: id_streamer, start_date, end_date' });
+    }
+    const streamer = await pool.query(
+      'SELECT id, "user", id_streamer, value_per_view_hour, commission FROM streamer WHERE LOWER(id_streamer) = LOWER($1)',
+      [id_streamer]
+    );
+    if (streamer.rows.length === 0) return res.status(404).json({ message: 'Streamer não encontrado' });
+    const ok = await generateInvoiceForStreamer(streamer.rows[0], start_date, end_date);
+    if (!ok) return res.status(409).json({ message: 'Cobrança já existe para esse período ou streamer sem rate configurado' });
+    return res.json({ generated: true });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/admin/invoices/:id/confirm — Confirmar pagamento (admin) ──
+app.post('/api/admin/invoices/:id/confirm', requireApiKey, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE invoices SET status = 'confirmed', confirmed_at = NOW(), confirmed_by = 'admin'
+       WHERE id = $1 AND status = 'paid' RETURNING id`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Cobrança não encontrada ou não está marcada como paga' });
+    return res.json({ confirmed: true, id: result.rows[0].id });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/admin/invoices/:id/overdue — Marcar como atrasada (admin) ──
+app.post('/api/admin/invoices/:id/overdue', requireApiKey, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE invoices SET status = 'overdue' WHERE id = $1 AND status = 'pending' RETURNING id`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Cobrança não encontrada ou não está pendente' });
+    return res.json({ overdue: true, id: result.rows[0].id });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/admin/streamer/:id_streamer/block — Bloquear streamer (admin) ──
+app.post('/api/admin/streamer/:id_streamer/block', requireApiKey, async (req, res) => {
+  try {
+    await pool.query('UPDATE streamer SET is_blocked = true WHERE LOWER(id_streamer) = LOWER($1)', [req.params.id_streamer]);
+    invalidateStreamerCache();
+    console.log(`[ADMIN] Streamer ${req.params.id_streamer} BLOQUEADO`);
+    return res.json({ blocked: true });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/admin/streamer/:id_streamer/unblock — Desbloquear streamer (admin) ──
+app.post('/api/admin/streamer/:id_streamer/unblock', requireApiKey, async (req, res) => {
+  try {
+    await pool.query('UPDATE streamer SET is_blocked = false WHERE LOWER(id_streamer) = LOWER($1)', [req.params.id_streamer]);
+    invalidateStreamerCache();
+    console.log(`[ADMIN] Streamer ${req.params.id_streamer} DESBLOQUEADO`);
+    return res.json({ unblocked: true });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+// ── GET /api/streamer/me/invoices — Listar cobranças do streamer autenticado ──
+app.get('/api/streamer/me/invoices', requireAuth, async (req, res) => {
+  try {
+    if (req.auth.role !== 'streamer') return res.status(403).json({ message: 'Apenas streamers' });
+    const result = await pool.query(
+      'SELECT * FROM invoices WHERE LOWER(id_streamer) = LOWER($1) ORDER BY created_at DESC',
+      [req.auth.id_streamer]
+    );
+    return res.json({ invoices: result.rows });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
+// ── POST /api/streamer/me/invoices/:id/pay — Streamer marca como pago ──
+app.post('/api/streamer/me/invoices/:id/pay', requireAuth, async (req, res) => {
+  try {
+    if (req.auth.role !== 'streamer') return res.status(403).json({ message: 'Apenas streamers' });
+    const result = await pool.query(
+      `UPDATE invoices SET status = 'paid', paid_at = NOW()
+       WHERE id = $1 AND LOWER(id_streamer) = LOWER($2) AND status IN ('pending', 'overdue') RETURNING id`,
+      [req.params.id, req.auth.id_streamer]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Cobrança não encontrada ou já paga' });
+    return res.json({ paid: true, id: result.rows[0].id });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
 // ── GET /health ──
 app.get('/health', (req, res) => {
   const stats = {};
@@ -1057,6 +1318,14 @@ async function processValidate(id_streamer, req, res) {
       return res.status(404).json({
         valid: false,
         message: 'Streamer nao encontrado'
+      });
+    }
+
+    if (streamer.is_blocked) {
+      console.log(`[VALIDATE] Streamer "${id_streamer}" bloqueado`);
+      return res.status(403).json({
+        valid: false,
+        message: 'Streamer bloqueado por inadimplencia'
       });
     }
 
