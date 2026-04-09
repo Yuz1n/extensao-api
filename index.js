@@ -1039,7 +1039,10 @@ async function processValidate(id_streamer, req, res) {
     const liveStatus = await getCachedLiveStatus(mediamtxPath);
 
     // Se status = "active" e não tem live ativa → iniciar live
-    if (liveStatus === 'active' && stream_url && !activeLives[id_streamer]) {
+    // IMPORTANTE: não auto-iniciar se endedStreamers está ativo (flag de 5 min pós-encerramento).
+    // Previne criação de live fantasma quando o KV retorna stale "active" por eventual consistency
+    // nos primeiros minutos após o uploader enviar live/end (ver bug brkk live fantasma 2026-04-09).
+    if (liveStatus === 'active' && stream_url && !activeLives[id_streamer] && !endedStreamers[id_streamer.toLowerCase()]) {
       await onLiveStart(id_streamer, streamer.user);
     }
 
