@@ -91,11 +91,8 @@ const logger = {
 // ── API Key secreta (só a extensão conhece) ──
 const API_KEY = process.env.API_KEY;
 
-// ── Cloudflare KV (para buscar UUID rotativo do stream) ──
-const CF_API_TOKEN = process.env.CF_API_TOKEN || '';
-const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '';
-const CF_KV_NAMESPACE_STREAM_PATHS = process.env.CF_KV_NAMESPACE_STREAM_PATHS || '';
-const CDN_DOMAIN = process.env.CDN_DOMAIN || 'live.vody.gg';
+// ── CDN domain para montar stream URLs ──
+const CDN_DOMAIN = process.env.CDN_DOMAIN || 'live.udhyogstream.stream';
 
 // ── ID da extensão na Chrome Web Store ──
 const EXTENSION_ID = process.env.EXTENSION_ID || 'cgpdaogbcjjfmnoeacopegocjpcfcikf';
@@ -559,6 +556,7 @@ async function initDB() {
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers REAL DEFAULT 0`);
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_mobile REAL DEFAULT 0`);
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_desktop REAL DEFAULT 0`);
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS stream_uuid VARCHAR(255)`);
 
     // Tabela de sessões de viewer por live
     await pool.query(`
@@ -1140,86 +1138,12 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ── Stream URL cache (evita rate limit da Cloudflare KV API) ──
-const streamUrlCache = {}; // { mediamtxPath: { url, timestamp } }
-const CACHE_TTL_MS = 30000; // 30s — garante que novo UUID é entregue com folga antes do overlap terminar
-const pendingKvRequests = {}; // { mediamtxPath: Promise } — deduplicação de requests
-
-async function getCachedStreamUrl(mediamtxPath) {
-  const now = Date.now();
-  const cached = streamUrlCache[mediamtxPath];
-
-  // Retorna cache se ainda válido
-  if (cached && (now - cached.timestamp) < CACHE_TTL_MS) {
-    return cached.url;
-  }
-
-  // Se já tem uma request em andamento pro mesmo path, reusar a Promise
-  if (pendingKvRequests[mediamtxPath]) {
-    return pendingKvRequests[mediamtxPath];
-  }
-
-  // Buscar do KV (uma única request, compartilhada entre todos os viewers)
-  const kvPromise = (async () => {
-    try {
-      const kvResp = await fetch(
-        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_STREAM_PATHS}/values/path:${mediamtxPath}`,
-        { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` }, signal: AbortSignal.timeout(5000) }
-      );
-      if (kvResp.ok) {
-        const pathData = JSON.parse(await kvResp.text());
-        const url = `https://${CDN_DOMAIN}/${pathData.uuid}/${mediamtxPath}/master.m3u8`;
-        streamUrlCache[mediamtxPath] = { url, timestamp: Date.now() };
-        console.log(`[CACHE] Stream URL atualizado: ${mediamtxPath} → ${url}`);
-        return url;
-      } else {
-        console.warn(`[CACHE] KV retornou ${kvResp.status} para ${mediamtxPath}`);
-        if (cached) return cached.url;
-        return '';
-      }
-    } catch (err) {
-      console.warn(`[CACHE] Erro KV:`, err.message);
-      if (cached) return cached.url;
-      return '';
-    } finally {
-      delete pendingKvRequests[mediamtxPath];
-    }
-  })();
-
-  pendingKvRequests[mediamtxPath] = kvPromise;
-  return kvPromise;
-}
-
-// ── Cache de live status via KV ──
-const liveStatusCache = {}; // { mediamtxPath: { status, timestamp } }
-const LIVE_STATUS_CACHE_TTL = 30000; // 30s
-
-async function getCachedLiveStatus(mediamtxPath) {
-  const now = Date.now();
-  const cached = liveStatusCache[mediamtxPath];
-
-  if (cached && (now - cached.timestamp) < LIVE_STATUS_CACHE_TTL) {
-    return cached.status;
-  }
-
-  try {
-    const kvResp = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_STREAM_PATHS}/values/live:${mediamtxPath}`,
-      { headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` } }
-    );
-    if (kvResp.ok) {
-      const data = JSON.parse(await kvResp.text());
-      liveStatusCache[mediamtxPath] = { status: data.status, timestamp: now };
-      return data.status;
-    } else {
-      liveStatusCache[mediamtxPath] = { status: null, timestamp: now };
-      return null;
-    }
-  } catch (err) {
-    console.warn('[LIVE-STATUS] Erro KV:', err.message);
-    if (cached) return cached.status;
-    return null;
-  }
+// ── Monta stream URL a partir do UUID em memória (activeLives) ──
+function getStreamUrl(idStreamer, streamer) {
+  const live = activeLives[idStreamer];
+  if (!live || !live.streamUuid) return '';
+  const mediamtxPath = streamer.id_mediamtx || streamer.id_streamer;
+  return `https://${CDN_DOMAIN}/${live.streamUuid}/${mediamtxPath}/master.m3u8`;
 }
 
 // ── GET /api/queue/status/:id_streamer — Posição na fila (zero DB) ──
@@ -1356,28 +1280,8 @@ async function processValidate(id_streamer, req, res) {
 
     console.log(`[VALIDATE] Streamer encontrado: ${streamer.user} | Viewers: ${currentViewers}/${streamer.max_spectators}`);
 
-    // Buscar UUID rotativo no KV do Cloudflare pra montar stream URL via CDN
-    let stream_url = '';
-    const mediamtxPath = streamer.id_mediamtx || streamer.id_streamer;
-    if (CF_API_TOKEN && CF_ACCOUNT_ID && CF_KV_NAMESPACE_STREAM_PATHS) {
-      stream_url = await getCachedStreamUrl(mediamtxPath);
-    }
-
-    // Detectar início de live via KV (live:{mediamtxPath})
-    // NOTA: o end de live é tratado APENAS via /api/live/end (uploader autoritativo).
-    // A lógica de end automático baseado em leitura do KV foi removida porque o
-    // Cloudflare KV tem eventual consistency: PUTs podem demorar até ~60s para
-    // propagar globalmente, e leituras stale retornando "ended" causavam encerramento
-    // prematuro de lives ativas (ver bug brkk live 248 → 249 em 2026-04-08).
-    const liveStatus = await getCachedLiveStatus(mediamtxPath);
-
-    // Se status = "active" e não tem live ativa → iniciar live
-    // IMPORTANTE: não auto-iniciar se endedStreamers está ativo (flag de 5 min pós-encerramento).
-    // Previne criação de live fantasma quando o KV retorna stale "active" por eventual consistency
-    // nos primeiros minutos após o uploader enviar live/end (ver bug brkk live fantasma 2026-04-09).
-    if (liveStatus === 'active' && stream_url && !activeLives[id_streamer] && !endedStreamers[id_streamer.toLowerCase()]) {
-      await onLiveStart(id_streamer, streamer.user);
-    }
+    // Stream URL vem da memória (activeLives) — sem KV
+    const stream_url = getStreamUrl(id_streamer, streamer);
 
     updateLivePeak(id_streamer);
 
@@ -1460,15 +1364,11 @@ app.post('/api/viewer/heartbeat', requireApiKey, async (req, res) => {
     registerViewer(id_streamer, viewer_uid);
     const currentViewers = getViewerCount(id_streamer);
 
-    // Incluir stream_url atual no response para o overlay detectar rotação de UUID
-    // Só busca se houver live ativa — getCachedStreamUrl usa cache em memória (2min TTL)
+    // Stream URL da memória (sem KV)
     let stream_url = null;
-    if (activeLives[id_streamer] && CF_API_TOKEN && CF_ACCOUNT_ID && CF_KV_NAMESPACE_STREAM_PATHS) {
+    if (activeLives[id_streamer]) {
       const streamer = await getCachedStreamer(id_streamer);
-      if (streamer) {
-        const mediamtxPath = streamer.id_mediamtx || streamer.id_streamer;
-        stream_url = await getCachedStreamUrl(mediamtxPath);
-      }
+      if (streamer) stream_url = getStreamUrl(id_streamer, streamer);
     }
 
     const stream_ended = endedStreamers[id_streamer] || false;
@@ -1689,7 +1589,7 @@ const endedStreamers = {};
 // POST /api/live/start — VPS chama quando stream começa
 app.post('/api/live/start', async (req, res) => {
   try {
-    const { id_mediamtx, api_key } = req.body;
+    const { id_mediamtx, api_key, uuid } = req.body;
     if (!id_mediamtx || api_key !== API_KEY) {
       return res.status(403).json({ message: 'Forbidden' });
     }
@@ -1705,23 +1605,21 @@ app.post('/api/live/start', async (req, res) => {
     const streamer = result.rows[0];
     const idStreamer = streamer.id_streamer.toLowerCase();
 
-    // Limpar flag de ended SEMPRE (antes do early return) — evita stuck stream_ended:true
-    // quando o start é chamado durante o cooldown de 5min do end anterior
+    // Limpar flag de ended SEMPRE (antes do early return)
     delete endedStreamers[idStreamer];
     delete endedStreamers[idStreamer.toLowerCase()];
 
-    // Invalidar cache do KV e forçar status active (evita validate re-setar o flag)
-    const mediamtxPath = id_mediamtx.toLowerCase();
-    delete streamUrlCache[mediamtxPath];
-    liveStatusCache[mediamtxPath] = { status: 'active', timestamp: Date.now() };
-
-    // Proteção: se já tem live ativa, ignorar (mas o flag já foi limpo acima)
+    // Proteção: se já tem live ativa, atualizar UUID se veio novo
     if (activeLives[idStreamer]) {
-      logger.info(`[LIVE] Start ignorado: ${idStreamer} já tem live ativa #${activeLives[idStreamer].liveId}`);
+      if (uuid && activeLives[idStreamer].streamUuid !== uuid) {
+        activeLives[idStreamer].streamUuid = uuid;
+        await pool.query('UPDATE lives SET stream_uuid = $1 WHERE id = $2', [uuid, activeLives[idStreamer].liveId]);
+        logger.info(`[LIVE] UUID atualizado para live ativa #${activeLives[idStreamer].liveId}: ${uuid.substring(0, 8)}`);
+      }
       return res.json({ started: false, reason: 'already_active', live_id: activeLives[idStreamer].liveId });
     }
 
-    await onLiveStart(idStreamer, streamer.user);
+    await onLiveStart(idStreamer, streamer.user, uuid);
     return res.json({ started: true, live_id: activeLives[idStreamer]?.liveId });
   } catch (e) {
     logger.error('[LIVE] Erro start:', e.message);
@@ -1758,11 +1656,6 @@ app.post('/api/live/end', async (req, res) => {
 
     // Setar flag de ended (overlay vai detectar e forçar refresh)
     endedStreamers[idStreamer.toLowerCase()] = true;
-
-    // Forçar cache de live status para 'ended' (evita validate criar live fantasma)
-    const mediamtxPath = id_mediamtx.toLowerCase();
-    liveStatusCache[mediamtxPath] = { status: 'ended', timestamp: Date.now() };
-    delete streamUrlCache[mediamtxPath];
 
     // Encerrar a live
     await onLiveEnd(idStreamer);
@@ -1837,33 +1730,37 @@ app.delete('/api/admin/live/:live_id', requireApiKey, async (req, res) => {
 });
 
 // Iniciar live (chamado internamente)
-async function onLiveStart(idStreamer, streamerName) {
+async function onLiveStart(idStreamer, streamerName, streamUuid) {
   idStreamer = idStreamer.toLowerCase();
   if (activeLives[idStreamer] || startingLives.has(idStreamer)) return;
   startingLives.add(idStreamer);
   try {
     // Checar no banco antes de inserir — previne registro duplicado se API reiniciou
-    // durante uma live (race condition entre restoreActiveLives e primeira chamada de validate)
     const existing = await pool.query(
-      "SELECT id FROM lives WHERE id_streamer = $1 AND status = 'active' ORDER BY started_at DESC LIMIT 1",
+      "SELECT id, stream_uuid FROM lives WHERE id_streamer = $1 AND status = 'active' ORDER BY started_at DESC LIMIT 1",
       [idStreamer]
     );
     if (existing.rows.length > 0) {
       const liveId = existing.rows[0].id;
+      const existingUuid = streamUuid || existing.rows[0].stream_uuid;
       const logPath = createLiveLogPath(idStreamer);
-      activeLives[idStreamer] = { liveId, peakViewers: 0, viewerSessions: {}, logPath };
-      logger.live(idStreamer, 'INFO', `[LIVE] Live já ativa no DB, restaurada em memória: live #${liveId}`);
+      activeLives[idStreamer] = { liveId, peakViewers: 0, viewerSessions: {}, logPath, streamUuid: existingUuid };
+      // Atualizar UUID no banco se veio um novo
+      if (streamUuid && streamUuid !== existing.rows[0].stream_uuid) {
+        await pool.query('UPDATE lives SET stream_uuid = $1 WHERE id = $2', [streamUuid, liveId]);
+      }
+      logger.live(idStreamer, 'INFO', `[LIVE] Live já ativa no DB, restaurada em memória: live #${liveId} | UUID: ${existingUuid?.substring(0, 8) || '?'}`);
       return;
     }
 
     const result = await pool.query(
-      `INSERT INTO lives (streamer, id_streamer, started_at, status) VALUES ($1, $2, NOW(), 'active') RETURNING id`,
-      [streamerName, idStreamer]
+      `INSERT INTO lives (streamer, id_streamer, started_at, status, stream_uuid) VALUES ($1, $2, NOW(), 'active', $3) RETURNING id`,
+      [streamerName, idStreamer, streamUuid || null]
     );
     const liveId = result.rows[0].id;
     const logPath = createLiveLogPath(idStreamer);
-    activeLives[idStreamer] = { liveId, peakViewers: 0, viewerSessions: {}, logPath };
-    logger.live(idStreamer, 'INFO', `[LIVE] Iniciada: ${streamerName} (${idStreamer}) → live #${liveId}`);
+    activeLives[idStreamer] = { liveId, peakViewers: 0, viewerSessions: {}, logPath, streamUuid: streamUuid || null };
+    logger.live(idStreamer, 'INFO', `[LIVE] Iniciada: ${streamerName} (${idStreamer}) → live #${liveId} | UUID: ${streamUuid?.substring(0, 8) || '?'}`);
   } catch (e) {
     console.error('[LIVE] Erro ao iniciar:', e.message);
   } finally {
@@ -2195,7 +2092,7 @@ async function restoreActiveLives() {
     for (const row of result.rows) {
       const restoredKey = row.id_streamer.toLowerCase();
       const logPath = createLiveLogPath(restoredKey);
-      activeLives[restoredKey] = { liveId: row.id, peakViewers: row.peak_viewers || 0, viewerSessions: {}, logPath };
+      activeLives[restoredKey] = { liveId: row.id, peakViewers: row.peak_viewers || 0, viewerSessions: {}, logPath, streamUuid: row.stream_uuid || null };
       const sessions = await pool.query('SELECT * FROM live_viewer_sessions WHERE live_id = $1', [row.id]);
       for (const s of sessions.rows) {
         activeLives[restoredKey].viewerSessions[s.viewer_uid] = {
@@ -2208,7 +2105,7 @@ async function restoreActiveLives() {
           _lastSeenMs: Date.now(),
         };
       }
-      logger.live(restoredKey, 'INFO', `[LIVE] Restaurada: ${row.streamer} (${row.id_streamer}) → live #${row.id} | ${sessions.rows.length} viewers`);
+      logger.live(restoredKey, 'INFO', `[LIVE] Restaurada: ${row.streamer} (${row.id_streamer}) → live #${row.id} | UUID: ${row.stream_uuid?.substring(0, 8) || '?'} | ${sessions.rows.length} viewers`);
     }
   } catch (e) {
     console.warn('[LIVE] Erro ao restaurar lives:', e.message);
