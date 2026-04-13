@@ -1217,44 +1217,13 @@
     var old = document.getElementById('hls-overlay');
     if (old) old.remove();
 
-    // Simulador de viewer do Kick — DESATIVADO
-    // startKickViewerSim();
-
-    // Espera Kick carregar e pausa
-    var checkCount = 0;
-    var checkInterval = setInterval(function () {
-      var v = player.querySelector('video');
-      checkCount++;
-      var isPlaying = v && !v.paused && v.currentTime > 0 && v.readyState >= 3;
-
-      if (isPlaying || checkCount > 40) {
-        clearInterval(checkInterval);
-        if (v) {
-          v.pause();
-          v.autoplay = false;
-          v.style.display = 'none';
-        }
-        doInjectMobile(player, streamUrl);
-      }
-    }, 200);
-  }
-
-  function doInjectMobile(player, streamUrl) {
-    // Bloqueador de interação com Kick
-    var blocker = document.createElement('div');
-    blocker.id = 'stream-kick-blocker';
-    blocker.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;z-index:998;background:transparent;pointer-events:auto;';
-    player.appendChild(blocker);
-
-    // Esconde controles do Kick
-    var css = document.createElement('style');
-    css.textContent = [
-      '#injected-channel-player button:not(#stream-fs):not(#stream-mute):not(#stream-quality-btn):not(#stream-quality-menu button){pointer-events:none!important;opacity:0!important;}',
-      '#stream-quality-menu button{pointer-events:auto!important;opacity:1!important;}',
-      '#injected-channel-player [class*="controls"]{pointer-events:none!important;opacity:0!important;}',
-      '#injected-channel-player [class*="overlay-container"]{pointer-events:none!important;}',
-    ].join('');
-    document.head.appendChild(css);
+    // Mobile agora funciona igual desktop: Kick continua rodando por baixo
+    // (160p mutado) e o HLS overlay roda por cima. Zero pause, zero interceptação.
+    if (kickVideo) {
+      kickVideo.muted = false;
+      kickVideo.volume = 0;
+    }
+    setTimeout(function () { trySet160p(player); }, 3000);
 
     var video = document.createElement('video');
     video.id = 'hls-overlay';
@@ -1262,7 +1231,8 @@
     video.playsInline = true;
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
-    video.style.cssText = 'width:100%;height:100%;position:absolute;top:0;left:0;background:#000;object-fit:contain;z-index:999;';
+    video.disableRemotePlayback = true;
+    video.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;z-index:999;background:#000;object-fit:contain;pointer-events:none;';
 
     player.style.position = 'relative';
     player.appendChild(video);
@@ -1273,13 +1243,10 @@
     startHLS(video, streamUrl);
     setupPlayerHealthTracking(video);
 
-    // Impede Kick de retomar
+    // Mantém Kick mutado (igual desktop)
     setInterval(function () {
-      var kv = player.querySelector('video:not(#hls-overlay)');
-      if (kv && !kv.paused) {
-        kv.pause();
-        kv.autoplay = false;
-      }
+      var v = player.querySelector('video:not(#hls-overlay)');
+      if (v) { v.muted = false; v.volume = 0; }
     }, 2000);
   }
 
