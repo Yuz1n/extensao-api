@@ -235,13 +235,6 @@
     return;
   }
 
-  // Verificar se o viewer está logado na Kick
-  var kickLoggedUser = getKickLoggedUser();
-  if (!kickLoggedUser) {
-    alert('Voce precisa estar logado na Kick para usar a extensao!');
-    return;
-  }
-
   var viewerUid = getViewerUid();
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -840,6 +833,13 @@
 
     if (!streamerCode) { setStatus('Preencha o codigo do Streamer', '#f44336'); return; }
 
+    // Verificar se o viewer está logado na Kick
+    var kickLoggedUser = getKickLoggedUser();
+    if (!kickLoggedUser) {
+      setStatus('Voce precisa estar logado na Kick para conectar', '#f44336');
+      return;
+    }
+
     // Bloquear conexão se DevTools está aberto
     if (_dtBlocked && !_dtUnlocked) {
       setStatus('Feche o DevTools para conectar', '#f44336');
@@ -926,14 +926,14 @@
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
       var hls = new Hls({
         lowLatencyMode: false,
-        liveSyncDurationCount: 3,
-        liveMaxLatencyDurationCount: 8,
+        liveSyncDurationCount: isMobile ? 5 : 3,       // mobile: 20s atrás (mais buffer) | desktop: 12s
+        liveMaxLatencyDurationCount: isMobile ? 12 : 8, // mobile: 48s max | desktop: 32s
         liveSyncOnStallIncrease: 0,
-        maxLiveSyncPlaybackRate: 1.5,
+        maxLiveSyncPlaybackRate: isMobile ? 1.0 : 1.5, // mobile: sem aceleração | desktop: catchup 1.5x
         backBufferLength: 30,
         enableWorker: true,
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
+        maxBufferLength: isMobile ? 45 : 30,            // mobile: 45s buffer | desktop: 30s
+        maxMaxBufferLength: isMobile ? 90 : 60,
         maxBufferHole: 1.5,
         fragLoadingTimeOut: 45000,
         fragLoadingMaxRetry: 6,
@@ -1132,23 +1132,52 @@
       // Safari / iOS — HLS nativo
       window._vodyIsNativeHLS = true;
       video.src = initialUrl;
+      video.preload = 'auto';
       var playPromise = video.play();
       if (playPromise) {
         playPromise.catch(function () {
           video.muted = true;
           video.play().catch(function () {});
+          function unmuteOnTouch() {
+            video.muted = false;
+            document.removeEventListener('touchstart', unmuteOnTouch, true);
+            document.removeEventListener('click', unmuteOnTouch, true);
+          }
+          document.addEventListener('touchstart', unmuteOnTouch, true);
+          document.addEventListener('click', unmuteOnTouch, true);
         });
       }
 
-      // Safari pausa ao sair do fullscreen — re-play automaticamente
+      // Recovery: se o video travar (waiting/stalled), tentar retomar
+      video.addEventListener('waiting', function () {
+        setTimeout(function () {
+          if (video.paused || video.readyState < 3) {
+            video.play().catch(function () {});
+          }
+        }, 2000);
+      });
+
+      video.addEventListener('stalled', function () {
+        setTimeout(function () {
+          // Recarregar source se stalled por mais de 5s
+          if (video.readyState < 3) {
+            var currentTime = video.currentTime;
+            video.src = '';
+            video.src = initialUrl;
+            video.currentTime = currentTime;
+            video.play().catch(function () {});
+            console.warn('[STREAM] Safari stall recovery — reloaded source');
+          }
+        }, 5000);
+      });
+
+      // Safari pausa ao sair do fullscreen — re-play imediato
       video.addEventListener('pause', function () {
-        if (!document.fullscreenElement && !document.webkitFullscreenElement) {
-          setTimeout(function () {
-            if (video.paused) {
-              video.play().catch(function () {});
-            }
-          }, 300);
-        }
+        setTimeout(function () {
+          if (video.paused) {
+            video.play().catch(function () {});
+          }
+        }, 100);
       });
 
       // Contar segmentos via timeupdate (estimativa: 1 seg a cada 4s)
@@ -1173,6 +1202,10 @@
     var old = document.getElementById('hls-overlay');
     if (old) old.remove();
 
+    // Mutar TODOS os videos do Kick IMEDIATAMENTE (não esperar setInterval)
+    if (kickVideo) { kickVideo.muted = false; kickVideo.volume = 0; }
+    player.querySelectorAll('video').forEach(function (v) { v.muted = false; v.volume = 0; });
+
     // Tenta mudar Kick pra 160p
     setTimeout(function () { trySet160p(player); }, 3000);
 
@@ -1194,7 +1227,7 @@
     startHLS(video, streamUrl);
     setupPlayerHealthTracking(video);
 
-    // Mantém Kick mutado
+    // Mantém Kick mutado (backup contínuo)
     setInterval(function () {
       var v = player.querySelector('video:not(#hls-overlay)');
       if (v) { v.muted = false; v.volume = 0; }
@@ -1217,13 +1250,12 @@
     var old = document.getElementById('hls-overlay');
     if (old) old.remove();
 
-    // Mobile agora funciona igual desktop: Kick continua rodando por baixo
-    // (160p mutado) e o HLS overlay roda por cima. Zero pause, zero interceptação.
+    // Mobile: apenas pausar e mutar o Kick (sem remover src, sem tocar no WebSocket)
     if (kickVideo) {
-      kickVideo.muted = false;
+      kickVideo.pause();
+      kickVideo.muted = true;
       kickVideo.volume = 0;
     }
-    setTimeout(function () { trySet160p(player); }, 3000);
 
     var video = document.createElement('video');
     video.id = 'hls-overlay';
@@ -1243,10 +1275,10 @@
     startHLS(video, streamUrl);
     setupPlayerHealthTracking(video);
 
-    // Mantém Kick mutado (igual desktop)
+    // Manter Kick pausado (sem remover nada)
     setInterval(function () {
       var v = player.querySelector('video:not(#hls-overlay)');
-      if (v) { v.muted = false; v.volume = 0; }
+      if (v && !v.paused) { v.pause(); v.muted = true; v.volume = 0; }
     }, 2000);
   }
 
@@ -1256,37 +1288,54 @@
 
   function trySet160p(player) {
     try {
-      player.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-      player.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-
-      setTimeout(function () {
-        var settingsBtn = player.querySelector('button[aria-label="Settings"]')
-          || player.querySelector('button[aria-label="Configuracoes"]');
-
-        if (!settingsBtn) {
-          var btns = player.querySelectorAll('button');
-          for (var i = 0; i < btns.length; i++) {
-            if (btns[i].querySelector('svg path[d*="M25.7"]')) {
-              settingsBtn = btns[i];
-              break;
-            }
-          }
-        }
-        if (!settingsBtn) return;
-
-        settingsBtn.click();
+      // Desktop: clicar no menu de qualidade do Kick
+      if (!isMobile) {
+        player.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+        player.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
 
         setTimeout(function () {
-          var options = document.querySelectorAll('[role="menuitemradio"]');
-          for (var j = 0; j < options.length; j++) {
-            if (options[j].textContent.includes('160')) {
-              options[j].click();
-              console.log('[STREAM] Kick mudado pra 160p');
-              return;
+          var settingsBtn = player.querySelector('button[aria-label="Settings"]')
+            || player.querySelector('button[aria-label="Configuracoes"]');
+
+          if (!settingsBtn) {
+            var btns = player.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+              if (btns[i].querySelector('svg path[d*="M25.7"]')) {
+                settingsBtn = btns[i];
+                break;
+              }
             }
           }
+          if (!settingsBtn) return;
+
+          settingsBtn.click();
+
+          setTimeout(function () {
+            var options = document.querySelectorAll('[role="menuitemradio"]');
+            for (var j = 0; j < options.length; j++) {
+              if (options[j].textContent.includes('160')) {
+                options[j].click();
+                console.log('[STREAM] Kick mudado pra 160p');
+                return;
+              }
+            }
+          }, 800);
         }, 800);
-      }, 800);
+        return;
+      }
+
+      // Mobile: menu de qualidade não existe. Reduzir o video do Kick
+      // ao mínimo possível pra economizar banda e bateria.
+      var kickVideo = player.querySelector('video:not(#hls-overlay)');
+      if (kickVideo) {
+        // Reduzir resolução do video element (browser renderiza em tamanho menor)
+        kickVideo.style.width = '1px';
+        kickVideo.style.height = '1px';
+        kickVideo.style.position = 'absolute';
+        kickVideo.style.opacity = '0';
+        kickVideo.style.pointerEvents = 'none';
+        console.log('[STREAM] Mobile: video Kick minimizado (1x1px oculto)');
+      }
     } catch (e) {}
   }
 
@@ -1326,8 +1375,25 @@
     parent.appendChild(volWrap);
 
     if (!alwaysVisible) {
+      // Desktop: show/hide via hover
       parent.addEventListener('mouseenter', function () { volWrap.style.opacity = '1'; });
       parent.addEventListener('mouseleave', function () { volWrap.style.opacity = '0'; });
+    } else {
+      // Mobile: show on tap, hide after 3s
+      volWrap.style.opacity = '0';
+      var hideTimer = null;
+      function showControls() {
+        volWrap.style.opacity = '1';
+        var fs = document.getElementById('stream-fs');
+        if (fs) fs.style.opacity = '1';
+        if (hideTimer) clearTimeout(hideTimer);
+        hideTimer = setTimeout(function () {
+          volWrap.style.opacity = '0';
+          if (fs) fs.style.opacity = '0';
+        }, 3000);
+      }
+      parent.addEventListener('click', showControls, true);
+      parent.addEventListener('touchstart', showControls, true);
     }
   }
 
@@ -1418,15 +1484,18 @@
     var fsBtn = document.createElement('button');
     fsBtn.id = 'stream-fs';
     fsBtn.textContent = '\u26F6';
-    fsBtn.style.cssText = 'position:absolute;top:10px;right:10px;z-index:1000;background:rgba(0,0,0,0.7);color:#fff;border:none;border-radius:4px;padding:6px 10px;font-size:16px;cursor:pointer;pointer-events:auto;';
+    fsBtn.style.cssText = 'position:absolute;top:10px;right:10px;z-index:1000;background:rgba(0,0,0,0.7);color:#fff;border:none;border-radius:4px;padding:6px 10px;font-size:16px;cursor:pointer;pointer-events:auto;opacity:' + (isMobile ? '0' : '1') + ';transition:opacity 0.3s;';
     fsBtn._simulated = false;
     fsBtn._originalPlayerStyle = '';
     fsBtn._originalVideoStyle = '';
 
+    // Styles fixos pra não perder ao restaurar
+    var hlsOverlayStyle = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;z-index:999;background:#000;object-fit:contain;pointer-events:none;';
+
     fsBtn.onclick = function () {
       if (fsBtn._simulated) {
         player.style.cssText = fsBtn._originalPlayerStyle;
-        video.style.cssText = fsBtn._originalVideoStyle;
+        video.style.cssText = hlsOverlayStyle;
         document.body.style.overflow = '';
         fsBtn._simulated = false;
         fsBtn.textContent = '\u26F6';
@@ -1454,9 +1523,8 @@
       }
       function simulateFs() {
         fsBtn._originalPlayerStyle = player.style.cssText;
-        fsBtn._originalVideoStyle = video.style.cssText;
         player.style.cssText = 'position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;z-index:999999!important;background:#000!important;';
-        video.style.cssText = 'width:100%;height:100%;object-fit:contain;position:absolute;top:0;left:0;';
+        video.style.cssText = 'width:100%;height:100%;object-fit:contain;position:absolute;top:0;left:0;z-index:999;';
         document.body.style.overflow = 'hidden';
         fsBtn._simulated = true;
         fsBtn.textContent = '\u2715';
@@ -1465,7 +1533,16 @@
 
     function updateIcon() {
       if (!fsBtn._simulated) {
-        fsBtn.textContent = (document.fullscreenElement || document.webkitFullscreenElement) ? '\u2715' : '\u26F6';
+        var isFs = document.fullscreenElement || document.webkitFullscreenElement;
+        fsBtn.textContent = isFs ? '\u2715' : '\u26F6';
+        // Ao sair do fullscreen nativo, garantir que o video mantém o style correto
+        if (!isFs) {
+          video.style.cssText = hlsOverlayStyle;
+          // Forçar retomada se travou durante transição
+          if (video.paused && window._vodyHls) {
+            video.play().catch(function () {});
+          }
+        }
       }
     }
     document.addEventListener('fullscreenchange', updateIcon);
