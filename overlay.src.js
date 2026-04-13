@@ -235,6 +235,13 @@
     return;
   }
 
+  // Verificar se o viewer está logado na Kick
+  var kickLoggedUser = getKickLoggedUser();
+  if (!kickLoggedUser) {
+    alert('Voce precisa estar logado na Kick para usar a extensao!');
+    return;
+  }
+
   var viewerUid = getViewerUid();
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -568,8 +575,8 @@
     var dtWarn = document.getElementById('stream-dt-warning');
     if (dtWarn) dtWarn.remove();
 
-    // Parar simulador de viewer do Kick (mobile)
-    stopKickViewerSim();
+    // Parar simulador de viewer do Kick (mobile) — DESATIVADO
+    // stopKickViewerSim();
 
     // Parar HLS
     if (window._vodyHls) {
@@ -1198,119 +1205,20 @@
   // PLAYER MOBILE — overlay sobre Kick
   // ════════════════════════════════════════════════════════════════════════════
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // KICK VIEWER SIMULATOR (mobile only)
-  // Quando o overlay pausa o player do Kick no mobile, o frontend para de
-  // enviar channel_handshake e user_event via WebSocket. Isso faz o viewer
-  // deixar de ser contado na Kick. Este simulador intercepta o WS existente
-  // e continua enviando os eventos pra manter o viewer contando.
-  // ════════════════════════════════════════════════════════════════════════════
-
-  function startKickViewerSim() {
-    var sim = { ws: null, handshakeTimer: null, trackingTimer: null, channelId: null, livestreamId: null };
-
-    // Interceptar WebSocket existente
-    var originalSend = WebSocket.prototype.send;
-    WebSocket.prototype.send = function (data) {
-      try {
-        if (this.url && this.url.indexOf('websockets.kick.com') !== -1) {
-          if (!sim.ws) {
-            sim.ws = this;
-            console.log('[KICK-SIM] WebSocket existente capturado');
-          }
-          try {
-            var msg = JSON.parse(data);
-            if (msg.type === 'channel_handshake' && msg.data && msg.data.message && msg.data.message.channelId) {
-              sim.channelId = msg.data.message.channelId;
-            }
-            if (msg.type === 'user_event' && msg.data && msg.data.message && msg.data.message.livestream_id) {
-              sim.livestreamId = msg.data.message.livestream_id;
-            }
-          } catch (e) {}
-
-          if (sim.ws && sim.channelId) {
-            WebSocket.prototype.send = originalSend;
-            console.log('[KICK-SIM] Interceptação completa — channelId: ' + sim.channelId);
-            startSimLoops();
-          }
-        }
-      } catch (e) {}
-      return originalSend.call(this, data);
-    };
-
-    // Fallback: buscar dados da API pública se interceptação demorar
-    var slug = window.location.pathname.split('/').filter(Boolean)[0];
-    if (slug) {
-      fetch('https://kick.com/api/v2/channels/' + encodeURIComponent(slug))
-        .then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (data) {
-          if (data) {
-            if (!sim.channelId && data.id) sim.channelId = String(data.id);
-            if (!sim.livestreamId && data.livestream && data.livestream.id) sim.livestreamId = data.livestream.id;
-            console.log('[KICK-SIM] API fallback: channelId=' + sim.channelId + ' livestreamId=' + sim.livestreamId);
-          }
-        })
-        .catch(function () {});
-    }
-
-    function startSimLoops() {
-      // Aguardar o player ser pausado pelo overlay
-      setTimeout(function () {
-        // channel_handshake a cada ~15s
-        var sendHandshake = function () {
-          if (sim.ws && sim.ws.readyState === 1 && sim.channelId) {
-            sim.ws.send(JSON.stringify({
-              type: 'channel_handshake',
-              data: { message: { channelId: String(sim.channelId) } }
-            }));
-          }
-          var jitter = (Math.random() - 0.5) * 1000;
-          sim.handshakeTimer = setTimeout(sendHandshake, 15000 + jitter);
-        };
-        sendHandshake();
-
-        // user_event a cada ~120s
-        if (sim.livestreamId) {
-          var sendTracking = function () {
-            if (sim.ws && sim.ws.readyState === 1) {
-              sim.ws.send(JSON.stringify({
-                type: 'user_event',
-                data: { message: { name: 'tracking.user.watch.livestream', channel_id: Number(sim.channelId), livestream_id: Number(sim.livestreamId) } }
-              }));
-            }
-            var jitter = (Math.random() - 0.5) * 10000;
-            sim.trackingTimer = setTimeout(sendTracking, 120000 + jitter);
-          };
-          setTimeout(sendTracking, 3000);
-        }
-
-        console.log('[KICK-SIM] Simulador ativo — handshake ~15s, tracking ~120s');
-      }, 2000);
-    }
-
-    // Expor pra cleanup
-    window._vodyKickSim = sim;
-  }
-
-  function stopKickViewerSim() {
-    var sim = window._vodyKickSim;
-    if (sim) {
-      if (sim.handshakeTimer) clearTimeout(sim.handshakeTimer);
-      if (sim.trackingTimer) clearTimeout(sim.trackingTimer);
-      sim.handshakeTimer = null;
-      sim.trackingTimer = null;
-      console.log('[KICK-SIM] Simulador parado');
-    }
-    window._vodyKickSim = null;
-  }
+  /* ════════════════════════════════════════════════════════════════════════════
+   * KICK VIEWER SIMULATOR — DESATIVADO
+   * Interceptava o WebSocket do Kick pra manter o viewer contando quando o
+   * overlay pausava o player nativo no mobile. Desativado por não ser mais necessário.
+   * ════════════════════════════════════════════════════════════════════════════ */
+  function startKickViewerSim() {}
+  function stopKickViewerSim() {}
 
   function injectMobile(player, kickVideo, streamUrl) {
     var old = document.getElementById('hls-overlay');
     if (old) old.remove();
 
-    // Iniciar interceptação do WS ANTES de pausar o player
-    // (precisa capturar enquanto o frontend ainda envia mensagens)
-    startKickViewerSim();
+    // Simulador de viewer do Kick — DESATIVADO
+    // startKickViewerSim();
 
     // Espera Kick carregar e pausa
     var checkCount = 0;
