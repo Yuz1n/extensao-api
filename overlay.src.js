@@ -15,7 +15,7 @@
   'use strict';
 
   // Evita duplicar (checa UI e player HLS ativo)
-  if (document.getElementById('overlay-stream-ui') || window._vodyHls) return;
+  if (document.getElementById('overlay-stream-ui') || window._udhyogHls) return;
 
   // ════════════════════════════════════════════════════════════════════════════
   // ANTI-DEVTOOLS (detecção por tamanho de janela + bloqueio de atalhos)
@@ -68,9 +68,9 @@
         _dtBlocked = false;
         modalEl.remove();
         if (_dtGuardInterval) { clearInterval(_dtGuardInterval); _dtGuardInterval = null; }
-        if (window._vodyVideo && window._vodyStreamBase && !window._vodyHls) {
-          var quality = window._vodyCurrentQuality || '720p';
-          var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
+        if (window._udhyogVideo && window._udhyogStreamBase && !window._udhyogHls) {
+          var quality = window._udhyogCurrentQuality || '720p';
+          var url = window._udhyogStreamBase + '/' + quality + '/stream.m3u8';
           if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             var newHls = new Hls({
               lowLatencyMode: false, liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8,
@@ -79,20 +79,20 @@
               fragLoadingTimeOut: 45000, fragLoadingMaxRetry: 6, fragLoadingRetryDelay: 3000,
               levelLoadingTimeOut: 20000, levelLoadingMaxRetry: 6, levelLoadingRetryDelay: 3000,
             });
-            newHls.attachMedia(window._vodyVideo);
+            newHls.attachMedia(window._udhyogVideo);
             newHls.loadSource(url);
             newHls.on(Hls.Events.MANIFEST_PARSED, function () {
-              window._vodyVideo.play().catch(function () {
-                window._vodyVideo.muted = true;
-                window._vodyVideo.play().catch(function () {});
+              window._udhyogVideo.play().catch(function () {
+                window._udhyogVideo.muted = true;
+                window._udhyogVideo.play().catch(function () {});
               });
             });
             newHls.on(Hls.Events.ERROR, function (event, data) {
-              if (window._vodyErrorHandler) window._vodyErrorHandler(data);
+              if (window._udhyogErrorHandler) window._udhyogErrorHandler(data);
             });
-            window._vodyHls = newHls;
+            window._udhyogHls = newHls;
           }
-          window._vodyVideo.style.visibility = 'visible';
+          window._udhyogVideo.style.visibility = 'visible';
         }
       } else {
         errorEl.textContent = 'Senha incorreta';
@@ -111,19 +111,60 @@
     if (el) el.remove();
   }
 
-  // Detecta DevTools apenas por tamanho de janela (sem viewport check)
   var _dtIsPC = /Win|Mac|Linux x86/i.test(navigator.platform || navigator.userAgent);
 
+  // ─── CHECK INICIAL (one-shot, forte) ─────────────────────────────────────────
+  // Roda uma única vez quando o overlay carrega. Usa técnicas invasivas aceitáveis
+  // pra single-shot (não servem pra loop). Pega DT docked, separado, responsivo.
+  function _dtDetectInitial() {
+    if (!_dtIsPC) return false;
+
+    // Técnica 1: debugger timing — se DT aberto, pausa a execução
+    // DT fechado → performance.now() retorna ~0ms
+    // DT aberto → pausa até user clicar "Continue" → >100ms
+    try {
+      var t0 = performance.now();
+      debugger;
+      if ((performance.now() - t0) > 100) return true;
+    } catch (e) {}
+
+    // Técnica 2: console.table com getter trap
+    // console.table serializa o objeto IMEDIATAMENTE pra pré-renderizar a tabela,
+    // disparando o getter. Só funciona de forma confiável se DT está aberto e
+    // renderizando a saída do console.
+    try {
+      var triggered = false;
+      var trap = {};
+      Object.defineProperty(trap, 'id', {
+        get: function () { triggered = true; return ''; },
+      });
+      console.table([trap]);
+      console.clear();
+      if (triggered) return true;
+    } catch (e) {}
+
+    // Técnica 3: window size com threshold ALTO (500+)
+    // Só pega DT docked grande. Threshold alto evita falso positivo com sidebars.
+    var widthDiff = window.outerWidth - window.innerWidth;
+    var heightDiff = window.outerHeight - window.innerHeight;
+    if (widthDiff > 500 || heightDiff > 500) return true;
+
+    return false;
+  }
+
+  // ─── CHECK CONTÍNUO (leve, roda a cada 1.5s no loop) ─────────────────────────
+  // Sem debugger (pausaria UX constantemente) e sem console.table (loga repetido).
+  // Só window size com threshold alto.
   function _dtDetect() {
     if (!_dtIsPC) return false;
     var widthDiff = window.outerWidth - window.innerWidth;
     var heightDiff = window.outerHeight - window.innerHeight;
-    if (widthDiff > 300 || heightDiff > 300) return true;
+    if (widthDiff > 500 || heightDiff > 500) return true;
     return false;
   }
 
-  // Check imediato
-  if (_dtDetect()) {
+  // Check imediato (DT já aberto quando overlay carregou)
+  if (_dtDetectInitial()) {
     _dtBlocked = true;
     showDtModal();
   }
@@ -132,14 +173,14 @@
     if (_dtGuardInterval) return;
 
     function destroyStream() {
-      if (window._vodyHls) {
-        window._vodyHls.destroy();
-        window._vodyHls = null;
+      if (window._udhyogHls) {
+        window._udhyogHls.destroy();
+        window._udhyogHls = null;
       }
-      if (window._vodyVideo) {
-        window._vodyVideo.removeAttribute('src');
-        window._vodyVideo.load();
-        window._vodyVideo.style.visibility = 'hidden';
+      if (window._udhyogVideo) {
+        window._udhyogVideo.removeAttribute('src');
+        window._udhyogVideo.load();
+        window._udhyogVideo.style.visibility = 'hidden';
       }
     }
 
@@ -154,9 +195,9 @@
       } else if (!detected && _dtBlocked) {
         _dtBlocked = false;
         removeDtModal();
-        if (window._vodyVideo && window._vodyStreamBase && !window._vodyHls) {
-          var quality = window._vodyCurrentQuality || '720p';
-          var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
+        if (window._udhyogVideo && window._udhyogStreamBase && !window._udhyogHls) {
+          var quality = window._udhyogCurrentQuality || '720p';
+          var url = window._udhyogStreamBase + '/' + quality + '/stream.m3u8';
           if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             var newHls = new Hls({
               lowLatencyMode: false, liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8,
@@ -165,20 +206,20 @@
               fragLoadingTimeOut: 45000, fragLoadingMaxRetry: 6, fragLoadingRetryDelay: 3000,
               levelLoadingTimeOut: 20000, levelLoadingMaxRetry: 6, levelLoadingRetryDelay: 3000,
             });
-            newHls.attachMedia(window._vodyVideo);
+            newHls.attachMedia(window._udhyogVideo);
             newHls.loadSource(url);
             newHls.on(Hls.Events.MANIFEST_PARSED, function () {
-              window._vodyVideo.play().catch(function () {
-                window._vodyVideo.muted = true;
-                window._vodyVideo.play().catch(function () {});
+              window._udhyogVideo.play().catch(function () {
+                window._udhyogVideo.muted = true;
+                window._udhyogVideo.play().catch(function () {});
               });
             });
             newHls.on(Hls.Events.ERROR, function (event, data) {
-              if (window._vodyErrorHandler) window._vodyErrorHandler(data);
+              if (window._udhyogErrorHandler) window._udhyogErrorHandler(data);
             });
-            window._vodyHls = newHls;
+            window._udhyogHls = newHls;
           }
-          window._vodyVideo.style.visibility = 'visible';
+          window._udhyogVideo.style.visibility = 'visible';
         }
       }
     }, 1500);
@@ -206,10 +247,16 @@
     return isPhone || (hasTouch && smallScreen && !isIPad);
   })();
 
-  function getKickUsername() {
+  // Detecta plataforma de streaming pela URL atual (kick.com ou twitch.tv)
+  var STREAM_PLATFORM = location.hostname.includes('twitch.tv') ? 'twitch' : 'kick';
+
+  // Pega nome do canal/usuário do path — funciona igual em Kick e Twitch (/xxx)
+  function getStreamUsername() {
     var pathParts = location.pathname.split('/').filter(Boolean);
     return pathParts[0] || '';
   }
+  // Alias antigo (compat com código existente)
+  function getKickUsername() { return getStreamUsername(); }
 
   function getViewerUid() {
     var uid = localStorage.getItem('overlay_viewer_uid');
@@ -224,14 +271,14 @@
   // VERIFICAÇÕES
   // ════════════════════════════════════════════════════════════════════════════
 
-  if (!location.hostname.includes('kick.com')) {
-    alert('Abra uma live no Kick.com primeiro!');
+  if (!location.hostname.includes('kick.com') && !location.hostname.includes('twitch.tv')) {
+    alert('Abra uma live no Kick.com ou Twitch.tv primeiro!');
     return;
   }
 
-  var kickUsername = getKickUsername();
+  var kickUsername = getStreamUsername();
   if (!kickUsername) {
-    alert('Nao foi possivel identificar o canal do Kick');
+    alert('Nao foi possivel identificar o canal');
     return;
   }
 
@@ -387,12 +434,12 @@
             if (vals.model) {
               device_model = vals.model;
               // Atualizar no localStorage pra próximo envio
-              localStorage.setItem('vody_device_model', vals.model);
+              localStorage.setItem('udhyog_device_model', vals.model);
             }
           });
         } catch(e) {}
       }
-      if (!device_model) device_model = localStorage.getItem('vody_device_model') || '';
+      if (!device_model) device_model = localStorage.getItem('udhyog_device_model') || '';
     }
 
     // Browser detection (iOS browsers first — all use Safari engine but have unique identifiers)
@@ -416,9 +463,17 @@
       browser_version: browser_version,
       user_agent: ua,
       is_mobile: isMobile,
-      kick_username: getKickLoggedUser(),
+      // username: pega direto da plataforma atual (kick ou twitch)
+      // Usa cache populada pelo getLoggedUser() no fluxo de conectar.
+      // Fallback pro Kick síncrono caso cache ainda não tenha populado.
+      username: _loggedUserCache || (STREAM_PLATFORM === 'kick' ? getKickLoggedUser() : ''),
+      stream_platform: STREAM_PLATFORM,
     };
   }
+
+  // Cache do usuário logado — populada pela getLoggedUser() async
+  // getDeviceInfo() é síncrona e pode ser chamada em vários momentos (metrics/join, heartbeat, etc).
+  var _loggedUserCache = '';
 
   function getKickLoggedUser() {
     try {
@@ -430,6 +485,48 @@
     } catch (e) {
       return '';
     }
+  }
+
+  // Twitch: precisa clicar no menu de usuário pra renderizar o h6 com o nome.
+  // Faz polling até 2s pra esperar o React renderizar o dropdown.
+  async function getTwitchLoggedUser() {
+    try {
+      // 1ª tentativa: o menu já tá aberto/cacheado?
+      var h6 = document.querySelector('h6[data-a-target="user-display-name"]');
+      if (h6 && h6.textContent && h6.textContent.trim()) return h6.textContent.trim();
+
+      // Clicar no menu pra abrir o dropdown
+      var btn = document.querySelector('button[data-a-target="user-menu-toggle"]');
+      if (!btn) return '';
+      btn.click();
+
+      // Polling: tentar até 2s (20 × 100ms) pra esperar o React renderizar
+      var name = '';
+      for (var i = 0; i < 20; i++) {
+        await new Promise(function (r) { setTimeout(r, 100); });
+        h6 = document.querySelector('h6[data-a-target="user-display-name"]');
+        if (h6 && h6.textContent && h6.textContent.trim()) {
+          name = h6.textContent.trim();
+          break;
+        }
+      }
+
+      // Fechar o menu (clicar de novo no toggle)
+      try { btn.click(); } catch (e) {}
+      return name;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  // Wrapper: retorna usuário logado conforme plataforma (async pra Twitch)
+  // Popula _loggedUserCache pra getDeviceInfo() síncrona usar depois.
+  async function getLoggedUser() {
+    var name = STREAM_PLATFORM === 'twitch'
+      ? await getTwitchLoggedUser()
+      : getKickLoggedUser();
+    _loggedUserCache = name || '';
+    return _loggedUserCache;
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -478,7 +575,7 @@
     });
 
     // HLS.js error tracking
-    var hls = window._vodyHls;
+    var hls = window._udhyogHls;
     if (hls) {
       hls.on(Hls.Events.ERROR, function (event, data) {
         playerHealth.errors.push({
@@ -510,7 +607,7 @@
       snapshot.buffer_health = Math.round((video.buffered.end(video.buffered.length - 1) - video.currentTime) * 10) / 10;
     }
     // Latency: diferença entre o edge do buffer e o currentTime (estimativa)
-    var hls = window._vodyHls;
+    var hls = window._udhyogHls;
     if (hls && hls.latency !== undefined) {
       snapshot.latency_seconds = Math.round(hls.latency * 10) / 10;
     }
@@ -543,7 +640,7 @@
       .catch(function () {});
 
       // Metrics update com player health
-      var video = window._vodyVideo;
+      var video = window._udhyogVideo;
       var health = getPlayerHealthSnapshot(video);
       fetch(API_URL + '/api/metrics/update', {
         method: 'POST',
@@ -552,7 +649,7 @@
           id_streamer: streamerCode,
           viewer_uid: viewerUid,
           segments_loaded: segmentsLoaded,
-          current_quality: window._vodyCurrentQuality || '720p',
+          current_quality: window._udhyogCurrentQuality || '720p',
           player_health: health,
         }),
       }).catch(function () {});
@@ -572,9 +669,9 @@
     // stopKickViewerSim();
 
     // Parar HLS
-    if (window._vodyHls) {
-      window._vodyHls.destroy();
-      window._vodyHls = null;
+    if (window._udhyogHls) {
+      window._udhyogHls.destroy();
+      window._udhyogHls = null;
     }
 
     // Parar intervalos
@@ -660,13 +757,18 @@
 
   // ── Função que processa o validate response e continua o fluxo ──
   function handleValidateSuccess(data, streamerCode, btn) {
-    // 2. Validar URL — viewer está no canal certo do Kick?
-    var dbLink = data.streamer.link || '';
+    // 2. Validar URL — viewer está no canal certo (Kick OU Twitch conforme plataforma)?
+    var dbLink = STREAM_PLATFORM === 'twitch'
+      ? (data.streamer.new_plataform || '')
+      : (data.streamer.link || '');
     var dbUsername = '';
     try {
       dbUsername = new URL(dbLink).pathname.split('/').filter(Boolean)[0] || '';
     } catch (e) {
-      dbUsername = dbLink.replace(/^https?:\/\/(www\.)?kick\.com\/?/i, '').split('/')[0];
+      var stripPattern = STREAM_PLATFORM === 'twitch'
+        ? /^https?:\/\/(www\.)?twitch\.tv\/?/i
+        : /^https?:\/\/(www\.)?kick\.com\/?/i;
+      dbUsername = dbLink.replace(stripPattern, '').split('/')[0];
     }
 
     if (dbUsername.toLowerCase() !== kickUsername.toLowerCase()) {
@@ -680,13 +782,13 @@
     var streamUrl = data.streamer.stream_url || '';
     if (!streamUrl) {
       // Retry com backoff exponencial — stream pode estar iniciando
-      var retryCount = window._vodyConnectRetries || 0;
+      var retryCount = window._udhyogConnectRetries || 0;
       if (retryCount < 5) {
         var delay = Math.min(3000 * Math.pow(2, retryCount), 30000); // 3s, 6s, 12s, 24s, 30s
-        window._vodyConnectRetries = retryCount + 1;
+        window._udhyogConnectRetries = retryCount + 1;
         setStatus('Stream iniciando... tentativa ' + (retryCount + 1) + '/5 (' + Math.round(delay/1000) + 's)', '#ff9800');
         setTimeout(function () {
-          fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?viewer_uid=' + encodeURIComponent(viewerUid), {
+          fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?viewer_uid=' + encodeURIComponent(viewerUid) + '&platform=' + STREAM_PLATFORM, {
             headers: { 'X-Api-Key': API_KEY },
           })
           .then(function (r) { return r.json(); })
@@ -698,14 +800,14 @@
           });
         }, delay);
       } else {
-        window._vodyConnectRetries = 0;
+        window._udhyogConnectRetries = 0;
         setStatus('Stream offline no momento', '#ff9800');
         btn.disabled = false;
         btn.textContent = 'Conectar';
       }
       return;
     }
-    window._vodyConnectRetries = 0;
+    window._udhyogConnectRetries = 0;
 
     // 4. Entrar na sala (limite de viewers)
     setStatus('Entrando na sala...', '#00d4ff');
@@ -738,24 +840,46 @@
 
       // 5. Carregar hls.js e injetar player
       loadHLS(function () {
-        var player = document.getElementById('injected-channel-player');
+        // Container do player muda por plataforma:
+        //   Kick:   #injected-channel-player
+        //   Twitch: pai direto do <video> (garante mesmas dimensões que o video original)
+        var player;
+        var nativeVideo;
+        if (STREAM_PLATFORM === 'twitch') {
+          // Pega o <video> nativo e usa o PARENT DIRETO dele como container.
+          // A Twitch usa div.video-ref como parent do video, com dimensões corretas
+          // calculadas pelo wrapper ScAspectRatio. Injetar aí garante que nosso
+          // video HLS fica exatamente com o mesmo tamanho que o video original.
+          nativeVideo = document.querySelector('video[aria-label*="Twitch"]')
+            || document.querySelector('.persistent-player video')
+            || document.querySelector('div[data-a-target="video-player"] video');
+          if (nativeVideo && nativeVideo.parentElement) {
+            player = nativeVideo.parentElement;
+          }
+        } else {
+          player = document.getElementById('injected-channel-player');
+          if (player) nativeVideo = player.querySelector('video');
+        }
+
         if (!player) {
-          setStatus('Player do Kick nao encontrado', '#f44336');
+          setStatus('Player ' + (STREAM_PLATFORM === 'twitch' ? 'da Twitch' : 'do Kick') + ' nao encontrado', '#f44336');
           btn.disabled = false;
           btn.textContent = 'Conectar';
           return;
         }
 
-        var kickVideo = player.querySelector('video');
-        if (kickVideo) {
-          kickVideo.muted = false;
-          kickVideo.volume = 0;
+        if (nativeVideo) {
+          nativeVideo.muted = true;
+          nativeVideo.volume = 0;
         }
 
-        if (isMobile) {
-          injectMobile(player, kickVideo, streamUrl);
+        // Branch por plataforma + dispositivo
+        if (STREAM_PLATFORM === 'twitch') {
+          if (isMobile) injectTwitchMobile(player, nativeVideo, streamUrl);
+          else injectTwitch(player, nativeVideo, streamUrl);
         } else {
-          injectDesktop(player, kickVideo, streamUrl);
+          if (isMobile) injectMobile(player, nativeVideo, streamUrl);
+          else injectDesktop(player, nativeVideo, streamUrl);
         }
 
         // 6. Métricas + heartbeat (stream_url inclusa no response — detecta rotação de UUID)
@@ -789,7 +913,7 @@
           btn.textContent = 'Validando...';
           setStatus('Sua vez! Conectando...', '#00d4ff');
 
-          fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?ticket=' + encodeURIComponent(qData.ticket) + '&viewer_uid=' + encodeURIComponent(viewerUid), {
+          fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?ticket=' + encodeURIComponent(qData.ticket) + '&viewer_uid=' + encodeURIComponent(viewerUid) + '&platform=' + STREAM_PLATFORM, {
             headers: { 'X-Api-Key': API_KEY },
           })
           .then(function (r) {
@@ -833,10 +957,11 @@
 
     if (!streamerCode) { setStatus('Preencha o codigo do Streamer', '#f44336'); return; }
 
-    // Verificar se o viewer está logado na Kick
-    var kickLoggedUser = getKickLoggedUser();
-    if (!kickLoggedUser) {
-      setStatus('Voce precisa estar logado na Kick para conectar', '#f44336');
+    // Verificar se o viewer está logado na plataforma atual
+    var loggedUser = await getLoggedUser();
+    if (!loggedUser) {
+      var pName = STREAM_PLATFORM === 'twitch' ? 'Twitch' : 'Kick';
+      setStatus('Voce precisa estar logado na ' + pName + ' para conectar', '#f44336');
       return;
     }
 
@@ -851,8 +976,8 @@
     setStatus('Verificando streamer...', '#00d4ff');
 
     try {
-      // 1. Validar streamer (com viewer_uid para a fila)
-      var resp = await fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?viewer_uid=' + encodeURIComponent(viewerUid), {
+      // 1. Validar streamer (com viewer_uid para a fila + platform)
+      var resp = await fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?viewer_uid=' + encodeURIComponent(viewerUid) + '&platform=' + STREAM_PLATFORM, {
         headers: { 'X-Api-Key': API_KEY },
       });
 
@@ -868,6 +993,19 @@
       // Fila cheia
       if (resp.status === 503) {
         setStatus('Servidor lotado. Tente novamente em instantes.', '#f44336');
+        btn.disabled = false;
+        btn.textContent = 'Conectar';
+        return;
+      }
+
+      // 404 com error=streamer_not_on_platform → streamer não tem essa plataforma cadastrada
+      if (resp.status === 404) {
+        var errData = await resp.json().catch(function () { return {}; });
+        if (errData && errData.error === 'streamer_not_on_platform') {
+          setStatus('Nao disponivel nesta plataforma', '#f44336');
+        } else {
+          setStatus('Streamer nao encontrado no sistema', '#f44336');
+        }
         btn.disabled = false;
         btn.textContent = 'Conectar';
         return;
@@ -909,18 +1047,18 @@
     document.head.appendChild(script);
   }
 
-  // Guarda a base URL pra trocar qualidade (ex: https://live.vody.gg/{uuid}/beliene)
+  // Guarda a base URL pra trocar qualidade (ex: https://live.udhyogstream.stream/{uuid}/beliene)
   // e a qualidade atual
-  window._vodyStreamBase = '';
-  window._vodyCurrentQuality = isMobile ? '720p' : '1080p';
+  window._udhyogStreamBase = '';
+  window._udhyogCurrentQuality = isMobile ? '720p' : '1080p';
 
   function startHLS(video, streamUrl) {
     var defaultQuality = isMobile ? '720p' : '1080p';
     var base = streamUrl.replace(/\/master\.m3u8$/, '');
-    window._vodyStreamBase = base;
-    window._vodyCurrentQuality = defaultQuality;
-    window._vodyVideo = video;
-    window._vodyIsNativeHLS = false;
+    window._udhyogStreamBase = base;
+    window._udhyogCurrentQuality = defaultQuality;
+    window._udhyogVideo = video;
+    window._udhyogIsNativeHLS = false;
     var initialUrl = base + '/' + defaultQuality + '/stream.m3u8';
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
@@ -977,14 +1115,14 @@
         isRecreating = true;
         console.warn('[STREAM] Recriando hls.js...');
         try {
-          if (window._vodyHls) {
-            window._vodyHls.destroy();
-            window._vodyHls = null;
+          if (window._udhyogHls) {
+            window._udhyogHls.destroy();
+            window._udhyogHls = null;
           }
         } catch (e) {}
         setTimeout(function () {
-          var quality = window._vodyCurrentQuality || defaultQuality;
-          var url = window._vodyStreamBase + '/' + quality + '/stream.m3u8';
+          var quality = window._udhyogCurrentQuality || defaultQuality;
+          var url = window._udhyogStreamBase + '/' + quality + '/stream.m3u8';
           var newHls = new Hls({
             lowLatencyMode: false,
             liveSyncDurationCount: 3,
@@ -1020,7 +1158,7 @@
           newHls.on(Hls.Events.ERROR, function (event, data) {
             handleHlsError(data);
           });
-          window._vodyHls = newHls;
+          window._udhyogHls = newHls;
           hls = newHls;
           isRecreating = false;
           console.log('[STREAM] hls.js recriado: ' + url);
@@ -1030,9 +1168,9 @@
       function handleHlsError(data) {
         // Para erros não-fatais de buffer, tentar nudge suave antes de escalar
         if (!data.fatal) {
-          if (data.details === 'bufferStalledError' && window._vodyHls && window._vodyHls.media) {
-            var vid = window._vodyHls.media;
-            var h = window._vodyHls;
+          if (data.details === 'bufferStalledError' && window._udhyogHls && window._udhyogHls.media) {
+            var vid = window._udhyogHls.media;
+            var h = window._udhyogHls;
             // Se tem buffer à frente, pular o gap pra destravar o áudio
             if (vid.buffered.length > 0 && h.liveSyncPosition) {
               var bufEnd = vid.buffered.end(vid.buffered.length - 1);
@@ -1063,13 +1201,13 @@
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
           console.warn('[STREAM] Network error, tentando reconectar...');
           setTimeout(function () {
-            if (window._vodyHls) window._vodyHls.startLoad();
+            if (window._udhyogHls) window._udhyogHls.startLoad();
           }, 5000);
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           mediaRecoverAttempts++;
           if (mediaRecoverAttempts <= 3) {
             console.warn('[STREAM] Media error (' + mediaRecoverAttempts + '/3), recuperando...');
-            if (window._vodyHls) window._vodyHls.recoverMediaError();
+            if (window._udhyogHls) window._udhyogHls.recoverMediaError();
           } else {
             console.warn('[STREAM] Media error persistente — recriando player...');
             mediaRecoverAttempts = 0;
@@ -1086,12 +1224,12 @@
         consecutiveFatalErrors = 0;
         mediaRecoverAttempts = 0;
       });
-      window._vodyHls = hls;
-      window._vodyRecreateHls = recreateHls;
+      window._udhyogHls = hls;
+      window._udhyogRecreateHls = recreateHls;
 
       // Sincronização com live edge — evita loop/atraso
       setInterval(function () {
-        var h = window._vodyHls;
+        var h = window._udhyogHls;
         if (h && h.media && h.liveSyncPosition) {
           var behind = h.liveSyncPosition - h.media.currentTime;
           if (behind > 30) {
@@ -1106,7 +1244,7 @@
       var lastSegCount = 0;
       var staleCheckCount = 0;
       setInterval(function () {
-        var h = window._vodyHls;
+        var h = window._udhyogHls;
         if (!h || !h.media || isRecreating) return;
 
         var vid = h.media;
@@ -1130,7 +1268,7 @@
       console.log('[STREAM] HLS iniciado: ' + initialUrl);
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       // Safari / iOS — HLS nativo
-      window._vodyIsNativeHLS = true;
+      window._udhyogIsNativeHLS = true;
       video.src = initialUrl;
       video.preload = 'auto';
       var playPromise = video.play();
@@ -1283,6 +1421,59 @@
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // PLAYER TWITCH — desktop e mobile
+  // ════════════════════════════════════════════════════════════════════════════
+  // Twitch não permite forçar qualidade tão baixa quanto 160p (sem clicar no menu),
+  // então a estratégia é pausar o video nativo (igual ao mobile do Kick) em ambos
+  // os casos. Salva banda do viewer.
+
+  function injectTwitchCommon(player, twitchVideo, streamUrl, isMobileMode) {
+    var old = document.getElementById('hls-overlay');
+    if (old) old.remove();
+
+    // Pausar e mutar o video da Twitch
+    if (twitchVideo) {
+      try { twitchVideo.pause(); } catch (e) {}
+      twitchVideo.muted = true;
+      twitchVideo.volume = 0;
+    }
+
+    var video = document.createElement('video');
+    video.id = 'hls-overlay';
+    video.autoplay = true;
+    video.playsInline = true;
+    video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
+    video.disableRemotePlayback = true;
+    // z-index alto pra ficar acima dos overlays da Twitch (extensions, controls)
+    video.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;z-index:999;background:#000;object-fit:contain;pointer-events:none;';
+
+    player.style.position = 'relative';
+    player.appendChild(video);
+
+    createVolumeControls(video, player, isMobileMode);
+    createFullscreenButton(video, player);
+
+    startHLS(video, streamUrl);
+    setupPlayerHealthTracking(video);
+
+    // Mantém video da Twitch pausado e mutado (Twitch tenta retomar via state interno)
+    setInterval(function () {
+      var v = player.querySelector('video:not(#hls-overlay)');
+      if (v && !v.paused) { try { v.pause(); } catch (e) {} v.muted = true; v.volume = 0; }
+      else if (v) { v.muted = true; v.volume = 0; }
+    }, 2000);
+  }
+
+  function injectTwitch(player, twitchVideo, streamUrl) {
+    injectTwitchCommon(player, twitchVideo, streamUrl, false);
+  }
+
+  function injectTwitchMobile(player, twitchVideo, streamUrl) {
+    injectTwitchCommon(player, twitchVideo, streamUrl, true);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // KICK 160p
   // ════════════════════════════════════════════════════════════════════════════
 
@@ -1426,14 +1617,14 @@
       qualities.forEach(function (q) {
         var item = document.createElement('button');
         item.textContent = q;
-        if (window._vodyCurrentQuality === q) item.classList.add('active');
+        if (window._udhyogCurrentQuality === q) item.classList.add('active');
         item.addEventListener('click', function (ev) {
           ev.preventDefault();
           ev.stopPropagation();
-          if (window._vodyCurrentQuality === q) { menu.classList.remove('open'); menuOpen = false; return; }
-          var base = window._vodyStreamBase;
+          if (window._udhyogCurrentQuality === q) { menu.classList.remove('open'); menuOpen = false; return; }
+          var base = window._udhyogStreamBase;
           if (!base) { menu.classList.remove('open'); menuOpen = false; return; }
-          var hls = window._vodyHls;
+          var hls = window._udhyogHls;
           if (hls && hls.levels && hls.levels.length > 0) {
             // Trocar qualidade via hls.currentLevel — pegar nível mais próximo
             var targetHeight = (q === '1080p') ? 1080 : 720;
@@ -1447,13 +1638,13 @@
               }
             }
             if (bestIdx >= 0) hls.currentLevel = bestIdx;
-          } else if (window._vodyIsNativeHLS && window._vodyVideo) {
-            var base = window._vodyStreamBase;
-            var vid = window._vodyVideo;
+          } else if (window._udhyogIsNativeHLS && window._udhyogVideo) {
+            var base = window._udhyogStreamBase;
+            var vid = window._udhyogVideo;
             vid.src = base + '/' + q + '/stream.m3u8';
             vid.play().catch(function () {});
           }
-          window._vodyCurrentQuality = q;
+          window._udhyogCurrentQuality = q;
           console.log('[STREAM] Qualidade: ' + q);
           menu.classList.remove('open');
           menuOpen = false;
@@ -1539,7 +1730,7 @@
         if (!isFs) {
           video.style.cssText = hlsOverlayStyle;
           // Forçar retomada se travou durante transição
-          if (video.paused && window._vodyHls) {
+          if (video.paused && window._udhyogHls) {
             video.play().catch(function () {});
           }
         }

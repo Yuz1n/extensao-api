@@ -97,7 +97,7 @@ const CDN_DOMAIN = process.env.CDN_DOMAIN || 'live.udhyogstream.stream';
 // ── ID da extensão na Chrome Web Store ──
 const EXTENSION_ID = process.env.EXTENSION_ID || 'cgpdaogbcjjfmnoeacopegocjpcfcikf';
 
-// ── CORS (extensão, squareweb e kick.com para o bookmarklet) ──
+// ── CORS (extensão, squareweb, kick.com e twitch.tv para o bookmarklet) ──
 app.use(cors({
   origin: (origin, callback) => {
     const allowedOrigins = [
@@ -105,7 +105,8 @@ app.use(cors({
     ];
     if (!origin || allowedOrigins.includes(origin)
         || (origin.endsWith('.squareweb.app') || origin === 'https://squareweb.app')
-        || (origin.endsWith('.kick.com') || origin === 'https://kick.com')) {
+        || (origin.endsWith('.kick.com') || origin === 'https://kick.com')
+        || (origin.endsWith('.twitch.tv') || origin === 'https://twitch.tv')) {
       callback(null, true);
     } else {
       console.warn(`[CORS] Bloqueado: ${origin}`);
@@ -169,7 +170,10 @@ function requireApiKey(req, res, next) {
     return res.status(403).json({ message: 'Acesso negado' });
   }
 
-  if (origin && !origin.includes(EXTENSION_ID) && !(origin.endsWith('.squareweb.app') || origin === 'https://squareweb.app') && !(origin.endsWith('.kick.com') || origin === 'https://kick.com')) {
+  if (origin && !origin.includes(EXTENSION_ID)
+      && !(origin.endsWith('.squareweb.app') || origin === 'https://squareweb.app')
+      && !(origin.endsWith('.kick.com') || origin === 'https://kick.com')
+      && !(origin.endsWith('.twitch.tv') || origin === 'https://twitch.tv')) {
     console.warn(`[AUTH] Origin invalida: ${origin}`);
     return res.status(403).json({ message: 'Acesso negado' });
   }
@@ -564,7 +568,7 @@ async function initDB() {
         id SERIAL PRIMARY KEY,
         live_id INTEGER REFERENCES lives(id) ON DELETE CASCADE,
         ip VARCHAR(100) NOT NULL,
-        kick_username VARCHAR(255) DEFAULT '',
+        username VARCHAR(255) DEFAULT '',
         platform VARCHAR(50) DEFAULT 'unknown',
         os VARCHAR(50) DEFAULT 'unknown',
         os_version VARCHAR(50) DEFAULT '',
@@ -607,6 +611,30 @@ async function initDB() {
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT false`);
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS billing_type VARCHAR(20) DEFAULT 'view_hours'`);
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS fixed_weekly_value REAL DEFAULT 0`);
+
+    // Multi-plataforma: link Twitch opcional + métricas separadas por plataforma
+    // Coluna 'platform' já existia em live_viewer_sessions (guarda OS), por isso usamos 'stream_platform'
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS new_plataform VARCHAR(255)`);
+    await pool.query(`ALTER TABLE live_viewer_sessions ADD COLUMN IF NOT EXISTS stream_platform VARCHAR(20) DEFAULT 'kick'`);
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS unique_kick INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS unique_twitch INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_kick REAL DEFAULT 0`);
+    await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_twitch REAL DEFAULT 0`);
+
+    // Renomear kick_username → username (idempotente — só roda se kick_username ainda existe e username não)
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'live_viewer_sessions' AND column_name = 'kick_username')
+           AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'live_viewer_sessions' AND column_name = 'username') THEN
+          ALTER TABLE live_viewer_sessions RENAME COLUMN kick_username TO username;
+        END IF;
+      END $$;
+    `);
+    // Garantir que a coluna username existe (caso nem kick_username nem username existissem)
+    await pool.query(`ALTER TABLE live_viewer_sessions ADD COLUMN IF NOT EXISTS username VARCHAR(255) DEFAULT ''`);
 
     // Índices para queries rápidas
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_lives_streamer ON lives(id_streamer)`);
@@ -710,15 +738,15 @@ app.get('/api/streamer/me/lives/:live_id', requireAuth, async (req, res) => {
     }
 
     const viewersResult = await pool.query(
-      `SELECT kick_username, platform, browser, is_mobile, total_seconds, segments_loaded, estimated_mb,
-              quality_history, joined_at, last_seen
+      `SELECT username, platform, browser, is_mobile, total_seconds, segments_loaded, estimated_mb,
+              quality_history, joined_at, last_seen, stream_platform
        FROM live_viewer_sessions WHERE live_id = $1 ORDER BY joined_at ASC`,
       [live_id]
     );
 
     return res.json({
       live: liveResult.rows[0],
-      viewers: viewersResult.rows,
+      viewers: viewersResult.rows.map(v => ({ ...v, stream_platform: v.stream_platform || 'kick' })),
     });
   } catch (e) {
     console.error('[STREAMER] Erro live detail:', e.message);
@@ -1174,8 +1202,37 @@ app.get('/api/queue/status/:id_streamer', requireApiKey, (req, res) => {
 });
 
 // ── GET /api/streamer/validate/:id_streamer ──
+// Query params:
+//   - platform=kick|twitch  → plataforma onde o overlay está rodando
+// O :id_streamer SEMPRE é o id_streamer do banco (o código que o viewer digita no overlay).
+// Se a plataforma não tem o link correspondente cadastrado (link pra Kick, new_plataform
+// pra Twitch), retorna erro específico `streamer_not_on_platform`.
+// A validação da URL (kick.com/xxx vs twitch.tv/yyy) é feita no próprio overlay,
+// comparando com data.streamer.link ou data.streamer.new_plataform.
 app.get('/api/streamer/validate/:id_streamer', requireApiKey, async (req, res) => {
   const id_streamer = req.params.id_streamer.toLowerCase();
+  const platform = (req.query.platform || 'kick').toLowerCase();
+
+  // Verificar se o streamer tem link da plataforma atual cadastrado.
+  // Sem isso, o overlay não deve rodar nessa plataforma pra esse streamer.
+  if (platform === 'kick' || platform === 'twitch') {
+    const streamerCheck = await getCachedStreamer(id_streamer);
+    if (streamerCheck) {
+      const linkField = platform === 'twitch' ? 'new_plataform' : 'link';
+      const linkValue = streamerCheck[linkField];
+      if (!linkValue || !String(linkValue).trim()) {
+        console.log(`[VALIDATE] ${platform} bloqueado: streamer "${id_streamer}" sem ${linkField} cadastrado`);
+        return res.status(404).json({
+          valid: false,
+          error: 'streamer_not_on_platform',
+          message: 'Streamer não disponível nesta plataforma',
+          platform: platform
+        });
+      }
+    }
+    // Se streamerCheck for null (id_streamer inexistente), cai no fluxo normal
+    // que retorna 404 "Streamer nao encontrado" no processValidate
+  }
 
   // ── Bypass 1: Path check de viewer já conectado (não enfileira) ──
   if (req.query.mode === 'pathcheck') {
@@ -1233,7 +1290,7 @@ let streamerCacheLoaded = false;
 
 async function loadStreamerCache() {
   const result = await pool.query(
-    'SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx FROM streamer'
+    'SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, new_plataform, is_blocked FROM streamer'
   );
   // Limpar cache antes de recarregar
   for (const key in streamerCache) delete streamerCache[key];
@@ -1449,7 +1506,7 @@ app.get('/api/viewer/count/:id_streamer', requireApiKey, async (req, res) => {
 app.get('/api/streamers', requireApiKeyOrAuth, async (req, res) => {
   try {
     console.log('[LIST] Listando todos os streamers');
-    const result = await pool.query('SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, commission, login, value_per_view_hour FROM streamer ORDER BY id');
+    const result = await pool.query('SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, commission, login, value_per_view_hour, new_plataform FROM streamer ORDER BY id');
 
     // Adicionar contagem de viewers ativos a cada streamer
     const streamers = result.rows.map(s => ({
@@ -1468,8 +1525,8 @@ app.get('/api/streamers', requireApiKeyOrAuth, async (req, res) => {
 // ── POST /api/streamer (admin) ──
 app.post('/api/streamer', requireApiKeyOrAuth, async (req, res) => {
   try {
-    const { user, link, id_streamer, max_spectators, id_mediamtx, login, senha, value_per_view_hour } = req.body;
-    console.log(`[CREATE] Cadastrando streamer: user="${user}", id_streamer="${id_streamer}", max=${max_spectators || 0}, mediamtx="${id_mediamtx || ''}", login="${login || ''}"`);
+    const { user, link, id_streamer, max_spectators, id_mediamtx, login, senha, value_per_view_hour, new_plataform } = req.body;
+    console.log(`[CREATE] Cadastrando streamer: user="${user}", id_streamer="${id_streamer}", max=${max_spectators || 0}, mediamtx="${id_mediamtx || ''}", login="${login || ''}", twitch="${new_plataform || ''}"`);
 
     if (!user || !id_streamer) {
       return res.status(400).json({ message: 'Campos "user" e "id_streamer" sao obrigatorios' });
@@ -1478,8 +1535,8 @@ app.post('/api/streamer', requireApiKeyOrAuth, async (req, res) => {
     const hashedSenha = senha ? await bcrypt.hash(senha, 10) : null;
 
     const result = await pool.query(
-      'INSERT INTO streamer ("user", link, id_streamer, max_spectators, id_mediamtx, login, senha, value_per_view_hour) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [user, link || null, id_streamer, max_spectators || 0, id_mediamtx || null, login || null, hashedSenha, value_per_view_hour || 0]
+      'INSERT INTO streamer ("user", link, id_streamer, max_spectators, id_mediamtx, login, senha, value_per_view_hour, new_plataform) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
+      [user, link || null, id_streamer, max_spectators || 0, id_mediamtx || null, login || null, hashedSenha, value_per_view_hour || 0, new_plataform || null]
     );
 
     console.log(`[CREATE] Streamer cadastrado com sucesso: ID ${result.rows[0].id}`);
@@ -1499,7 +1556,7 @@ app.post('/api/streamer', requireApiKeyOrAuth, async (req, res) => {
 app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { id_streamer } = req.params;
-    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour, billing_type, fixed_weekly_value } = req.body;
+    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour, billing_type, fixed_weekly_value, new_plataform } = req.body;
 
     console.log(`[UPDATE] Atualizando streamer: "${id_streamer}" body:`, JSON.stringify(req.body));
 
@@ -1519,6 +1576,7 @@ app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
     if (value_per_view_hour !== undefined)  { fields.push(`value_per_view_hour = $${idx++}`);  values.push(value_per_view_hour); }
     if (billing_type !== undefined)         { fields.push(`billing_type = $${idx++}`);         values.push(billing_type); }
     if (fixed_weekly_value !== undefined)   { fields.push(`fixed_weekly_value = $${idx++}`);   values.push(fixed_weekly_value); }
+    if (new_plataform !== undefined)        { fields.push(`new_plataform = $${idx++}`);        values.push(new_plataform || null); }
 
     if (fields.length === 0) {
       return res.status(400).json({ message: 'Nenhum campo para atualizar' });
@@ -1788,6 +1846,10 @@ async function onLiveEnd(idStreamer) {
     const totalMobileSeconds = sessions.filter(s => s.is_mobile).reduce((sum, s) => sum + (s.total_seconds || 0), 0);
     const totalDesktopSeconds = totalWatchSeconds - totalMobileSeconds;
 
+    // Soma de watch seconds por plataforma (kick | twitch)
+    const totalKickSeconds = sessions.filter(s => (s.stream_platform || 'kick') === 'kick').reduce((sum, s) => sum + (s.total_seconds || 0), 0);
+    const totalTwitchSeconds = sessions.filter(s => s.stream_platform === 'twitch').reduce((sum, s) => sum + (s.total_seconds || 0), 0);
+
     const avgViewers = durationSeconds > 0
       ? Math.ceil((totalWatchSeconds / durationSeconds) * 10) / 10
       : 0;
@@ -1797,13 +1859,24 @@ async function onLiveEnd(idStreamer) {
     const avgViewersDesktop = durationSeconds > 0
       ? Math.ceil((totalDesktopSeconds / durationSeconds) * 10) / 10
       : 0;
+    const avgViewersKick = durationSeconds > 0
+      ? Math.ceil((totalKickSeconds / durationSeconds) * 10) / 10
+      : 0;
+    const avgViewersTwitch = durationSeconds > 0
+      ? Math.ceil((totalTwitchSeconds / durationSeconds) * 10) / 10
+      : 0;
 
-    // Contar viewers únicos mobile vs desktop (por IP)
+    // Contar viewers únicos mobile vs desktop (por IP) e por plataforma (kick vs twitch)
     const mobileIPs = new Set();
     const desktopIPs = new Set();
+    const kickIPs = new Set();
+    const twitchIPs = new Set();
     for (const s of Object.values(live.viewerSessions)) {
       if (s.is_mobile) mobileIPs.add(s.ip);
       else desktopIPs.add(s.ip);
+      // stream_platform default 'kick' (compatibilidade c/ sessions antigas sem o campo)
+      if (s.stream_platform === 'twitch') twitchIPs.add(s.ip);
+      else kickIPs.add(s.ip);
     }
 
     await pool.query(
@@ -1811,11 +1884,16 @@ async function onLiveEnd(idStreamer) {
        peak_viewers = $2, total_unique_viewers = $3, avg_viewers = $4,
        unique_mobile = $5, unique_desktop = $6,
        avg_viewers_mobile = $7, avg_viewers_desktop = $8,
-       status = 'ended' WHERE id = $9`,
-      [durationSeconds, live.peakViewers, uniqueIPs.size, avgViewers, mobileIPs.size, desktopIPs.size, avgViewersMobile, avgViewersDesktop, live.liveId]
+       unique_kick = $9, unique_twitch = $10,
+       avg_viewers_kick = $11, avg_viewers_twitch = $12,
+       status = 'ended' WHERE id = $13`,
+      [durationSeconds, live.peakViewers, uniqueIPs.size, avgViewers,
+       mobileIPs.size, desktopIPs.size, avgViewersMobile, avgViewersDesktop,
+       kickIPs.size, twitchIPs.size, avgViewersKick, avgViewersTwitch,
+       live.liveId]
     );
     await flushLiveViewerSessions(live);
-    logger.live(idStreamer, 'INFO', `[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} (M:${avgViewersMobile} D:${avgViewersDesktop}) | Únicos: ${uniqueIPs.size} (M:${mobileIPs.size} D:${desktopIPs.size})`);
+    logger.live(idStreamer, 'INFO', `[LIVE] Encerrada: ${idStreamer} → live #${live.liveId} | Peak: ${live.peakViewers} | Média: ${avgViewers} (M:${avgViewersMobile} D:${avgViewersDesktop} K:${avgViewersKick} T:${avgViewersTwitch}) | Únicos: ${uniqueIPs.size} (M:${mobileIPs.size} D:${desktopIPs.size} K:${kickIPs.size} T:${twitchIPs.size})`);
   } catch (e) {
     logger.live(idStreamer, 'ERROR', '[LIVE] Erro ao encerrar:', e.message);
   }
@@ -1844,19 +1922,20 @@ async function flushLiveViewerSessions(live) {
       const results = await Promise.allSettled(
         batch.map(([viewerUid, s]) =>
           pool.query(`
-            INSERT INTO live_viewer_sessions (live_id, ip, kick_username, platform, os, os_version, device_model, browser, browser_version, user_agent, is_mobile, joined_at, last_seen, total_seconds, segments_loaded, estimated_mb, quality_history, player_health, viewer_uid)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+            INSERT INTO live_viewer_sessions (live_id, ip, username, platform, os, os_version, device_model, browser, browser_version, user_agent, is_mobile, joined_at, last_seen, total_seconds, segments_loaded, estimated_mb, quality_history, player_health, viewer_uid, stream_platform)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
             ON CONFLICT (live_id, viewer_uid) DO UPDATE SET
-              kick_username = EXCLUDED.kick_username, last_seen = EXCLUDED.last_seen,
+              username = EXCLUDED.username, last_seen = EXCLUDED.last_seen,
               total_seconds = EXCLUDED.total_seconds, segments_loaded = EXCLUDED.segments_loaded,
               estimated_mb = EXCLUDED.estimated_mb, quality_history = EXCLUDED.quality_history,
-              player_health = EXCLUDED.player_health
+              player_health = EXCLUDED.player_health, stream_platform = EXCLUDED.stream_platform
           `, [
-            live.liveId, s.ip, s.kick_username || '', s.platform || 'unknown', s.os || 'unknown',
+            live.liveId, s.ip, s.username || '', s.platform || 'unknown', s.os || 'unknown',
             s.os_version || '', s.device_model || '', s.browser || 'unknown', s.browser_version || '',
             s.user_agent || '', s.is_mobile || false, s.joined_at, s.last_seen,
             s.total_seconds || 0, s.segments_loaded || 0, s.estimated_mb || 0,
             JSON.stringify(s.quality_history || []), JSON.stringify(s.player_health || {}), viewerUid,
+            s.stream_platform || 'kick',
           ])
         )
       );
@@ -1889,12 +1968,16 @@ function trackLiveViewer(idStreamer, viewerUid, deviceInfo, ip) {
   if (!live) return;
   if (!live.viewerSessions[viewerUid]) {
     const now = getBrazilTimestamp();
+    // stream_platform: kick | twitch (vem do overlay; fallback 'kick' por compat)
+    const sp = String(deviceInfo?.stream_platform || 'kick').toLowerCase();
     live.viewerSessions[viewerUid] = {
-      ip, kick_username: deviceInfo?.kick_username || '',
+      // Aceita 'username' (novo) com fallback pra 'kick_username' (compat com overlays antigos em cache)
+      ip, username: deviceInfo?.username || deviceInfo?.kick_username || '',
       platform: deviceInfo?.platform || 'unknown', os: deviceInfo?.os || 'unknown',
       os_version: deviceInfo?.os_version || '', device_model: deviceInfo?.device_model || '',
       browser: deviceInfo?.browser || 'unknown', browser_version: deviceInfo?.browser_version || '',
       user_agent: deviceInfo?.user_agent || '', is_mobile: deviceInfo?.is_mobile || false,
+      stream_platform: (sp === 'twitch' ? 'twitch' : 'kick'),
       joined_at: now, last_seen: now, _lastSeenMs: Date.now(),
       total_seconds: 0, segments_loaded: 0, estimated_mb: 0,
       quality_history: [], player_health: {},
@@ -1961,7 +2044,7 @@ app.post('/api/metrics/join', requireApiKey, (req, res) => {
       || req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown';
     trackLiveViewer(id_streamer, viewer_uid, device_info, ip);
     updateLivePeak(id_streamer);
-    logger.live(id_streamer, 'INFO', `[METRICS] Viewer ${ip} (${device_info?.kick_username || '?'}) entrou em ${id_streamer}`);
+    logger.live(id_streamer, 'INFO', `[METRICS] Viewer ${ip} (${device_info?.username || device_info?.kick_username || '?'}) entrou em ${id_streamer}`);
     return res.json({ tracked: true });
   } catch (e) {
     logger.live(id_streamer, 'ERROR', '[METRICS] Erro join:', e.message);
@@ -2023,7 +2106,8 @@ app.get('/api/lives/:id_streamer', requireApiKey, async (req, res) => {
     const limit = parseInt(req.query.limit) || 20;
     const result = await pool.query(
       `SELECT id, streamer, id_streamer, started_at, ended_at, duration_seconds,
-              peak_viewers, total_unique_viewers, avg_viewers, unique_mobile, unique_desktop, status
+              peak_viewers, total_unique_viewers, avg_viewers, unique_mobile, unique_desktop,
+              unique_kick, unique_twitch, avg_viewers_kick, avg_viewers_twitch, status
        FROM lives WHERE LOWER(id_streamer) = LOWER($1)
        ORDER BY started_at DESC LIMIT $2`, [id_streamer, limit]
     );
@@ -2032,7 +2116,10 @@ app.get('/api/lives/:id_streamer', requireApiKey, async (req, res) => {
       duration: formatTime(r.duration_seconds || 0), duration_seconds: r.duration_seconds,
       peak_viewers: r.peak_viewers, total_unique_viewers: r.total_unique_viewers,
       avg_viewers: r.avg_viewers || 0, unique_mobile: r.unique_mobile || 0,
-      unique_desktop: r.unique_desktop || 0, status: r.status,
+      unique_desktop: r.unique_desktop || 0,
+      unique_kick: r.unique_kick || 0, unique_twitch: r.unique_twitch || 0,
+      avg_viewers_kick: r.avg_viewers_kick || 0, avg_viewers_twitch: r.avg_viewers_twitch || 0,
+      status: r.status,
     }));
     return res.json({ streamer: id_streamer, total: lives.length, lives });
   } catch (e) {
@@ -2051,14 +2138,15 @@ app.get('/api/lives/:id_streamer/:live_id', requireApiKey, async (req, res) => {
     if (liveResult.rows.length === 0) return res.status(404).json({ message: 'Live nao encontrada' });
     const live = liveResult.rows[0];
     const viewersResult = await pool.query(
-      `SELECT ip, kick_username, platform, os, os_version, device_model, browser, browser_version,
+      `SELECT ip, username, platform, os, os_version, device_model, browser, browser_version,
               user_agent, is_mobile, joined_at, last_seen, total_seconds, segments_loaded, estimated_mb,
-              quality_history, player_health
+              quality_history, player_health, stream_platform
        FROM live_viewer_sessions WHERE live_id = $1 ORDER BY joined_at ASC`, [live_id]
     );
     const viewers = viewersResult.rows.map(v => ({
-      ip: v.ip, kick_username: v.kick_username, platform: v.platform, os: v.os,
+      ip: v.ip, username: v.username, platform: v.platform, os: v.os,
       device_model: v.device_model, browser: v.browser, is_mobile: v.is_mobile,
+      stream_platform: v.stream_platform || 'kick',
       joined_at: v.joined_at, last_seen: v.last_seen,
       time_formatted: formatTime(v.total_seconds || 0), total_seconds: v.total_seconds,
       segments_loaded: v.segments_loaded, estimated_mb: v.estimated_mb,
@@ -2070,7 +2158,10 @@ app.get('/api/lives/:id_streamer/:live_id', requireApiKey, async (req, res) => {
         duration: formatTime(live.duration_seconds || 0), duration_seconds: live.duration_seconds,
         peak_viewers: live.peak_viewers, total_unique_viewers: live.total_unique_viewers,
         avg_viewers: live.avg_viewers || 0, unique_mobile: live.unique_mobile || 0,
-        unique_desktop: live.unique_desktop || 0, status: live.status,
+        unique_desktop: live.unique_desktop || 0,
+        unique_kick: live.unique_kick || 0, unique_twitch: live.unique_twitch || 0,
+        avg_viewers_kick: live.avg_viewers_kick || 0, avg_viewers_twitch: live.avg_viewers_twitch || 0,
+        status: live.status,
       },
       viewers: {
         total: viewers.length,
@@ -2096,9 +2187,10 @@ async function restoreActiveLives() {
       const sessions = await pool.query('SELECT * FROM live_viewer_sessions WHERE live_id = $1', [row.id]);
       for (const s of sessions.rows) {
         activeLives[restoredKey].viewerSessions[s.viewer_uid] = {
-          ip: s.ip, kick_username: s.kick_username, platform: s.platform, os: s.os,
+          ip: s.ip, username: s.username, platform: s.platform, os: s.os,
           os_version: s.os_version, device_model: s.device_model, browser: s.browser,
           browser_version: s.browser_version, user_agent: s.user_agent, is_mobile: s.is_mobile,
+          stream_platform: s.stream_platform || 'kick',
           joined_at: s.joined_at, last_seen: s.last_seen, total_seconds: s.total_seconds,
           segments_loaded: s.segments_loaded, estimated_mb: s.estimated_mb,
           quality_history: s.quality_history || [], player_health: s.player_health || {},
