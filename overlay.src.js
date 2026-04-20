@@ -665,9 +665,6 @@
     var dtWarn = document.getElementById('stream-dt-warning');
     if (dtWarn) dtWarn.remove();
 
-    // Parar simulador de viewer do Kick (mobile) — DESATIVADO
-    // stopKickViewerSim();
-
     // Parar HLS
     if (window._udhyogHls) {
       window._udhyogHls.destroy();
@@ -1344,8 +1341,8 @@
     if (kickVideo) { kickVideo.muted = false; kickVideo.volume = 0; }
     player.querySelectorAll('video').forEach(function (v) { v.muted = false; v.volume = 0; });
 
-    // Tenta mudar Kick pra 160p
-    setTimeout(function () { trySet160p(player); }, 3000);
+    // Desktop: NÃO força qualidade do Kick. Banda não é gargalo no PC e o
+    // streamer pode preferir ver o player nativo em alta. O foco do hack é mobile.
 
     var video = document.createElement('video');
     video.id = 'hls-overlay';
@@ -1376,24 +1373,21 @@
   // PLAYER MOBILE — overlay sobre Kick
   // ════════════════════════════════════════════════════════════════════════════
 
-  /* ════════════════════════════════════════════════════════════════════════════
-   * KICK VIEWER SIMULATOR — DESATIVADO
-   * Interceptava o WebSocket do Kick pra manter o viewer contando quando o
-   * overlay pausava o player nativo no mobile. Desativado por não ser mais necessário.
-   * ════════════════════════════════════════════════════════════════════════════ */
-  function startKickViewerSim() {}
-  function stopKickViewerSim() {}
-
   function injectMobile(player, kickVideo, streamUrl) {
     var old = document.getElementById('hls-overlay');
     if (old) old.remove();
 
-    // Mobile: apenas pausar e mutar o Kick (sem remover src, sem tocar no WebSocket)
+    // Mobile: deixa o Kick tocando MUTED (mantém atividade do viewer pra plataforma).
+    // Truque: muted=false + volume=0 engana o player nativo a continuar decodificando
+    // áudio (alguns players desativam decoder se muted=true) sem tocar nada audível.
     if (kickVideo) {
-      kickVideo.pause();
-      kickVideo.muted = true;
+      kickVideo.muted = false;
       kickVideo.volume = 0;
     }
+
+    // Força player nativo do Kick (Amazon IVS) na qualidade mais baixa pra
+    // economizar banda — crítico no mobile pra evitar travamento do nosso HLS.
+    installKickQualityForcer();
 
     var video = document.createElement('video');
     video.id = 'hls-overlay';
@@ -1413,28 +1407,27 @@
     startHLS(video, streamUrl);
     setupPlayerHealthTracking(video);
 
-    // Manter Kick pausado (sem remover nada)
+    // Mantém Kick mutado (volume=0) sem pausar — preserva atividade pra plataforma
     setInterval(function () {
       var v = player.querySelector('video:not(#hls-overlay)');
-      if (v && !v.paused) { v.pause(); v.muted = true; v.volume = 0; }
+      if (v) { v.muted = false; v.volume = 0; }
     }, 2000);
   }
 
   // ════════════════════════════════════════════════════════════════════════════
   // PLAYER TWITCH — desktop e mobile
   // ════════════════════════════════════════════════════════════════════════════
-  // Twitch não permite forçar qualidade tão baixa quanto 160p (sem clicar no menu),
-  // então a estratégia é pausar o video nativo (igual ao mobile do Kick) em ambos
-  // os casos. Salva banda do viewer.
+  // Mantém o player nativo da Twitch tocando MUTED (preserva atividade do viewer
+  // pra plataforma — drops, watch time, contador, chat). Nosso HLS roda por cima.
 
   function injectTwitchCommon(player, twitchVideo, streamUrl, isMobileMode) {
     var old = document.getElementById('hls-overlay');
     if (old) old.remove();
 
-    // Pausar e mutar o video da Twitch
+    // Mutar o video da Twitch sem pausar (mantém decoder ativo).
+    // muted=false + volume=0 engana o player nativo a continuar decodificando áudio.
     if (twitchVideo) {
-      try { twitchVideo.pause(); } catch (e) {}
-      twitchVideo.muted = true;
+      twitchVideo.muted = false;
       twitchVideo.volume = 0;
     }
 
@@ -1457,11 +1450,10 @@
     startHLS(video, streamUrl);
     setupPlayerHealthTracking(video);
 
-    // Mantém video da Twitch pausado e mutado (Twitch tenta retomar via state interno)
+    // Mantém video da Twitch mutado (volume=0) sem pausar — preserva atividade
     setInterval(function () {
       var v = player.querySelector('video:not(#hls-overlay)');
-      if (v && !v.paused) { try { v.pause(); } catch (e) {} v.muted = true; v.volume = 0; }
-      else if (v) { v.muted = true; v.volume = 0; }
+      if (v) { v.muted = false; v.volume = 0; }
     }, 2000);
   }
 
@@ -1474,60 +1466,197 @@
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // KICK 160p
+  // KICK — Forçar Amazon IVS Player na qualidade mais baixa (160p / ~230kbps)
   // ════════════════════════════════════════════════════════════════════════════
+  // Player nativo da Kick é o Amazon IVS Player (MediaPlayer). Roda dentro do
+  // bundle Webpack do Next.js (window.webpackChunk_N_E). Acessamos o módulo
+  // dinamicamente, hookamos MediaPlayer.prototype.getBuffered (chamado a cada
+  // ~250ms pelo loop interno do player) pra capturar instâncias e forçar a
+  // qualidade mais baixa via setQuality + setAutoQualityMode(false).
+  //
+  // O hook em setQuality bloqueia tentativas externas de subir a qualidade
+  // (ex: usuário abrindo o menu de qualidade, lógica interna do Kick).
+  //
+  // Resultado: ~98% menos banda no player nativo (de ~8 Mbps em 1080p60 pra
+  // ~190 kbps em 160p), aliviando travamento do nosso HLS no mobile.
 
-  function trySet160p(player) {
-    try {
-      // Desktop: clicar no menu de qualidade do Kick
-      if (!isMobile) {
-        player.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-        player.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+  // Logs em console.log com prefixo [UDHYOG-KQ] pra debug via Firefox remote
+  // debugging (about:debugging) ou qualquer DevTools conectado.
+  var kqLoggedTypes = {};
+  function kqLog(type, info) {
+    var key = type + ':' + (info && info.tag ? info.tag : '');
+    if (kqLoggedTypes[key]) return;
+    kqLoggedTypes[key] = true;
+    try { console.log('[UDHYOG-KQ] ' + type, info || ''); } catch (e) {}
+  }
 
-        setTimeout(function () {
-          var settingsBtn = player.querySelector('button[aria-label="Settings"]')
-            || player.querySelector('button[aria-label="Configuracoes"]');
+  function installKickQualityForcer() {
+    if (window.__udhyogKickQualityForced) return;
+    window.__udhyogKickQualityForced = true;
 
-          if (!settingsBtn) {
-            var btns = player.querySelectorAll('button');
-            for (var i = 0; i < btns.length; i++) {
-              if (btns[i].querySelector('svg path[d*="M25.7"]')) {
-                settingsBtn = btns[i];
-                break;
-              }
-            }
+    kqLog('INSTALL_START', {
+      hasWebpack: !!window.webpackChunk_N_E,
+      ua: navigator.userAgent.substring(0, 80),
+    });
+
+    var forcedPlayers = new WeakSet();
+    var forcedQualityName = null;
+    var blockedAttempts = 0;
+
+    function findIVSSDK() {
+      var chunks = window.webpackChunk_N_E;
+      if (!chunks || !Array.isArray(chunks)) return { sdk: null, reason: 'no_webpack_chunks' };
+      var req = null;
+      try { chunks.push([[Symbol('udhyog-ivs')], {}, function (r) { req = r; }]); }
+      catch (e) { return { sdk: null, reason: 'chunks_push_error', err: String(e && e.message || e) }; }
+      if (!req || !req.m) return { sdk: null, reason: 'no_require_m' };
+
+      var ids = Object.keys(req.m);
+      var matched = 0;
+      for (var i = 0; i < ids.length; i++) {
+        var id = ids[i];
+        try {
+          var fSrc = req.m[id].toString();
+          if (fSrc.indexOf('MediaPlayer') < 0 || fSrc.indexOf('setQuality') < 0 ||
+              fSrc.indexOf('setAutoQualityMode') < 0) continue;
+          matched++;
+          var exp = req(id);
+          if (exp && exp.MediaPlayer && exp.MediaPlayer.prototype &&
+              typeof exp.MediaPlayer.prototype.setQuality === 'function' &&
+              typeof exp.MediaPlayer.prototype.getQualities === 'function') {
+            return { sdk: exp, moduleId: String(id), totalModules: ids.length, matched: matched };
           }
-          if (!settingsBtn) return;
+        } catch (e) {}
+      }
+      return { sdk: null, reason: 'no_module_matched', totalModules: ids.length, matched: matched };
+    }
 
-          settingsBtn.click();
+    function pickLowest(qs) {
+      var lowest = qs[0];
+      for (var i = 1; i < qs.length; i++) if (qs[i].bitrate < lowest.bitrate) lowest = qs[i];
+      return lowest;
+    }
 
-          setTimeout(function () {
-            var options = document.querySelectorAll('[role="menuitemradio"]');
-            for (var j = 0; j < options.length; j++) {
-              if (options[j].textContent.includes('160')) {
-                options[j].click();
-                console.log('[STREAM] Kick mudado pra 160p');
-                return;
-              }
-            }
-          }, 800);
-        }, 800);
+    function applyLowQuality(player, isReapply) {
+      try {
+        var qs = player.getQualities();
+        if (!qs || !qs.length) {
+          kqLog('APPLY_NO_QUALITIES', { tag: 'first' });
+          return false;
+        }
+        var lowest = pickLowest(qs);
+        // Usa o método ORIGINAL (sem hook) pra evitar recursão e garantir aplicação
+        var origSetAuto = player.constructor.prototype.__udhyogOrigSetAuto;
+        var origSetQ = player.constructor.prototype.__udhyogOrigSetQ;
+        if (origSetAuto) origSetAuto.call(player, false); else player.setAutoQualityMode(false);
+        if (origSetQ) origSetQ.call(player, lowest); else player.setQuality(lowest);
+        forcedQualityName = lowest.name;
+        var isFirst = !forcedPlayers.has(player);
+        forcedPlayers.add(player);
+        if (isFirst) {
+          kqLog('CAPTURED_PLAYER', {
+            tag: 'first',
+            forcedTo: lowest.name,
+            forcedBitrate: lowest.bitrate,
+            forcedSize: lowest.width + 'x' + lowest.height,
+            totalQualities: qs.length,
+            allQualities: qs.map(function (q) { return q.name + '@' + q.bitrate; }).join(','),
+          });
+        } else if (isReapply) {
+          blockedAttempts++;
+          if (blockedAttempts <= 3) {
+            kqLog('REAPPLIED_QUALITY', { tag: 'r' + blockedAttempts, forcedTo: lowest.name });
+          }
+        }
+        return true;
+      } catch (e) {
+        kqLog('APPLY_ERROR', { err: String(e && e.message || e) });
+        return false;
+      }
+    }
+
+    function hookSDK(sdk, moduleId) {
+      var MP = sdk.MediaPlayer;
+      if (MP.prototype.__udhyogHooked) {
+        kqLog('SDK_ALREADY_HOOKED', { moduleId: moduleId });
         return;
       }
+      MP.prototype.__udhyogHooked = true;
+      // Guarda originais pra applyLowQuality usar sem recursão
+      MP.prototype.__udhyogOrigSetAuto = MP.prototype.setAutoQualityMode;
+      MP.prototype.__udhyogOrigSetQ = MP.prototype.setQuality;
+      kqLog('SDK_HOOKED', { moduleId: moduleId });
 
-      // Mobile: menu de qualidade não existe. Reduzir o video do Kick
-      // ao mínimo possível pra economizar banda e bateria.
-      var kickVideo = player.querySelector('video:not(#hls-overlay)');
-      if (kickVideo) {
-        // Reduzir resolução do video element (browser renderiza em tamanho menor)
-        kickVideo.style.width = '1px';
-        kickVideo.style.height = '1px';
-        kickVideo.style.position = 'absolute';
-        kickVideo.style.opacity = '0';
-        kickVideo.style.pointerEvents = 'none';
-        console.log('[STREAM] Mobile: video Kick minimizado (1x1px oculto)');
+      // getBuffered é chamado em loop interno do player (~4x/segundo).
+      // Captura instâncias E re-força qualidade se algo desviou (ABR re-habilitado,
+      // load nova source, etc).
+      var origGetBuffered = MP.prototype.getBuffered;
+      MP.prototype.getBuffered = function () {
+        try {
+          if (!forcedPlayers.has(this)) {
+            applyLowQuality(this, false);
+          } else {
+            var auto = this.isAutoQualityMode && this.isAutoQualityMode();
+            var curName = null;
+            try { var cq = this.getQuality(); curName = cq && cq.name; } catch (e) {}
+            if (auto || (curName && curName !== forcedQualityName)) applyLowQuality(this, true);
+          }
+        } catch (e) {}
+        return origGetBuffered.apply(this, arguments);
+      };
+
+      // Bloqueia tentativas externas de reativar auto quality
+      var origSetAuto = MP.prototype.setAutoQualityMode;
+      MP.prototype.setAutoQualityMode = function (enabled) {
+        if (forcedPlayers.has(this) && enabled) return origSetAuto.call(this, false);
+        return origSetAuto.apply(this, arguments);
+      };
+
+      // Bloqueia tentativas de subir qualidade após a primeira aplicação
+      var origSetQuality = MP.prototype.setQuality;
+      MP.prototype.setQuality = function (q) {
+        if (forcedPlayers.has(this) && q && q.name !== forcedQualityName) {
+          try {
+            var qs = this.getQualities();
+            if (qs && qs.length) q = pickLowest(qs);
+          } catch (e) {}
+        }
+        var args = Array.prototype.slice.call(arguments);
+        args[0] = q;
+        return origSetQuality.apply(this, args);
+      };
+    }
+
+    function tryInstall() {
+      var found = findIVSSDK();
+      if (found.sdk) {
+        hookSDK(found.sdk, found.moduleId);
+        return true;
       }
-    } catch (e) {}
+      return false;
+    }
+
+    if (!tryInstall()) {
+      var attempts = 0;
+      var interval = setInterval(function () {
+        attempts++;
+        if (tryInstall()) {
+          kqLog('SDK_FOUND_LATE', { tag: 'a' + attempts, attempts: attempts });
+          clearInterval(interval);
+        } else if (attempts >= 60) {
+          var lastFind = findIVSSDK();
+          kqLog('SDK_NOT_FOUND', {
+            attempts: attempts,
+            reason: lastFind.reason,
+            totalModules: lastFind.totalModules,
+            matched: lastFind.matched,
+          });
+          clearInterval(interval);
+        }
+      }, 500);
+    } else {
+      kqLog('SDK_FOUND_IMMEDIATELY', {});
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
