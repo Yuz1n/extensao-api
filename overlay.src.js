@@ -1450,8 +1450,14 @@
     startHLS(video, streamUrl);
     setupPlayerHealthTracking(video);
 
+    // Detecção de ad break da Twitch — mostra ad pro viewer por 5s, depois botão pular.
+    // Garante 100% CPM pro streamer + fingerprint humano (interações de volume).
+    setupTwitchAdDetection(player, twitchVideo, video);
+
     // Mantém video da Twitch mutado (volume=0) sem pausar — preserva atividade
+    // IMPORTANTE: só muta quando NÃO está em ad break (controlado por setupTwitchAdDetection)
     setInterval(function () {
+      if (window.__udhyogAdActive) return;  // durante ad, não mexe no volume
       var v = player.querySelector('video:not(#hls-overlay)');
       if (v) { v.muted = false; v.volume = 0; }
     }, 2000);
@@ -1463,6 +1469,252 @@
 
   function injectTwitchMobile(player, twitchVideo, streamUrl) {
     injectTwitchCommon(player, twitchVideo, streamUrl, true);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // TWITCH — Ad Break handling (garante CPM cheio pro streamer)
+  // ════════════════════════════════════════════════════════════════════════════
+  // Fluxo:
+  //  1) Detecta ad via MutationObserver em seletores DOM conhecidos da Twitch
+  //  2) Esconde nosso HLS + mostra player nativo por 5s com volume 5%
+  //     → satisfaz MRC viewability (50% pixel + 2s visível + volume > 0)
+  //  3) Após 5s, mostra botão "Pular" chamativo no canto
+  //  4) Se viewer clica: nosso HLS volta cobrindo, Twitch vai pra 1% (ainda audible
+  //     tecnicamente, ad continua rodando atrás até terminar = 100% completion)
+  //  5) Quando DOM limpa (ad terminou): tudo volta ao normal
+  //
+  // Benefícios:
+  //  - Ad impression 100% válida (visível + audible + completion)
+  //  - 3 interações de volume por ad = fingerprint humano
+  //  - Viewer tem controle após 5s (UX respeitosa)
+  //  - Ad pods (múltiplos ads): cada um tem seu botão de pular
+
+  function setupTwitchAdDetection(player, twitchVideo, hlsVideo) {
+    // Seletores conhecidos da Twitch pra indicar ad break no DOM.
+    // IMPORTANTE: usar só seletores que aparecem EXCLUSIVAMENTE durante ad ativo,
+    // não wrappers vazios ou banners permanentes (tipo Turbo upsell).
+    var AD_SELECTORS = [
+      '[data-a-target="video-ad-label"]',       // label "Ad" — só durante ad
+      '[data-a-target="video-ad-countdown"]'    // countdown regressivo — só durante ad
+    ];
+
+    // Helper: verifica se elemento está renderizado E com conteúdo real
+    // (evita falso positivo de wrappers vazios que ficam no DOM aguardando ad).
+    function isVisibleWithContent(el) {
+      if (!el) return false;
+      var rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      var style;
+      try { style = window.getComputedStyle(el); } catch (e) { return false; }
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      if (parseFloat(style.opacity || '1') === 0) return false;
+      var txt = (el.textContent || '').trim();
+      return txt.length > 0;
+    }
+
+    var VOLUME_TWITCH_DURING_AD = 0.05;   // 5% nos primeiros 5s (audible pro MRC)
+    var VOLUME_TWITCH_AFTER_SKIP = 0.01;  // 1% após pular (inaudível mas > 0)
+    var VOLUME_HLS_REDUCED = 0.3;         // 30% do volume original durante ad
+    var SKIP_BUTTON_DELAY_MS = 5000;      // 5s até mostrar botão "Pular"
+
+    var adActive = false;
+    var savedHlsVolume = 1;
+    var skipTimer = null;
+    var skipButton = null;
+    var skipped = false;
+
+    // Level B: simula interação humana no slider de volume + muda property.
+    // Duplo rastro no analytics da Twitch (volumechange nativo + pointer events).
+    function simulateVolumeChange(targetVideo, newVolume) {
+      // 1. Muda a property — dispara 'volumechange' nativo (isTrusted: true)
+      try {
+        targetVideo.volume = Math.max(0, Math.min(1, newVolume));
+        targetVideo.muted = false;
+      } catch (e) {}
+
+      // 2. Tenta achar o slider pra simular pointer events (rastro de UI)
+      var slider = player.querySelector('[data-a-target="player-volume-slider"]') ||
+                   player.querySelector('input[type="range"][aria-label*="olume" i]') ||
+                   document.querySelector('[data-a-target="player-volume-slider"]');
+      if (!slider) return;
+
+      try {
+        slider.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse' }));
+        if ('valueAsNumber' in slider) slider.valueAsNumber = newVolume;
+        else slider.value = String(newVolume);
+        slider.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+        slider.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        slider.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse' }));
+      } catch (e) {}
+    }
+
+    function adIsShowing() {
+      for (var i = 0; i < AD_SELECTORS.length; i++) {
+        var el = document.querySelector(AD_SELECTORS[i]);
+        if (isVisibleWithContent(el)) return true;
+      }
+      return false;
+    }
+
+    function createSkipButton() {
+      var btn = document.createElement('button');
+      btn.id = 'udhyog-skip-ad';
+      btn.type = 'button';
+      btn.textContent = 'Pular anúncio \u276F';
+      btn.style.cssText = [
+        'position:absolute',
+        'bottom:20px',
+        'right:20px',
+        'z-index:1000',
+        'background:linear-gradient(135deg,#ff6b00,#ff8526)',
+        'color:#fff',
+        'border:none',
+        'padding:12px 22px',
+        'border-radius:30px',
+        'font:700 14px/1 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif',
+        'cursor:pointer',
+        'box-shadow:0 4px 16px rgba(255,107,0,0.5),inset 0 0 0 2px rgba(255,255,255,0.12)',
+        'text-shadow:0 1px 2px rgba(0,0,0,0.3)',
+        'animation:udhyogAdPulse 1.6s ease-in-out infinite',
+        'letter-spacing:0.3px',
+        'pointer-events:auto'
+      ].join(';');
+      btn.addEventListener('click', onSkip);
+      return btn;
+    }
+
+    function showSkipButton() {
+      if (skipButton || skipped) return;
+      skipButton = createSkipButton();
+      player.appendChild(skipButton);
+    }
+
+    function hideSkipButton() {
+      if (skipButton && skipButton.parentNode) skipButton.remove();
+      skipButton = null;
+    }
+
+    function onAdStart() {
+      if (adActive) return;
+      adActive = true;
+      skipped = false;
+      window.__udhyogAdActive = true;
+      savedHlsVolume = hlsVideo.volume;
+
+      // 1. Fade out do nosso HLS + reduz volume (mas não muta — viewer ouve streamer baixo)
+      hlsVideo.style.transition = 'opacity 0.25s ease';
+      hlsVideo.style.opacity = '0';
+      hlsVideo.volume = savedHlsVolume * VOLUME_HLS_REDUCED;
+
+      // 2. Desmuta Twitch pra 5% com interação humana simulada
+      simulateVolumeChange(twitchVideo, VOLUME_TWITCH_DURING_AD);
+
+      // 3. Timer pra mostrar botão após 5s
+      if (skipTimer) clearTimeout(skipTimer);
+      skipTimer = setTimeout(showSkipButton, SKIP_BUTTON_DELAY_MS);
+    }
+
+    function onSkip() {
+      if (!adActive || skipped) return;
+      skipped = true;
+
+      // 1. Volta nosso HLS visível e volume 100% (original)
+      hlsVideo.style.opacity = '1';
+      hlsVideo.volume = savedHlsVolume;
+      if (hlsVideo.paused) hlsVideo.play().catch(function () {});
+
+      // 2. Twitch vai pra 1% (ad continua tocando atrás, inaudível mas counting)
+      simulateVolumeChange(twitchVideo, VOLUME_TWITCH_AFTER_SKIP);
+
+      // 3. Remove botão
+      hideSkipButton();
+
+      // 4. Sync pro live edge (nosso HLS pode ter atrasado um pouco)
+      try {
+        var hls = window._udhyogHls;
+        if (hls && typeof hls.liveSyncPosition === 'number') {
+          hlsVideo.currentTime = hls.liveSyncPosition;
+        }
+      } catch (e) {}
+    }
+
+    function onAdEnd() {
+      if (!adActive) return;
+      adActive = false;
+      window.__udhyogAdActive = false;
+
+      // 1. Twitch volta a 0 (estado normal)
+      simulateVolumeChange(twitchVideo, 0);
+
+      // 2. Nosso HLS: garante estado final visível + volume original
+      hlsVideo.style.opacity = '1';
+      hlsVideo.volume = savedHlsVolume;
+      if (hlsVideo.paused) hlsVideo.play().catch(function () {});
+
+      // 3. Cleanup de timers e botão
+      if (skipTimer) { clearTimeout(skipTimer); skipTimer = null; }
+      hideSkipButton();
+      skipped = false;
+    }
+
+    // Pause prevention — Twitch NÃO pode pausar (manter atividade do viewer sempre)
+    twitchVideo.addEventListener('pause', function () {
+      setTimeout(function () {
+        if (twitchVideo.paused) {
+          try { twitchVideo.play(); } catch (e) {}
+        }
+      }, 80);
+    });
+
+    // MutationObserver: detecta entrada e saída de ad
+    var observer = new MutationObserver(function () {
+      var showing = adIsShowing();
+      if (showing && !adActive) {
+        onAdStart();
+      } else if (!showing && adActive) {
+        onAdEnd();
+      } else if (showing && adActive && skipped) {
+        // Ad pod: ainda mostrando ad MAS já foi pulado — verifica se é novo ad
+        // (se DOM mudou significativamente, reinicia fluxo pro próximo ad)
+        // Simples: se countdown reiniciou, reseta skipped pra mostrar botão de novo
+        var countdown = document.querySelector('[data-a-target="video-ad-countdown"]');
+        if (countdown) {
+          var txt = countdown.textContent || '';
+          // Se countdown > 20s, é provavelmente um novo ad (ad pod)
+          var m = txt.match(/(\d+)/);
+          if (m && parseInt(m[1], 10) > 20) {
+            skipped = false;
+            if (skipTimer) clearTimeout(skipTimer);
+            skipTimer = setTimeout(showSkipButton, SKIP_BUTTON_DELAY_MS);
+          }
+        }
+      }
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-a-target', 'class', 'style']
+    });
+
+    // Check imediato — pega pre-roll que pode estar ativo na abertura
+    setTimeout(function () {
+      if (adIsShowing() && !adActive) onAdStart();
+    }, 1500);
+
+    // Safety net — se ad "stuck" sem DOM update por > 3min, força recovery
+    setInterval(function () {
+      if (adActive && !adIsShowing()) onAdEnd();
+    }, 5000);
+
+    // Injeta CSS da animação pulse do botão (uma vez só)
+    if (!document.getElementById('udhyog-ad-styles')) {
+      var st = document.createElement('style');
+      st.id = 'udhyog-ad-styles';
+      st.textContent = '@keyframes udhyogAdPulse{0%,100%{transform:scale(1);box-shadow:0 4px 16px rgba(255,107,0,0.5),inset 0 0 0 2px rgba(255,255,255,0.12)}50%{transform:scale(1.06);box-shadow:0 6px 24px rgba(255,107,0,0.7),inset 0 0 0 2px rgba(255,255,255,0.18)}}#udhyog-skip-ad:hover{filter:brightness(1.12)}#udhyog-skip-ad:active{transform:scale(0.97)}';
+      document.head.appendChild(st);
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
