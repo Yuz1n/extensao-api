@@ -754,6 +754,9 @@
 
   // ── Função que processa o validate response e continua o fluxo ──
   function handleValidateSuccess(data, streamerCode, btn) {
+    // Guardar streamerCode globalmente — revalidateAndRecover precisa quando UUID muda
+    window._udhyogStreamerCode = streamerCode;
+
     // 2. Validar URL — viewer está no canal certo (Kick OU Twitch conforme plataforma)?
     var dbLink = STREAM_PLATFORM === 'twitch'
       ? (data.streamer.new_plataform || '')
@@ -1105,6 +1108,65 @@
       var lastFragLoadedTime = Date.now();
       var mediaRecoverAttempts = 0;
       var isRecreating = false;
+      var revalidateInProgress = false;
+      var lastRevalidateAt = 0;
+      var revalidateAttempts = 0;
+
+      // Revalida via API quando hls.js dá fatal NETWORK_ERROR.
+      // Caso UUID tenha mudado (live encerrou e streamer reconectou), atualiza base + recriaHls.
+      // Se API confirmar stream_ended, mostra tela de fim. Throttle 5s + máx 5 tentativas com mesma URL.
+      function revalidateAndRecover() {
+        var now = Date.now();
+        if (revalidateInProgress) return;
+        if (now - lastRevalidateAt < 5000) return;
+        lastRevalidateAt = now;
+        revalidateInProgress = true;
+
+        var streamerCode = window._udhyogStreamerCode;
+        if (!streamerCode) {
+          revalidateInProgress = false;
+          return;
+        }
+
+        console.warn('[STREAM] Revalidando via API apos erro fatal...');
+        fetch(API_URL + '/api/streamer/validate/' + encodeURIComponent(streamerCode) + '?viewer_uid=' + encodeURIComponent(viewerUid) + '&platform=' + STREAM_PLATFORM, {
+          headers: { 'X-Api-Key': API_KEY },
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          revalidateInProgress = false;
+
+          // API confirmou que a stream encerrou ou nao tem URL valida — fim de jogo
+          if (data.stream_ended || !data.valid || !data.streamer || !data.streamer.stream_url) {
+            console.warn('[STREAM] API confirmou stream encerrado.');
+            showStreamEnded();
+            return;
+          }
+
+          var newBase = data.streamer.stream_url.replace(/\/master\.m3u8$/, '');
+          if (newBase !== window._udhyogStreamBase) {
+            // UUID novo (live reconectou) — atualiza base e recria player
+            console.warn('[STREAM] UUID mudou, atualizando: ' + window._udhyogStreamBase + ' -> ' + newBase);
+            window._udhyogStreamBase = newBase;
+            revalidateAttempts = 0;
+            recreateHls();
+          } else {
+            // Mesma URL — pode ser problema de rede do viewer ou path realmente morto
+            revalidateAttempts++;
+            if (revalidateAttempts >= 5) {
+              console.warn('[STREAM] Revalidate falhou 5x com mesma URL — declarando stream encerrado');
+              showStreamEnded();
+              return;
+            }
+            console.warn('[STREAM] URL igual, recriando player (tentativa ' + revalidateAttempts + '/5)...');
+            recreateHls();
+          }
+        })
+        .catch(function (e) {
+          revalidateInProgress = false;
+          console.warn('[STREAM] Revalidate falhou:', e && e.message);
+        });
+      }
 
       // Função para destruir e recriar hls.js quando está morto (recovery de erros)
       function recreateHls() {
@@ -1151,6 +1213,7 @@
             lastFragLoadedTime = Date.now();
             consecutiveFatalErrors = 0;
             mediaRecoverAttempts = 0;
+            revalidateAttempts = 0;
           });
           newHls.on(Hls.Events.ERROR, function (event, data) {
             handleHlsError(data);
@@ -1196,10 +1259,10 @@
         }
 
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          console.warn('[STREAM] Network error, tentando reconectar...');
-          setTimeout(function () {
-            if (window._udhyogHls) window._udhyogHls.startLoad();
-          }, 5000);
+          // 404 em master.m3u8 / level / fragment = UUID provavelmente mudou (live reconectou)
+          // ou path foi deletado do R2. Revalidar via API pra pegar URL nova ao invés de só re-tentar.
+          console.warn('[STREAM] Network error fatal (' + data.details + ') — revalidando via API...');
+          revalidateAndRecover();
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           mediaRecoverAttempts++;
           if (mediaRecoverAttempts <= 3) {
@@ -1220,6 +1283,7 @@
         // Reset contadores quando um fragmento carrega com sucesso
         consecutiveFatalErrors = 0;
         mediaRecoverAttempts = 0;
+        revalidateAttempts = 0;
       });
       window._udhyogHls = hls;
       window._udhyogRecreateHls = recreateHls;
