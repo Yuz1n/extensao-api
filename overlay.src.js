@@ -247,6 +247,442 @@
     return isPhone || (hasTouch && smallScreen && !isIPad);
   })();
 
+  // ════════════════════════════════════════════════════════════════════════════
+  // ADS — Adsterra integration (banner display, desktop only)
+  // Estado global compartilhado entre validate, player init e fake fullscreen
+  // ════════════════════════════════════════════════════════════════════════════
+  window._udhyogAds = window._udhyogAds || {
+    enabled: false,
+    zones: [],
+    activeZone: null,
+    bannerInjected: false,
+    adblockRecheckInterval: null,
+    refreshInterval: null,
+    refreshCount: 0,
+  };
+
+  // Intervalo de refresh do banner (ms). 30s e padrao seguro Adsterra (mais frequente pode disparar fraud).
+  var _UDHYOG_AD_REFRESH_MS = 30000;
+
+  // Carrega/recarrega scripts Adsterra dentro do slot, ENCAPSULADOS em iframe sandbox.
+  // Sandbox bloqueia: popunder, redirect top-navigation, modals/alerts, downloads forçados.
+  // Permite: scripts + same-origin (necessario pro invoke.js do Adsterra rodar).
+  function _udhyogLoadAdScripts(slot, zone, isRefresh) {
+    if (!slot || !zone) return;
+    slot.innerHTML = '';
+
+    // Iframe sandboxed que vai conter o Adsterra
+    // ⭐ pointer-events:none → clicks "atravessam" o banner = ad nao consegue disparar redirect via click
+    // Trade-off: viewer nao pode clicar pra ir pro advertiser (CTR=0, CPM cai um pouco)
+    // Beneficio: ~90% dos redirects de Adsterra sao click-baseados, esses todos bloqueados
+    var sandboxFrame = document.createElement('iframe');
+    sandboxFrame.id = 'udhyog-ad-sandbox-frame';
+    sandboxFrame.style.cssText = 'width:' + zone.width + 'px;height:' + zone.height + 'px;border:0;display:block;overflow:hidden;background:transparent;pointer-events:none';
+    sandboxFrame.setAttribute('scrolling', 'no');
+    sandboxFrame.setAttribute('frameborder', '0');
+    // Sandbox: bloqueia popunder/top-navigation/modals/forms/downloads
+    // allow-same-origin necessário pra Adsterra (cookies/localStorage)
+    sandboxFrame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+
+    // HTML minimo dentro do sandbox que carrega o Adsterra
+    var adHTML = ''
+      + '<!doctype html>'
+      + '<html>'
+      + '<head>'
+      + '<meta charset="utf-8">'
+      + '<style>html,body{margin:0;padding:0;overflow:hidden;background:transparent;width:100%;height:100%}</style>'
+      + '</head>'
+      + '<body>'
+      + '<script>atOptions = {"key":"' + zone.key + '","format":"iframe","height":' + zone.height + ',"width":' + zone.width + ',"params":{}};<\/script>'
+      + '<script src="' + zone.url + '"><\/script>'
+      + '</body>'
+      + '</html>';
+
+    // srcdoc carrega o HTML inline (compativel com sandbox, sem CORS issues)
+    sandboxFrame.srcdoc = adHTML;
+
+    if (!isRefresh) {
+      sandboxFrame.onload = function () {
+        console.log('[ADS] ✅ Sandbox iframe carregou (Adsterra isolado):', zone.url);
+      };
+      sandboxFrame.onerror = function (e) {
+        console.error('[ADS] ❌ Sandbox iframe FALHOU:', zone.url, e);
+      };
+    }
+
+    slot.appendChild(sandboxFrame);
+  }
+
+  // Helper de DEBUG/DEV — chamar no console pra resetar consent e simular 1a visita
+  window._udhyogResetAds = function () {
+    localStorage.removeItem('udhyog_lgpd_consent');
+    var banner = document.getElementById('udhyog-ad-banner-wrapper');
+    if (banner) banner.remove();
+    var block = document.getElementById('udhyog-adblock-block');
+    if (block) block.remove();
+    var modal = document.getElementById('udhyog-lgpd-modal');
+    if (modal) modal.remove();
+    if (window._udhyogAds.adblockRecheckInterval) {
+      clearInterval(window._udhyogAds.adblockRecheckInterval);
+      window._udhyogAds.adblockRecheckInterval = null;
+    }
+    if (window._udhyogAds.refreshInterval) {
+      clearInterval(window._udhyogAds.refreshInterval);
+      window._udhyogAds.refreshInterval = null;
+    }
+    window._udhyogAds.bannerInjected = false;
+    window._udhyogAds.refreshCount = 0;
+    console.log('[ADS] 🔄 Estado de ads resetado. Recarregue a pagina (F5) para testar como 1a visita.');
+  };
+
+  function _udhyogDetectAdblock() {
+    return new Promise(function (resolve) {
+      console.log('[ADS] 🔍 Iniciando deteccao de adblock');
+      // Método 1: bait div com classes que adblockers escondem
+      var bait = document.createElement('div');
+      bait.className = 'ad-banner ads adsbox doubleclick ad-placement adunit';
+      bait.style.cssText = 'position:absolute!important;left:-9999px!important;top:-9999px!important;height:50px!important;width:300px!important;display:block!important';
+      bait.innerHTML = '&nbsp;';
+      document.body.appendChild(bait);
+      setTimeout(function () {
+        var blocked1 = bait.offsetHeight === 0 || bait.offsetWidth === 0 || bait.offsetParent === null;
+        console.log('[ADS] Bait div check: blocked=' + blocked1 + ' (h=' + bait.offsetHeight + ' w=' + bait.offsetWidth + ' parent=' + (bait.offsetParent !== null) + ')');
+        document.body.removeChild(bait);
+        if (blocked1) { console.log('[ADS] ❌ Adblock detectado via bait div'); resolve(true); return; }
+        // Método 2: tenta carregar script comum bloqueado por adblockers
+        fetch('https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js', { mode: 'no-cors', cache: 'no-store' })
+          .then(function () { console.log('[ADS] ✅ Adsense script carregou — sem adblock'); resolve(false); })
+          .catch(function (e) { console.log('[ADS] ❌ Adblock detectado via fetch fail:', e && e.message); resolve(true); });
+      }, 100);
+    });
+  }
+
+  function _udhyogGetLGPDConsent() {
+    return localStorage.getItem('udhyog_lgpd_consent') === 'accepted';
+  }
+
+  function _udhyogShowLGPDConsent() {
+    return new Promise(function (resolve) {
+      var existing = document.getElementById('udhyog-lgpd-modal');
+      if (existing) existing.remove();
+      var modal = document.createElement('div');
+      modal.id = 'udhyog-lgpd-modal';
+      modal.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#1a1a1a;color:#fff;padding:18px 20px;border-top:2px solid #ff8c00;z-index:9999998;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:14px;line-height:1.5;box-shadow:0 -4px 20px rgba(0,0,0,0.5)';
+      modal.innerHTML = '<div style="max-width:1200px;margin:0 auto;display:flex;align-items:center;gap:20px;flex-wrap:wrap"><div style="flex:1;min-width:280px"><div style="font-weight:600;margin-bottom:6px">Cookies e Anuncios</div><div style="color:#aaa;font-size:13px">Usamos cookies de terceiros para exibir anuncios e manter o servico gratuito. Ao continuar, voce concorda com nossa politica de privacidade.</div></div><div style="display:flex;gap:10px"><button id="udhyog-lgpd-reject" style="padding:10px 20px;background:#333;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer">Rejeitar</button><button id="udhyog-lgpd-accept" style="padding:10px 24px;background:linear-gradient(135deg,#ff8c00,#0088ff);color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Aceitar</button></div></div>';
+      document.body.appendChild(modal);
+      document.getElementById('udhyog-lgpd-accept').addEventListener('click', function () {
+        localStorage.setItem('udhyog_lgpd_consent', 'accepted');
+        modal.remove();
+        resolve(true);
+      });
+      document.getElementById('udhyog-lgpd-reject').addEventListener('click', function () {
+        localStorage.setItem('udhyog_lgpd_consent', 'rejected');
+        modal.remove();
+        resolve(false);
+      });
+    });
+  }
+
+  function _udhyogShowAdblockBlock() {
+    // Para HLS atual (se já iniciou)
+    try {
+      if (window._udhyogHls) { window._udhyogHls.destroy(); window._udhyogHls = null; }
+    } catch (e) {}
+    var hlsVideo = document.getElementById('hls-overlay');
+    if (hlsVideo) hlsVideo.remove();
+
+    var existing = document.getElementById('udhyog-adblock-block');
+    if (existing) existing.remove();
+
+    var modal = document.createElement('div');
+    modal.id = 'udhyog-adblock-block';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.95);backdrop-filter:blur(15px);-webkit-backdrop-filter:blur(15px);z-index:9999999;display:flex;justify-content:center;align-items:center;padding:20px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif';
+    modal.innerHTML = '<div style="max-width:480px;text-align:center;background:#111116;border:1px solid rgba(255,140,0,0.2);border-radius:20px;padding:40px 32px;box-shadow:0 24px 80px rgba(0,0,0,0.6)"><div style="font-size:48px;margin-bottom:16px">&#128683;</div><h2 style="color:#fff;font-size:22px;font-weight:700;margin-bottom:12px">Bloqueador de Anuncios Detectado</h2><p style="color:#aaa;font-size:14px;line-height:1.6;margin-bottom:18px">Para continuar assistindo, desabilite o bloqueador de anuncios para este site e atualize a pagina.</p><p style="color:#888;font-size:13px;line-height:1.5;margin-bottom:24px">Os anuncios ajudam a manter o servico gratuito. Obrigado!</p><button id="udhyog-adblock-reload" style="width:100%;padding:14px;background:linear-gradient(135deg,#ff8c00,#0088ff);color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;text-shadow:0 1px 2px rgba(0,0,0,0.3)">Ja desabilitei - Recarregar</button><div style="color:#555;font-size:11px;margin-top:12px">Verificacao automatica a cada 5 segundos</div></div>';
+    document.body.appendChild(modal);
+    document.getElementById('udhyog-adblock-reload').addEventListener('click', function () { location.reload(); });
+
+    // Auto-recheck a cada 5s — quando viewer desabilitar, reload automatico
+    if (window._udhyogAds.adblockRecheckInterval) clearInterval(window._udhyogAds.adblockRecheckInterval);
+    window._udhyogAds.adblockRecheckInterval = setInterval(function () {
+      _udhyogDetectAdblock().then(function (stillBlocked) {
+        if (!stillBlocked) {
+          clearInterval(window._udhyogAds.adblockRecheckInterval);
+          location.reload();
+        }
+      });
+    }, 5000);
+  }
+
+  function _udhyogSelectAdsZone(zones) {
+    if (!zones || zones.length === 0) return null;
+    // Posicao atual: inline abaixo da section dos links/patrocinadores do streamer
+    // Prioridade de tamanhos para essa posicao (formato horizontal):
+    //   1. 728x90 (Leaderboard) — formato ideal horizontal
+    //   2. 468x60 (Half Banner) — fallback menor
+    //   3. 320x50 (Mobile Banner) — pequeno mas funciona
+    //   4. primeiro disponivel
+    var leaderboard = zones.find(function (z) { return z.width === 728 && z.height === 90; });
+    if (leaderboard) return leaderboard;
+    var halfBanner = zones.find(function (z) { return z.width === 468 && z.height === 60; });
+    if (halfBanner) return halfBanner;
+    var mobileBanner = zones.find(function (z) { return z.width === 320 && z.height === 50; });
+    if (mobileBanner) return mobileBanner;
+    return zones[0];
+  }
+
+  function _udhyogInjectAdsBanner() {
+    console.log('[ADS] 📺 _udhyogInjectAdsBanner chamado. State:', JSON.parse(JSON.stringify(window._udhyogAds)));
+    if (window._udhyogAds.bannerInjected) {
+      console.log('[ADS] ⚠️ Banner ja foi injetado, ignorando chamada duplicada');
+      return;
+    }
+    var zone = window._udhyogAds.activeZone;
+    if (!zone) {
+      console.warn('[ADS] ❌ Nenhuma zone ativa! activeZone=', zone, 'zones=', window._udhyogAds.zones);
+      return;
+    }
+
+    console.log('[ADS] Zone selecionada:', zone);
+
+    var existing = document.getElementById('udhyog-ad-banner-wrapper');
+    if (existing) {
+      console.log('[ADS] Removendo wrapper anterior');
+      existing.remove();
+    }
+
+    // Banner inline — vai abaixo do player no layout natural da pagina
+    var wrapper = document.createElement('div');
+    wrapper.id = 'udhyog-ad-banner-wrapper';
+    wrapper.style.cssText = 'width:100%!important;display:flex!important;justify-content:center!important;align-items:center!important;padding:8px 0!important;background:rgba(0,0,0,0.95)!important;min-height:' + (zone.height + 16) + 'px!important;border-top:2px solid rgba(255,140,0,0.3)!important;border-bottom:1px solid rgba(255,255,255,0.08)!important;pointer-events:auto!important;position:relative!important;z-index:100!important;box-sizing:border-box!important';
+
+    var slot = document.createElement('div');
+    slot.id = 'udhyog-ad-banner-slot';
+    slot.style.cssText = 'width:' + zone.width + 'px;height:' + zone.height + 'px;display:block;position:relative';
+    wrapper.appendChild(slot);
+
+    // Carregamento inicial dos scripts Adsterra (1a impressao)
+    _udhyogLoadAdScripts(slot, zone, false);
+
+    // Posicionar banner INLINE no final do #channel-content (abaixo dos links/patrocinadores)
+    wrapper.style.cssText = 'width:100%!important;display:flex!important;justify-content:center!important;align-items:center!important;padding:24px 16px!important;margin:16px 0 0 0!important;background:rgba(0,0,0,0.4)!important;border-top:1px solid rgba(255,140,0,0.2)!important;border-radius:8px!important;box-sizing:border-box!important;position:relative!important';
+
+    // Tenta inserir como ultimo filho de #channel-content (Kick layout) — fica abaixo da section dos patrocinadores
+    var inserted = false;
+    var channelContent = document.getElementById('channel-content');
+    if (channelContent) {
+      channelContent.appendChild(wrapper);
+      console.log('[ADS] ✅ Banner inserido como ultimo filho de #channel-content');
+      inserted = true;
+    } else {
+      // Fallback 1: ultima <section> dentro do <main>
+      var sections = document.querySelectorAll('main section');
+      if (sections.length > 0) {
+        var lastSection = sections[sections.length - 1];
+        if (lastSection.parentNode) {
+          lastSection.parentNode.insertBefore(wrapper, lastSection.nextSibling);
+          console.log('[ADS] ✅ Banner inserido apos ultima section do main (fallback)');
+          inserted = true;
+        }
+      }
+    }
+    if (!inserted) {
+      // Ultimo recurso: fixed bottom da viewport
+      wrapper.style.cssText = 'position:fixed!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;display:flex!important;justify-content:center!important;align-items:center!important;padding:6px 0!important;background:rgba(0,0,0,0.92)!important;z-index:9999998!important;min-height:' + (zone.height + 12) + 'px!important;border-top:1px solid rgba(255,255,255,0.08)!important';
+      document.body.appendChild(wrapper);
+      console.log('[ADS] ⚠️ Fallback: banner fixed bottom (#channel-content nao encontrado)');
+    }
+    window._udhyogAds.bannerInjected = true;
+    window._udhyogAds.refreshCount = 0;
+    console.log('[ADS] ✅ Banner ' + zone.width + 'x' + zone.height + ' visivel?', wrapper.offsetHeight > 0, 'rect:', wrapper.getBoundingClientRect());
+
+    // Anti-redirect SILENCIOSO: intercepta navegacao programatica sem popup nativo do browser.
+    // Trackeia ultimo click "real" do user (fora do iframe ad). Se navegacao acontecer sem click
+    // recente, cancela silenciosamente (sem perguntar nada pro viewer).
+    if (!window._udhyogAds._redirectGuardSetup) {
+      window._udhyogAds._redirectGuardSetup = true;
+      window._udhyogAds._lastUserClick = Date.now();
+
+      // Captura clicks reais do user (fora do iframe ad)
+      document.addEventListener('click', function (e) {
+        if (!e.target.closest('#udhyog-ad-banner-wrapper')) {
+          window._udhyogAds._lastUserClick = Date.now();
+        }
+      }, true);
+
+      function _isLikelyAdRedirect() {
+        var msSinceClick = Date.now() - (window._udhyogAds._lastUserClick || 0);
+        return msSinceClick > 1500 && window._udhyogAds.bannerInjected;
+      }
+
+      // 1. Navigation API (Chrome 102+, melhor opcao — cancela silenciosamente)
+      if (typeof window.navigation !== 'undefined' && window.navigation && typeof window.navigation.addEventListener === 'function') {
+        try {
+          window.navigation.addEventListener('navigate', function (event) {
+            if (_isLikelyAdRedirect()) {
+              try {
+                event.preventDefault();
+                console.warn('[ADS] 🚫 Navigation API bloqueou:', event.destination && event.destination.url);
+              } catch (e) {}
+            }
+          });
+          console.log('[ADS] 🛡️ Navigation API guard ativo');
+        } catch (e) { console.warn('[ADS] Navigation API setup falhou:', e.message); }
+      }
+
+      // 2. Override location.assign / replace (silencioso)
+      try {
+        var origAssign = window.location.assign.bind(window.location);
+        var origReplace = window.location.replace.bind(window.location);
+        window.location.assign = function (url) {
+          if (_isLikelyAdRedirect()) {
+            console.warn('[ADS] 🚫 location.assign bloqueado:', url);
+            return;
+          }
+          return origAssign(url);
+        };
+        window.location.replace = function (url) {
+          if (_isLikelyAdRedirect()) {
+            console.warn('[ADS] 🚫 location.replace bloqueado:', url);
+            return;
+          }
+          return origReplace(url);
+        };
+      } catch (e) { console.warn('[ADS] Override assign/replace falhou:', e.message); }
+
+      // 3. Override location.href setter (cobre o caso mais comum: parent.location.href = '...')
+      try {
+        var locProto = Object.getPrototypeOf(window.location);
+        var origHref = Object.getOwnPropertyDescriptor(locProto, 'href');
+        if (origHref && origHref.set && origHref.configurable !== false) {
+          Object.defineProperty(window.location, 'href', {
+            configurable: true,
+            get: function () { return origHref.get.call(this); },
+            set: function (value) {
+              if (_isLikelyAdRedirect()) {
+                console.warn('[ADS] 🚫 location.href setter bloqueado:', value);
+                return;
+              }
+              origHref.set.call(this, value);
+            }
+          });
+        }
+      } catch (e) { console.warn('[ADS] Override location.href falhou:', e.message); }
+
+      console.log('[ADS] 🛡️ Anti-redirect guard ativo (silencioso, sem popup)');
+    }
+
+    // Verifica em 3s se o iframe do Adsterra realmente apareceu
+    setTimeout(function () {
+      var iframes = slot.querySelectorAll('iframe');
+      console.log('[ADS] 3s apos inject: ' + iframes.length + ' iframe(s) dentro do slot');
+      if (iframes.length > 0) {
+        var iframe = iframes[0];
+        console.log('[ADS] Iframe src:', iframe.src, 'size:', iframe.offsetWidth + 'x' + iframe.offsetHeight);
+      } else {
+        console.warn('[ADS] ⚠️ Nenhum iframe no slot apos 3s — Adsterra nao serviu ad ou foi bloqueado');
+      }
+    }, 3000);
+
+    // Auto-refresh a cada 30s — recarrega scripts Adsterra pra servir novo ad (= nova impression)
+    if (window._udhyogAds.refreshInterval) clearInterval(window._udhyogAds.refreshInterval);
+    window._udhyogAds.refreshInterval = setInterval(function () {
+      // So refresh se viewer estiver na aba ativa (evita queimar impression em aba background)
+      if (document.hidden) {
+        console.log('[ADS] ⏸️ Refresh pulado (aba em background)');
+        return;
+      }
+      var stillSlot = document.getElementById('udhyog-ad-banner-slot');
+      if (!stillSlot) {
+        // Slot foi removido (ex: showStreamEnded), para refresh
+        clearInterval(window._udhyogAds.refreshInterval);
+        window._udhyogAds.refreshInterval = null;
+        console.log('[ADS] ⏹️ Refresh parado (slot nao existe mais)');
+        return;
+      }
+      window._udhyogAds.refreshCount++;
+      console.log('[ADS] 🔄 Refresh #' + window._udhyogAds.refreshCount + ' (a cada ' + (_UDHYOG_AD_REFRESH_MS/1000) + 's)');
+      _udhyogLoadAdScripts(stillSlot, window._udhyogAds.activeZone, true);
+    }, _UDHYOG_AD_REFRESH_MS);
+    console.log('[ADS] ⏱️ Auto-refresh agendado a cada ' + (_UDHYOG_AD_REFRESH_MS/1000) + 's');
+  }
+
+  // Mostra checkbox de consent dentro do popup ja existente (NAO modal separado).
+  // Disable botao Conectar ate user marcar. Texto explicativo via os-status.
+  function _udhyogShowConsentInPopup() {
+    var wrap = document.getElementById('os-consent-wrap');
+    var checkbox = document.getElementById('os-consent-check');
+    var btn = document.getElementById('os-btn');
+    var status = document.getElementById('os-status');
+    if (!wrap || !checkbox || !btn) {
+      console.warn('[ADS] Popup nao existe mais — fallback pra modal hard block');
+      _udhyogShowAdblockBlock();
+      return;
+    }
+    wrap.style.display = 'flex';
+    checkbox.checked = false;
+    btn.disabled = true;
+    btn.style.opacity = '0.45';
+    btn.style.cursor = 'not-allowed';
+    btn.textContent = 'Marque a caixa para continuar';
+    if (status) {
+      status.textContent = 'Este streamer exibe anuncios. Aceite acima para continuar.';
+      status.style.color = '#ff8c00';
+      status.classList.add('has-msg');
+    }
+    console.log('[ADS] 📋 Checkbox de consent mostrado no popup (streamer tem ads)');
+  }
+
+  // Verifica LGPD consent + adblock antes de iniciar player.
+  // Resolve true = OK pra prosseguir. False = bloqueado.
+  function _udhyogCheckAdsGate(streamer) {
+    return new Promise(function (resolve) {
+      console.log('[ADS] 🚪 _udhyogCheckAdsGate chamado. streamer:', streamer);
+      console.log('[ADS] isMobile:', isMobile, 'viewport:', window.innerWidth + 'x' + window.innerHeight, 'platform:', navigator.platform);
+      console.log('[ADS] ads_enabled:', streamer && streamer.ads_enabled, 'ads_zones (raw):', streamer && streamer.ads_zones);
+
+      // Sem ads ou mobile: passa direto
+      if (!streamer) { console.log('[ADS] Bypass: sem streamer'); resolve(true); return; }
+      if (!streamer.ads_enabled) { console.log('[ADS] Bypass: ads_enabled=false (banco nao atualizado pra esse streamer?)'); resolve(true); return; }
+      if (isMobile) { console.log('[ADS] Bypass: mobile detectado'); resolve(true); return; }
+
+      var zones = streamer.ads_zones || [];
+      if (typeof zones === 'string') {
+        try { zones = JSON.parse(zones); console.log('[ADS] zones era string, parseado:', zones); }
+        catch (e) { console.error('[ADS] ❌ Erro parsing ads_zones JSON:', e); zones = []; }
+      }
+      if (!Array.isArray(zones) || zones.length === 0) { console.warn('[ADS] Bypass: zones vazio ou invalido', zones); resolve(true); return; }
+
+      window._udhyogAds.enabled = true;
+      window._udhyogAds.zones = zones;
+      window._udhyogAds.activeZone = _udhyogSelectAdsZone(zones);
+      console.log('[ADS] ✅ Ads habilitado. Zone selecionada:', window._udhyogAds.activeZone);
+
+      // 1. LGPD consent — checkbox aparece DENTRO do popup so se streamer tem ads E !consent
+      // ⚠️ BYPASS TEMPORARIO PRA TESTES — mudar SKIP_CONSENT_FOR_TESTING=false antes de prod com volume
+      var SKIP_CONSENT_FOR_TESTING = true;
+      var hasConsent = SKIP_CONSENT_FOR_TESTING ? true : _udhyogGetLGPDConsent();
+      console.log('[ADS] LGPD consent ja dado?', hasConsent, '(SKIP_CONSENT_FOR_TESTING=' + SKIP_CONSENT_FOR_TESTING + ')');
+      if (!hasConsent) {
+        console.log('[ADS] 📋 Streamer tem ads mas user nao deu consent — mostrando checkbox no popup');
+        _udhyogShowConsentInPopup();
+        resolve(false);
+        return;
+      }
+      // 2. Detecta adblock — se ativo, bloqueia
+      _udhyogDetectAdblock().then(function (hasAdblock) {
+        console.log('[ADS] Adblock detectado?', hasAdblock);
+        if (hasAdblock) {
+          console.log('[ADS] ❌ Adblock ativo — bloqueando');
+          _udhyogShowAdblockBlock();
+          resolve(false);
+          return;
+        }
+        console.log('[ADS] ✅ Gate passou — prosseguindo pra player');
+        resolve(true);
+      });
+    });
+  }
+
   // Detecta plataforma de streaming pela URL atual (kick.com ou twitch.tv)
   var STREAM_PLATFORM = location.hostname.includes('twitch.tv') ? 'twitch' : 'kick';
 
@@ -353,6 +789,10 @@
     '  <div class="os-divider"></div>',
     '  <label class="os-label">Codigo do Streamer</label>',
     '  <input id="os-code" class="os-input" type="text" placeholder="Digite seu codigo" spellcheck="false" autocomplete="off">',
+    '  <div id="os-consent-wrap" style="display:none;align-items:flex-start;gap:8px;margin:14px 0 4px;padding:10px 12px;background:rgba(255,140,0,0.06);border:1px solid rgba(255,140,0,0.15);border-radius:8px">',
+    '    <input type="checkbox" id="os-consent-check" style="margin-top:3px;cursor:pointer;accent-color:#ff8c00;flex-shrink:0">',
+    '    <label for="os-consent-check" style="font-size:12px;color:#bbb;line-height:1.5;cursor:pointer;flex:1">Este streamer exibe anuncios. Aceito ver anuncios e cookies para apoiar o servico gratuito.</label>',
+    '  </div>',
     '  <button id="os-btn" class="os-btn">Conectar</button>',
     '  <div id="os-status" class="os-status"></div>',
     '</div>',
@@ -362,9 +802,36 @@
   var lastCode = localStorage.getItem('overlay_last_code');
   if (lastCode) document.getElementById('os-code').value = lastCode;
 
+  // Setup do checkbox de consent.
+  // Botao Conectar comeca SEMPRE habilitado (consent só vira gate APOS validate confirmar ads_enabled).
+  // O wrap do checkbox fica oculto inicialmente — só aparece se streamer tiver ads E user nao tiver consent.
+  var consentCheckbox = document.getElementById('os-consent-check');
+  var connectBtn = document.getElementById('os-btn');
+  consentCheckbox.addEventListener('change', function () {
+    if (consentCheckbox.checked) {
+      localStorage.setItem('udhyog_lgpd_consent', 'accepted');
+      // Habilita botao quando user aceita (so relevante se wrap tiver visivel)
+      connectBtn.disabled = false;
+      connectBtn.style.opacity = '1';
+      connectBtn.style.cursor = 'pointer';
+      connectBtn.textContent = 'Conectar';
+      var st = document.getElementById('os-status');
+      if (st) { st.textContent = ''; st.classList.remove('has-msg'); }
+    } else {
+      localStorage.removeItem('udhyog_lgpd_consent');
+      // Se wrap esta visivel (ads_enabled), volta a desabilitar
+      var wrap = document.getElementById('os-consent-wrap');
+      if (wrap && wrap.style.display !== 'none') {
+        connectBtn.disabled = true;
+        connectBtn.style.opacity = '0.45';
+        connectBtn.style.cursor = 'not-allowed';
+      }
+    }
+  });
+
   document.getElementById('os-close').onclick = function () { overlay.remove(); };
   document.getElementById('os-code').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') document.getElementById('os-btn').click();
+    if (e.key === 'Enter' && !connectBtn.disabled) connectBtn.click();
   });
 
   function setStatus(msg, color) {
@@ -838,6 +1305,16 @@
 
       setStatus('Carregando player...', '#00d4ff');
 
+      // Gate de ads (LGPD + adblock detection) antes de iniciar player
+      _udhyogCheckAdsGate(data.streamer).then(function (allowed) {
+        if (!allowed) {
+          // Bloqueado:
+          //   - Sem consent: checkbox foi mostrado dentro do popup, MANTEM popup aberto pra user marcar
+          //   - Adblock: modal hard-block ja cobre tudo, popup fica atras (irrelevante)
+          // NAO remove overlay — se for consent, user precisa do popup pra marcar checkbox
+          return;
+        }
+
       // 5. Carregar hls.js e injetar player
       loadHLS(function () {
         // Container do player muda por plataforma:
@@ -882,6 +1359,12 @@
           else injectDesktop(player, nativeVideo, streamUrl);
         }
 
+        // Injeta banner de ads (desktop only, se ads_enabled e gate passou)
+        console.log('[ADS] Pos-inject player. enabled=' + (window._udhyogAds && window._udhyogAds.enabled) + ' isMobile=' + isMobile + ' — chamando inject?', !!(window._udhyogAds && window._udhyogAds.enabled && !isMobile));
+        if (window._udhyogAds && window._udhyogAds.enabled && !isMobile) {
+          _udhyogInjectAdsBanner();
+        }
+
         // 6. Métricas + heartbeat (stream_url inclusa no response — detecta rotação de UUID)
         sendMetricsJoin(streamerCode);
         startHeartbeat(streamerCode);
@@ -889,6 +1372,7 @@
 
         setStatus('Conectado!', '#4caf50');
         setTimeout(function () { overlay.remove(); }, 1500);
+      });
       });
     })
     .catch(function () {

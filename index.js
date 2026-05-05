@@ -621,6 +621,12 @@ async function initDB() {
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_kick REAL DEFAULT 0`);
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_twitch REAL DEFAULT 0`);
 
+    // Banner ads (controle por streamer) — Adsterra integration
+    // ads_zones é array JSONB de banners disponíveis: [{key, url, width, height}, ...]
+    // O overlay escolhe qual zone usar baseado na viewport do viewer.
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS ads_enabled BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS ads_zones JSONB DEFAULT '[]'::jsonb`);
+
     // Renomear kick_username → username (idempotente — só roda se kick_username ainda existe e username não)
     await pool.query(`
       DO $$
@@ -1290,7 +1296,7 @@ let streamerCacheLoaded = false;
 
 async function loadStreamerCache() {
   const result = await pool.query(
-    'SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, new_plataform, is_blocked FROM streamer'
+    'SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, new_plataform, is_blocked, ads_enabled, ads_zones FROM streamer'
   );
   // Limpar cache antes de recarregar
   for (const key in streamerCache) delete streamerCache[key];
@@ -2356,7 +2362,6 @@ app.put('/api/streamer/:id_streamer/commission', requireApiKeyOrAuth, async (req
 });
 
 // GET /api/logs — ler logs de uma live específica
-// Query: ?streamer=beli21&date=2026-03-26&live=1&filter=JOIN&tail=100
 app.get('/api/logs', requireApiKey, (req, res) => {
   try {
     const streamer = (req.query.streamer || '').toLowerCase();
@@ -2390,7 +2395,6 @@ app.get('/api/logs', requireApiKey, (req, res) => {
 });
 
 // GET /api/logs/dates — listar datas e lives disponíveis por streamer
-// Query: ?streamer=beli21 (opcional)
 app.get('/api/logs/dates', requireApiKey, (req, res) => {
   try {
     if (!fs.existsSync(LIVES_LOG_DIR)) return res.json({ dates: [] });
