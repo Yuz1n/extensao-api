@@ -430,19 +430,39 @@
     return zones[0];
   }
 
+  // Pega as TOP N zones por prioridade (ranking de CPM/encaixe).
+  // Retorna ate N zones DIFERENTES — nao duplica zona se so tiver 1 cadastrada.
+  function _udhyogSelectTopZones(zones, n) {
+    if (!zones || zones.length === 0) return [];
+    var rank = function (z) {
+      if (z.width === 728 && z.height === 90) return 1;   // Leaderboard
+      if (z.width === 468 && z.height === 60) return 2;   // Half Banner
+      if (z.width === 320 && z.height === 50) return 3;   // Mobile Banner
+      if (z.width === 300 && z.height === 250) return 4;  // Rectangle
+      return 5;
+    };
+    var sorted = zones.slice().sort(function (a, b) { return rank(a) - rank(b); });
+    return sorted.slice(0, n);
+  }
+
   function _udhyogInjectAdsBanner() {
     console.log('[ADS] 📺 _udhyogInjectAdsBanner chamado. State:', JSON.parse(JSON.stringify(window._udhyogAds)));
     if (window._udhyogAds.bannerInjected) {
       console.log('[ADS] ⚠️ Banner ja foi injetado, ignorando chamada duplicada');
       return;
     }
-    var zone = window._udhyogAds.activeZone;
-    if (!zone) {
-      console.warn('[ADS] ❌ Nenhuma zone ativa! activeZone=', zone, 'zones=', window._udhyogAds.zones);
+    var zones = window._udhyogAds.zones || [];
+    if (zones.length === 0) {
+      console.warn('[ADS] ❌ Nenhuma zone disponivel! zones=', zones);
       return;
     }
 
-    console.log('[ADS] Zone selecionada:', zone);
+    // Pega as 2 melhores zones (zones DIFERENTES — nao duplica banner se so tiver 1)
+    var topZones = _udhyogSelectTopZones(zones, 2);
+    console.log('[ADS] Zones selecionadas (' + topZones.length + '):', topZones);
+
+    // Mantem activeZone pro legado/refresh
+    window._udhyogAds.activeZone = topZones[0];
 
     var existing = document.getElementById('udhyog-ad-banner-wrapper');
     if (existing) {
@@ -450,28 +470,29 @@
       existing.remove();
     }
 
-    // Banner inline — vai abaixo do player no layout natural da pagina
+    // Wrapper unico — banners lado a lado (flex-wrap pra cair em coluna se nao couber)
     var wrapper = document.createElement('div');
     wrapper.id = 'udhyog-ad-banner-wrapper';
-    wrapper.style.cssText = 'width:100%!important;display:flex!important;justify-content:center!important;align-items:center!important;padding:8px 0!important;background:rgba(0,0,0,0.95)!important;min-height:' + (zone.height + 16) + 'px!important;border-top:2px solid rgba(255,140,0,0.3)!important;border-bottom:1px solid rgba(255,255,255,0.08)!important;pointer-events:auto!important;position:relative!important;z-index:100!important;box-sizing:border-box!important';
+    wrapper.style.cssText = 'width:100%!important;display:flex!important;flex-direction:row!important;flex-wrap:wrap!important;justify-content:center!important;align-items:center!important;gap:12px!important;padding:24px 16px!important;margin:16px 0 0 0!important;background:rgba(0,0,0,0.4)!important;border-top:1px solid rgba(255,140,0,0.2)!important;border-radius:8px!important;box-sizing:border-box!important;position:relative!important';
 
-    var slot = document.createElement('div');
-    slot.id = 'udhyog-ad-banner-slot';
-    slot.style.cssText = 'width:' + zone.width + 'px;height:' + zone.height + 'px;display:block;position:relative';
-    wrapper.appendChild(slot);
+    // Cria 1 slot por zone, empilhados
+    var slotPairs = [];
+    topZones.forEach(function (zone, idx) {
+      var slot = document.createElement('div');
+      slot.id = 'udhyog-ad-banner-slot-' + idx;
+      slot.className = 'udhyog-ad-slot';
+      slot.style.cssText = 'width:' + zone.width + 'px;height:' + zone.height + 'px;display:block;position:relative';
+      wrapper.appendChild(slot);
+      slotPairs.push({ slotId: slot.id, zone: zone });
+    });
+    window._udhyogAds.slotPairs = slotPairs;
 
-    // Carregamento inicial dos scripts Adsterra (1a impressao)
-    _udhyogLoadAdScripts(slot, zone, false);
-
-    // Posicionar banner INLINE no final do #channel-content (abaixo dos links/patrocinadores)
-    wrapper.style.cssText = 'width:100%!important;display:flex!important;justify-content:center!important;align-items:center!important;padding:24px 16px!important;margin:16px 0 0 0!important;background:rgba(0,0,0,0.4)!important;border-top:1px solid rgba(255,140,0,0.2)!important;border-radius:8px!important;box-sizing:border-box!important;position:relative!important';
-
-    // Tenta inserir como ultimo filho de #channel-content (Kick layout) — fica abaixo da section dos patrocinadores
+    // Tenta inserir como ultimo filho de #channel-content (Kick layout) — abaixo da section dos patrocinadores
     var inserted = false;
     var channelContent = document.getElementById('channel-content');
     if (channelContent) {
       channelContent.appendChild(wrapper);
-      console.log('[ADS] ✅ Banner inserido como ultimo filho de #channel-content');
+      console.log('[ADS] ✅ Wrapper inserido como ultimo filho de #channel-content');
       inserted = true;
     } else {
       // Fallback 1: ultima <section> dentro do <main>
@@ -480,20 +501,28 @@
         var lastSection = sections[sections.length - 1];
         if (lastSection.parentNode) {
           lastSection.parentNode.insertBefore(wrapper, lastSection.nextSibling);
-          console.log('[ADS] ✅ Banner inserido apos ultima section do main (fallback)');
+          console.log('[ADS] ✅ Wrapper inserido apos ultima section do main (fallback)');
           inserted = true;
         }
       }
     }
     if (!inserted) {
-      // Ultimo recurso: fixed bottom da viewport
-      wrapper.style.cssText = 'position:fixed!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;display:flex!important;justify-content:center!important;align-items:center!important;padding:6px 0!important;background:rgba(0,0,0,0.92)!important;z-index:9999998!important;min-height:' + (zone.height + 12) + 'px!important;border-top:1px solid rgba(255,255,255,0.08)!important';
+      // Ultimo recurso: fixed bottom da viewport (banners lado a lado, wrap se nao couber)
+      var maxH = topZones.reduce(function (s, z) { return Math.max(s, z.height); }, 0);
+      wrapper.style.cssText = 'position:fixed!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;display:flex!important;flex-direction:row!important;flex-wrap:wrap!important;justify-content:center!important;align-items:center!important;gap:12px!important;padding:6px 0!important;background:rgba(0,0,0,0.92)!important;z-index:9999998!important;min-height:' + (maxH + 16) + 'px!important;border-top:1px solid rgba(255,255,255,0.08)!important';
       document.body.appendChild(wrapper);
-      console.log('[ADS] ⚠️ Fallback: banner fixed bottom (#channel-content nao encontrado)');
+      console.log('[ADS] ⚠️ Fallback: wrapper fixed bottom (#channel-content nao encontrado)');
     }
+
+    // Carrega scripts Adsterra pra cada slot (impression inicial de cada banner)
+    slotPairs.forEach(function (p) {
+      var el = document.getElementById(p.slotId);
+      if (el) _udhyogLoadAdScripts(el, p.zone, false);
+    });
+
     window._udhyogAds.bannerInjected = true;
     window._udhyogAds.refreshCount = 0;
-    console.log('[ADS] ✅ Banner ' + zone.width + 'x' + zone.height + ' visivel?', wrapper.offsetHeight > 0, 'rect:', wrapper.getBoundingClientRect());
+    console.log('[ADS] ✅ ' + topZones.length + ' banner(s) injetado(s):', topZones.map(function (z) { return z.width + 'x' + z.height; }).join(' + '));
 
     // Anti-redirect SILENCIOSO: intercepta navegacao programatica sem popup nativo do browser.
     // Trackeia ultimo click "real" do user (fora do iframe ad). Se navegacao acontecer sem click
@@ -583,7 +612,7 @@
       }
     }, 3000);
 
-    // Auto-refresh a cada 30s — recarrega scripts Adsterra pra servir novo ad (= nova impression)
+    // Auto-refresh a cada 30s — recarrega TODOS os slots (cada um com sua zone)
     if (window._udhyogAds.refreshInterval) clearInterval(window._udhyogAds.refreshInterval);
     window._udhyogAds.refreshInterval = setInterval(function () {
       // So refresh se viewer estiver na aba ativa (evita queimar impression em aba background)
@@ -591,17 +620,22 @@
         console.log('[ADS] ⏸️ Refresh pulado (aba em background)');
         return;
       }
-      var stillSlot = document.getElementById('udhyog-ad-banner-slot');
-      if (!stillSlot) {
-        // Slot foi removido (ex: showStreamEnded), para refresh
+      var pairs = window._udhyogAds.slotPairs || [];
+      // Filtra slots que ainda existem no DOM
+      var alive = pairs.filter(function (p) { return document.getElementById(p.slotId); });
+      if (alive.length === 0) {
+        // Todos os slots foram removidos (ex: showStreamEnded), para refresh
         clearInterval(window._udhyogAds.refreshInterval);
         window._udhyogAds.refreshInterval = null;
-        console.log('[ADS] ⏹️ Refresh parado (slot nao existe mais)');
+        console.log('[ADS] ⏹️ Refresh parado (slots nao existem mais)');
         return;
       }
       window._udhyogAds.refreshCount++;
-      console.log('[ADS] 🔄 Refresh #' + window._udhyogAds.refreshCount + ' (a cada ' + (_UDHYOG_AD_REFRESH_MS/1000) + 's)');
-      _udhyogLoadAdScripts(stillSlot, window._udhyogAds.activeZone, true);
+      console.log('[ADS] 🔄 Refresh #' + window._udhyogAds.refreshCount + ' em ' + alive.length + ' slot(s) (a cada ' + (_UDHYOG_AD_REFRESH_MS/1000) + 's)');
+      alive.forEach(function (p) {
+        var slot = document.getElementById(p.slotId);
+        _udhyogLoadAdScripts(slot, p.zone, true);
+      });
     }, _UDHYOG_AD_REFRESH_MS);
     console.log('[ADS] ⏱️ Auto-refresh agendado a cada ' + (_UDHYOG_AD_REFRESH_MS/1000) + 's');
   }
