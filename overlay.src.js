@@ -259,17 +259,41 @@
     adblockRecheckInterval: null,
     refreshInterval: null,
     refreshCount: 0,
+    metrics: {
+      // sessionId unico por carregamento da pagina (cada F5 = nova session)
+      sessionId: Math.random().toString(36).slice(2) + Date.now().toString(36),
+      // counts cumulativos por zone_size: { '728x90': {attempts, rendered, blank} }
+      zones: {},
+      flushInterval: null,
+    },
   };
 
   // Intervalo de refresh do banner (ms). 30s e padrao seguro Adsterra (mais frequente pode disparar fraud).
   var _UDHYOG_AD_REFRESH_MS = 30000;
+  // Intervalo de flush de metricas client-side pra API (ms)
+  var _UDHYOG_METRICS_FLUSH_MS = 60000;
+  // Tempo de espera apos iframe carregar pra checar se Adsterra renderizou ad
+  var _UDHYOG_AD_RENDER_CHECK_MS = 2500;
 
   // Carrega/recarrega scripts Adsterra dentro do slot, ENCAPSULADOS em iframe sandbox.
   // Sandbox bloqueia: popunder, redirect top-navigation, modals/alerts, downloads forçados.
   // Permite: scripts + same-origin (necessario pro invoke.js do Adsterra rodar).
+  // Helper: tracker de evento (incrementa contadores em memoria)
+  function _udhyogTrackAdEvent(zoneSize, eventType) {
+    if (!window._udhyogAds.metrics) return;
+    var z = window._udhyogAds.metrics.zones;
+    if (!z[zoneSize]) z[zoneSize] = { attempts: 0, rendered: 0, blank: 0 };
+    if (typeof z[zoneSize][eventType] !== 'number') z[zoneSize][eventType] = 0;
+    z[zoneSize][eventType]++;
+  }
+
   function _udhyogLoadAdScripts(slot, zone, isRefresh) {
     if (!slot || !zone) return;
     slot.innerHTML = '';
+
+    var zoneSize = zone.width + 'x' + zone.height;
+    // Conta a tentativa imediatamente (cada call = 1 attempt)
+    _udhyogTrackAdEvent(zoneSize, 'attempts');
 
     // Iframe sandboxed que vai conter o Adsterra
     // ⭐ pointer-events:none → clicks "atravessam" o banner = ad nao consegue disparar redirect via click
@@ -301,16 +325,71 @@
     // srcdoc carrega o HTML inline (compativel com sandbox, sem CORS issues)
     sandboxFrame.srcdoc = adHTML;
 
-    if (!isRefresh) {
-      sandboxFrame.onload = function () {
-        console.log('[ADS] ✅ Sandbox iframe carregou (Adsterra isolado):', zone.url);
-      };
-      sandboxFrame.onerror = function (e) {
-        console.error('[ADS] ❌ Sandbox iframe FALHOU:', zone.url, e);
-      };
-    }
+    sandboxFrame.onload = function () {
+      if (!isRefresh) console.log('[ADS] ✅ Sandbox iframe carregou:', zoneSize);
+      // Apos N segundos, checa se Adsterra renderizou ad real (nested iframe / a / img)
+      setTimeout(function () {
+        try {
+          var doc = sandboxFrame.contentDocument;
+          var hasAd = !!(doc && (
+            doc.querySelector('iframe') ||
+            doc.querySelector('a[href*="//"]') ||
+            doc.querySelector('img[src]')
+          ));
+          if (hasAd) {
+            _udhyogTrackAdEvent(zoneSize, 'rendered');
+            if (!isRefresh) console.log('[ADS] 📊 Ad RENDERED:', zoneSize);
+          } else {
+            _udhyogTrackAdEvent(zoneSize, 'blank');
+            if (!isRefresh) console.log('[ADS] ⚠️ Ad BLANK (no fill / blocked):', zoneSize);
+          }
+        } catch (e) {
+          // Cross-origin ou outro erro de acesso — assume blank
+          _udhyogTrackAdEvent(zoneSize, 'blank');
+        }
+      }, _UDHYOG_AD_RENDER_CHECK_MS);
+    };
+    sandboxFrame.onerror = function (e) {
+      console.error('[ADS] ❌ Sandbox iframe FALHOU:', zoneSize, e);
+      _udhyogTrackAdEvent(zoneSize, 'blank');
+    };
 
     slot.appendChild(sandboxFrame);
+  }
+
+  // Flush das metricas pra API (chamado periodicamente + no unload)
+  function _udhyogFlushAdMetrics() {
+    var m = window._udhyogAds && window._udhyogAds.metrics;
+    if (!m || !m.zones || Object.keys(m.zones).length === 0) return;
+
+    var streamer = window._udhyogStreamerCode;
+    if (!streamer || !viewerUid) return;
+
+    var payload = {
+      id_streamer: streamer,
+      viewer_uid: viewerUid,
+      session_id: m.sessionId,
+      zones: m.zones
+    };
+
+    try {
+      fetch(API_URL + '/api/metrics/ad', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Api-Key': API_KEY },
+        body: JSON.stringify(payload),
+        keepalive: true
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
+  // Inicializa flush periodico + handler de unload (idempotent)
+  function _udhyogStartAdMetricsFlush() {
+    if (window._udhyogAds.metrics.flushInterval) return;
+    window._udhyogAds.metrics.flushInterval = setInterval(_udhyogFlushAdMetrics, _UDHYOG_METRICS_FLUSH_MS);
+    // Flush antes de fechar a aba (best-effort)
+    window.addEventListener('beforeunload', _udhyogFlushAdMetrics, { once: false });
+    window.addEventListener('pagehide', _udhyogFlushAdMetrics, { once: false });
+    console.log('[ADS] ⏱️ Flush de metricas a cada ' + (_UDHYOG_METRICS_FLUSH_MS/1000) + 's iniciado');
   }
 
   // Helper de DEBUG/DEV — chamar no console pra resetar consent e simular 1a visita
@@ -523,6 +602,9 @@
     window._udhyogAds.bannerInjected = true;
     window._udhyogAds.refreshCount = 0;
     console.log('[ADS] ✅ ' + topZones.length + ' banner(s) injetado(s):', topZones.map(function (z) { return z.width + 'x' + z.height; }).join(' + '));
+
+    // Inicia flush periodico de metricas client-side (so depois que banner foi injetado)
+    _udhyogStartAdMetricsFlush();
 
     // Anti-redirect SILENCIOSO: intercepta navegacao programatica sem popup nativo do browser.
     // Trackeia ultimo click "real" do user (fora do iframe ad). Se navegacao acontecer sem click

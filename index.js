@@ -627,6 +627,28 @@ async function initDB() {
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS ads_enabled BOOLEAN DEFAULT false`);
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS ads_zones JSONB DEFAULT '[]'::jsonb`);
 
+    // Métricas de ads (instrumentação client-side)
+    // Cada flush do overlay = 1 row por (live, viewer, session, zone). UPSERT pelo unique.
+    // Comparando attempts/rendered/blank com Adsterra dashboard, identificamos onde tá o vazamento.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ad_metrics_log (
+        id BIGSERIAL PRIMARY KEY,
+        live_id INTEGER REFERENCES lives(id) ON DELETE CASCADE,
+        id_streamer VARCHAR(50),
+        viewer_uid VARCHAR(64),
+        session_id VARCHAR(32),
+        zone_size VARCHAR(20),
+        attempts INTEGER DEFAULT 0,
+        rendered INTEGER DEFAULT 0,
+        blank INTEGER DEFAULT 0,
+        first_seen TIMESTAMPTZ DEFAULT NOW(),
+        last_seen TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(live_id, viewer_uid, session_id, zone_size)
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ad_metrics_live ON ad_metrics_log(live_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ad_metrics_streamer ON ad_metrics_log(id_streamer, last_seen DESC)`);
+
     // Renomear kick_username → username (idempotente — só roda se kick_username ainda existe e username não)
     await pool.query(`
       DO $$
@@ -650,7 +672,28 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_streamer ON invoices(id_streamer)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)`);
 
-    console.log('[DB] Tabelas streamer, lives, live_viewer_sessions, invoices prontas');
+    // Version gate — bloqueia .exe desatualizado no startup do streamer-app.
+    // Consultada por /api/app/version-check. Bumpar required_version força update.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_versions (
+        app_name         VARCHAR(50)  PRIMARY KEY,
+        required_version VARCHAR(20)  NOT NULL,
+        download_url     TEXT,
+        message          TEXT,
+        updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+      )
+    `);
+    // Seed inicial: registra streamer_app com a versao corrente (0.1.0).
+    // Pra forcar update: UPDATE app_versions SET required_version='0.2.0' WHERE app_name='streamer_app';
+    await pool.query(`
+      INSERT INTO app_versions (app_name, required_version, download_url, message)
+      VALUES ('streamer_app', '0.1.0',
+              'https://discord.gg/SEU_INVITE_AQUI',
+              'Por favor atualize seu aplicativo. Link disponível no Discord.')
+      ON CONFLICT (app_name) DO NOTHING
+    `);
+
+    console.log('[DB] Tabelas streamer, lives, live_viewer_sessions, invoices, app_versions prontas');
 
     const count = await pool.query('SELECT COUNT(*) FROM streamer');
     console.log(`[DB] Streamers cadastrados: ${count.rows[0].count}`);
@@ -662,6 +705,63 @@ async function initDB() {
 // ══════════════════════════════════════════════
 // ── ROTAS ──
 // ══════════════════════════════════════════════
+
+// ── GET /api/app/version-check ──
+// Gate de versao usado pelo streamer-app no startup. Compara versao instalada
+// com app_versions.required_version. Semantica: app_version >= required = OK.
+// 200 = ok, 426 Upgrade Required = bloqueio (UI mostra modal "Atualize via Discord").
+// Fail-open no app: erro 5xx/timeout permite startup (nao brica streamers se API cair).
+app.get('/api/app/version-check', requireApiKey, async (req, res) => {
+  try {
+    const { app: appName, version } = req.query;
+    if (!appName || !version) {
+      return res.status(400).json({ message: 'Parametros app e version obrigatorios' });
+    }
+
+    const result = await pool.query(
+      'SELECT required_version, download_url, message FROM app_versions WHERE app_name = $1',
+      [appName]
+    );
+
+    // App nao registrado na tabela = sem gate (nao bloqueia)
+    if (result.rows.length === 0) {
+      return res.json({ status: 'ok', registered: false });
+    }
+
+    const { required_version, download_url, message } = result.rows[0];
+
+    if (versionGte(version, required_version)) {
+      return res.json({ status: 'ok', required: required_version });
+    }
+
+    // 426 Upgrade Required — RFC 7231
+    return res.status(426).json({
+      status: 'outdated',
+      required: required_version,
+      current: version,
+      message: message || 'Por favor atualize seu aplicativo.',
+      download_url: download_url || null,
+    });
+  } catch (e) {
+    console.error('[VERSION-CHECK]', e.message);
+    return res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// Compara duas versoes 'X.Y.Z'. Retorna true se a >= b. Trata strings nao-numericas como 0.
+function versionGte(a, b) {
+  const parse = v => String(v).split('.').map(n => parseInt(n, 10) || 0);
+  const ap = parse(a);
+  const bp = parse(b);
+  const len = Math.max(ap.length, bp.length);
+  for (let i = 0; i < len; i++) {
+    const av = ap[i] || 0;
+    const bv = bp[i] || 0;
+    if (av > bv) return true;
+    if (av < bv) return false;
+  }
+  return true; // igual = aceita
+}
 
 // ── POST /api/auth/login ──
 app.post('/api/auth/login', async (req, res) => {
@@ -1469,6 +1569,135 @@ app.post('/api/viewer/leave', requireApiKey, async (req, res) => {
     });
   } catch (err) {
     logger.live(id_streamer, 'ERROR', '[LEAVE] Erro:', err.message);
+    return res.status(500).json({ message: 'Erro interno do servidor' });
+  }
+});
+
+// ── POST /api/metrics/ad — Recebe métricas client-side de loading do banner ──
+// Cada flush do overlay envia totals desde início da sessão (idempotent UPSERT).
+// Permite comparar attempts/rendered/blank com Adsterra dashboard pra achar onde vaza.
+app.post('/api/metrics/ad', requireApiKey, async (req, res) => {
+  try {
+    const id_streamer = (req.body.id_streamer || '').toLowerCase();
+    const viewer_uid = req.body.viewer_uid;
+    const session_id = req.body.session_id;
+    const zones = req.body.zones; // { '728x90': {attempts, rendered, blank}, ... }
+
+    if (!id_streamer || !viewer_uid || !session_id || !zones) {
+      return res.status(400).json({ message: 'Campos obrigatorios faltando' });
+    }
+
+    const live = activeLives[id_streamer];
+    if (!live) {
+      // Sem live ativa, descarta silenciosamente (viewer pode ter pago após end)
+      return res.json({ accepted: false, reason: 'no_active_live' });
+    }
+
+    // UPSERT cada zone — client envia totals desde inicio da session, server faz REPLACE
+    const queries = [];
+    for (const [zone_size, counts] of Object.entries(zones)) {
+      if (!counts || typeof counts !== 'object') continue;
+      const attempts = parseInt(counts.attempts || 0, 10);
+      const rendered = parseInt(counts.rendered || 0, 10);
+      const blank = parseInt(counts.blank || 0, 10);
+      if (attempts === 0 && rendered === 0 && blank === 0) continue;
+
+      queries.push(pool.query(
+        `INSERT INTO ad_metrics_log (live_id, id_streamer, viewer_uid, session_id, zone_size, attempts, rendered, blank, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         ON CONFLICT (live_id, viewer_uid, session_id, zone_size)
+         DO UPDATE SET
+           attempts = GREATEST(ad_metrics_log.attempts, EXCLUDED.attempts),
+           rendered = GREATEST(ad_metrics_log.rendered, EXCLUDED.rendered),
+           blank    = GREATEST(ad_metrics_log.blank, EXCLUDED.blank),
+           last_seen = NOW()`,
+        [live.liveId, id_streamer, viewer_uid, session_id, zone_size, attempts, rendered, blank]
+      ));
+    }
+    await Promise.all(queries);
+
+    return res.json({ accepted: true, zones_updated: queries.length });
+  } catch (err) {
+    console.error('[METRICS/AD] Erro:', err.message);
+    return res.status(500).json({ message: 'Erro interno do servidor' });
+  }
+});
+
+// ── GET /api/admin/ad-stats — Agregação de métricas de ads por live ──
+// Query params: live_id (opcional) OU id_streamer (pega live ativa)
+app.get('/api/admin/ad-stats', requireApiKey, async (req, res) => {
+  try {
+    let liveId = req.query.live_id ? parseInt(req.query.live_id, 10) : null;
+    const id_streamer = (req.query.id_streamer || '').toLowerCase();
+
+    if (!liveId && id_streamer) {
+      const live = activeLives[id_streamer];
+      if (live) liveId = live.liveId;
+      else {
+        // Pega live mais recente
+        const r = await pool.query('SELECT live_id FROM lives WHERE LOWER(id_streamer) = $1 ORDER BY started_at DESC LIMIT 1', [id_streamer]);
+        if (r.rows.length) liveId = r.rows[0].live_id;
+      }
+    }
+
+    if (!liveId) {
+      return res.status(400).json({ message: 'Forneca live_id ou id_streamer com live ativa/recente' });
+    }
+
+    // Agregação por zone
+    const byZone = await pool.query(`
+      SELECT
+        zone_size,
+        SUM(attempts) AS total_attempts,
+        SUM(rendered) AS total_rendered,
+        SUM(blank) AS total_blank,
+        COUNT(DISTINCT viewer_uid) AS unique_viewers,
+        COUNT(DISTINCT session_id) AS sessions
+      FROM ad_metrics_log
+      WHERE live_id = $1
+      GROUP BY zone_size
+      ORDER BY total_attempts DESC
+    `, [liveId]);
+
+    // Totais agregados
+    const totalsR = await pool.query(`
+      SELECT
+        SUM(attempts) AS attempts,
+        SUM(rendered) AS rendered,
+        SUM(blank) AS blank,
+        COUNT(DISTINCT viewer_uid) AS unique_viewers,
+        COUNT(DISTINCT session_id) AS sessions
+      FROM ad_metrics_log
+      WHERE live_id = $1
+    `, [liveId]);
+
+    const t = totalsR.rows[0];
+    const renderRate = t.attempts > 0 ? (t.rendered / t.attempts * 100).toFixed(1) : 0;
+    const blankRate = t.attempts > 0 ? (t.blank / t.attempts * 100).toFixed(1) : 0;
+
+    return res.json({
+      live_id: liveId,
+      totals: {
+        attempts: parseInt(t.attempts || 0, 10),
+        rendered: parseInt(t.rendered || 0, 10),
+        blank: parseInt(t.blank || 0, 10),
+        unique_viewers: parseInt(t.unique_viewers || 0, 10),
+        sessions: parseInt(t.sessions || 0, 10),
+        render_rate_pct: parseFloat(renderRate),
+        blank_rate_pct: parseFloat(blankRate),
+      },
+      by_zone: byZone.rows.map(r => ({
+        zone_size: r.zone_size,
+        attempts: parseInt(r.total_attempts, 10),
+        rendered: parseInt(r.total_rendered, 10),
+        blank: parseInt(r.total_blank, 10),
+        unique_viewers: parseInt(r.unique_viewers, 10),
+        sessions: parseInt(r.sessions, 10),
+        render_rate_pct: parseInt(r.total_attempts, 10) > 0 ? parseFloat((r.total_rendered / r.total_attempts * 100).toFixed(1)) : 0,
+      })),
+    });
+  } catch (err) {
+    console.error('[ADMIN/AD-STATS] Erro:', err.message);
     return res.status(500).json({ message: 'Erro interno do servidor' });
   }
 });
