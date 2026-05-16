@@ -958,6 +958,61 @@ app.get('/api/streamer/me/payment', requireAuth, async (req, res) => {
   }
 });
 
+// ── POST /api/streamer/me/log-upload — Streamer envia chunk do log do app ──
+// Recebe bytes raw do log (Content-Type: application/octet-stream).
+// Headers:
+//   X-Log-Filename: '2026-05-15.log' (validado anti path-traversal)
+//   X-Log-Mode: 'append' | 'replace'
+// Escreve em log-app/{id_streamer}/{filename}. Permite visibilidade real-time
+// do que ta acontecendo no app do streamer (atraso ate LOG_UPLOAD_INTERVAL).
+const LOG_APP_DIR = path.join(__dirname, 'log-app');
+const LOG_UPLOAD_MAX_BYTES = 50 * 1024 * 1024; // 50MB por request
+
+app.post(
+  '/api/streamer/me/log-upload',
+  requireAuth,
+  express.raw({ type: 'application/octet-stream', limit: LOG_UPLOAD_MAX_BYTES }),
+  async (req, res) => {
+    try {
+      if (req.auth.role !== 'streamer') {
+        return res.status(403).json({ message: 'Apenas streamers' });
+      }
+
+      const filename = String(req.headers['x-log-filename'] || '').trim();
+      const mode = String(req.headers['x-log-mode'] || 'append').toLowerCase();
+
+      // Anti path-traversal: aceita só YYYY-MM-DD.log ou simlar (alfanum + . - _)
+      if (!/^[A-Za-z0-9_.\-]+\.log$/.test(filename)) {
+        return res.status(400).json({ message: 'Filename invalido (esperado YYYY-MM-DD.log)' });
+      }
+      if (mode !== 'append' && mode !== 'replace') {
+        return res.status(400).json({ message: 'X-Log-Mode deve ser append ou replace' });
+      }
+
+      const body = req.body;
+      if (!Buffer.isBuffer(body) || body.length === 0) {
+        return res.status(400).json({ message: 'Body vazio ou invalido (Content-Type deve ser application/octet-stream)' });
+      }
+
+      const idStreamer = req.auth.id_streamer;
+      const dir = path.join(LOG_APP_DIR, idStreamer);
+      await fs.promises.mkdir(dir, { recursive: true });
+
+      const filePath = path.join(dir, filename);
+      if (mode === 'replace') {
+        await fs.promises.writeFile(filePath, body);
+      } else {
+        await fs.promises.appendFile(filePath, body);
+      }
+
+      return res.json({ ok: true, bytes: body.length, mode, path: `log-app/${idStreamer}/${filename}` });
+    } catch (e) {
+      console.error('[LOG-UPLOAD]', e.message);
+      return res.status(500).json({ message: e.message });
+    }
+  }
+);
+
 // ── PUT /api/streamer/me/password — Streamer troca a própria senha ──
 app.put('/api/streamer/me/password', requireAuth, async (req, res) => {
   try {
