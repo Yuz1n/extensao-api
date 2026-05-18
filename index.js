@@ -763,6 +763,17 @@ function versionGte(a, b) {
   return true; // igual = aceita
 }
 
+// ── GET /api/auth/validate — valida se JWT ainda eh valido (usado pelo streamer-app no startup) ──
+// requireAuth ja faz toda a validacao: assina + expiracao. Se passar, 200; se nao, 401.
+app.get('/api/auth/validate', requireAuth, (req, res) => {
+  res.json({
+    valid: true,
+    role: req.auth.role,
+    id_streamer: req.auth.id_streamer || null,
+    login: req.auth.login || null,
+  });
+});
+
 // ── POST /api/auth/login ──
 app.post('/api/auth/login', async (req, res) => {
   try {
@@ -1195,7 +1206,8 @@ setInterval(() => {
 app.get('/api/admin/invoices', requireApiKey, async (req, res) => {
   try {
     const { status, id_streamer } = req.query;
-    let q = `SELECT i.*, s."user" as streamer_name FROM invoices i
+    let q = `SELECT i.*, s."user" as streamer_name, COALESCE(s.is_blocked, false) as is_blocked
+             FROM invoices i
              LEFT JOIN streamer s ON LOWER(s.id_streamer) = LOWER(i.id_streamer)`;
     const conditions = [];
     const values = [];
