@@ -1651,14 +1651,96 @@
   // e a qualidade atual
   window._udhyogStreamBase = '';
   window._udhyogCurrentQuality = isMobile ? '720p' : '1080p';
+  // Qualidades disponiveis no master.m3u8 — populado dinamicamente em startHLS()
+  // Fallback inicial: ['1080p', '720p'] (comportamento legado). Sera substituido
+  // pelos NAMEs reais lidos do master.m3u8, suportando STREAM_MODE do streamer.
+  window._udhyogAvailableQualities = ['1080p', '720p'];
+
+  // Parse variants do master.m3u8 pra detectar qualidades disponiveis.
+  // Necessario porque streamer pode estar em modo so 720p ou so 1080p — menu
+  // de qualidade deve refletir o que ESTA disponivel, nao um hardcoded.
+  //
+  // Duas estrategias (em ordem de preferencia):
+  //   1. NAME="..." em #EXT-X-STREAM-INF — quando ffmpeg inclui (multi-variant)
+  //   2. Path da linha depois de #EXT-X-STREAM-INF — ffmpeg OMITE NAME quando
+  //      tem 1 variant só (modo 720p_only/1080p_only). Linha vira "720p\stream.m3u8"
+  //      ou "720p/stream.m3u8" — extrai primeiro segment como quality.
+  function fetchAvailableQualities(base, callback) {
+    var done = false;
+    function finish(list) {
+      if (done) return;
+      done = true;
+      window._udhyogAvailableQualities = (list && list.length > 0)
+        ? list : ['1080p', '720p'];
+      callback();
+    }
+    // Timeout 3s — se master.m3u8 demorar muito, segue com fallback
+    var timeoutId = setTimeout(function () { finish(null); }, 3000);
+    fetch(base + '/master.m3u8', { cache: 'no-store' })
+      .then(function (r) { return r.text(); })
+      .then(function (text) {
+        clearTimeout(timeoutId);
+        var names = [];
+
+        // Strategy 1: NAME="..." attribute
+        var re = /NAME="([^"]+)"/g;
+        var m;
+        while ((m = re.exec(text)) !== null) {
+          if (names.indexOf(m[1]) < 0) names.push(m[1]);
+        }
+
+        // Strategy 2: fallback — parse path da linha depois de STREAM-INF.
+        // ffmpeg single-variant nao inclui NAME, mas escreve "720p\stream.m3u8"
+        // ou "720p/stream.m3u8". Pega primeiro segment (separador / ou \).
+        if (names.length === 0) {
+          var lines = text.split(/\r?\n/);
+          for (var i = 0; i < lines.length - 1; i++) {
+            if (lines[i].indexOf('#EXT-X-STREAM-INF:') === 0) {
+              var pathLine = lines[i + 1].trim();
+              if (pathLine && pathLine.charAt(0) !== '#') {
+                var seg = pathLine.split(/[\/\\]/)[0];
+                if (seg && names.indexOf(seg) < 0) names.push(seg);
+              }
+            }
+          }
+        }
+
+        finish(names);
+      })
+      .catch(function () {
+        clearTimeout(timeoutId);
+        finish(null);
+      });
+  }
+
+  // Escolhe qualidade default baseada no que ESTA disponivel.
+  // Preferencia: desktop 1080p, mobile 720p. Se preferida nao existe, pega a
+  // alternativa. Se nada existir, fallback pra primeira variant.
+  function pickDefaultQuality() {
+    var available = window._udhyogAvailableQualities || ['1080p', '720p'];
+    var prefer = isMobile ? ['720p', '1080p'] : ['1080p', '720p'];
+    for (var i = 0; i < prefer.length; i++) {
+      if (available.indexOf(prefer[i]) >= 0) return prefer[i];
+    }
+    return available[0] || (isMobile ? '720p' : '1080p');
+  }
 
   function startHLS(video, streamUrl) {
-    var defaultQuality = isMobile ? '720p' : '1080p';
     var base = streamUrl.replace(/\/master\.m3u8$/, '');
     window._udhyogStreamBase = base;
-    window._udhyogCurrentQuality = defaultQuality;
     window._udhyogVideo = video;
     window._udhyogIsNativeHLS = false;
+
+    // Descobre quais variants existem (1080p/720p/etc) antes de escolher default.
+    // Necessario pra suportar STREAM_MODE do streamer (so 720p ou so 1080p).
+    fetchAvailableQualities(base, function () {
+      var defaultQuality = pickDefaultQuality();
+      window._udhyogCurrentQuality = defaultQuality;
+      _startHLSWithQuality(video, base, defaultQuality);
+    });
+  }
+
+  function _startHLSWithQuality(video, base, defaultQuality) {
     var initialUrl = base + '/' + defaultQuality + '/stream.m3u8';
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
@@ -2634,7 +2716,8 @@
   }
 
   function createQualitySelector() {
-    var qualities = ['1080p', '720p'];
+    // Lista de qualidades vem do master.m3u8 (populado por fetchAvailableQualities).
+    // Fallback ['1080p', '720p'] caso fetch tenha falhado.
     var wrap = document.createElement('div');
     wrap.id = 'stream-quality-wrap';
 
@@ -2651,6 +2734,12 @@
     btn.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();
+
+      // Se so 1 qualidade disponivel, nao faz sentido abrir menu
+      var qualities = window._udhyogAvailableQualities || ['1080p', '720p'];
+      if (qualities.length <= 1) {
+        return;
+      }
 
       if (menuOpen) {
         menu.classList.remove('open');
@@ -2713,6 +2802,17 @@
 
     wrap.appendChild(btn);
     wrap.appendChild(menu);
+
+    // Esconde o botao se so houver 1 qualidade — menu inutil (recheck periodico
+    // caso fetch de qualities tenha terminado depois da criacao do botao)
+    function syncBtnVisibility() {
+      var qs = window._udhyogAvailableQualities || ['1080p', '720p'];
+      btn.style.display = qs.length <= 1 ? 'none' : '';
+    }
+    syncBtnVisibility();
+    setTimeout(syncBtnVisibility, 1000);  // re-check apos fetch async terminar
+    setTimeout(syncBtnVisibility, 3000);
+
     return wrap;
   }
 

@@ -1146,8 +1146,11 @@ async function generateInvoiceForStreamer(streamer, periodStart, periodEnd) {
 // Gera cobranças automáticas pra todos os streamers
 async function generateWeeklyInvoices() {
   try {
-    // Calcular período: quinta passada → quinta de ontem (roda na sexta 00h, pega quinta a quinta)
-    // Ex: roda sexta 10/04 → período 03/04 (quinta) até 09/04 (quinta)
+    // Calcular periodo: sexta passada → quinta (roda na sexta 00h, fecha a semana sex→qui).
+    // Ex: roda sexta 10/04 → periodo 03/04 (sexta) ate 09/04 (quinta) = 7 dias.
+    // Antes era startDate = endDate - 7 (qui→qui, 8 dias inclusivos) — fazia toda quinta
+    // entrar em DOIS invoices consecutivos (double-billing). Fix: usar - 6 pra startDate
+    // cair em SEXTA, garantindo periodos contiguos sem overlap nem buraco.
     const now = new Date();
     const brNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
     // endDate = quinta mais recente (ontem se hoje é sexta)
@@ -1157,9 +1160,9 @@ async function generateWeeklyInvoices() {
     const daysBack = (dayOfWeek + 3) % 7; // sex=1, sab=2, dom=3, seg=4, ter=5, qua=6, qui=0
     endDate.setDate(endDate.getDate() - daysBack);
     endDate.setHours(0, 0, 0, 0);
-    // startDate = 7 dias antes do endDate (quinta anterior)
+    // startDate = 6 dias antes do endDate → cai na SEXTA (periodo sex→qui = 7 dias)
     const startDate = new Date(endDate);
-    startDate.setDate(startDate.getDate() - 7);
+    startDate.setDate(startDate.getDate() - 6);
 
     const periodStart = startDate.toISOString().split('T')[0];
     const periodEnd = endDate.toISOString().split('T')[0];
@@ -1188,7 +1191,7 @@ async function generateWeeklyInvoices() {
 }
 
 // Cron interno: checar a cada minuto se é sexta-feira 00:00 BRT
-// Gera cobranças referentes à semana quinta→quinta que acabou de fechar
+// Gera cobranças referentes à semana sexta→quinta (7 dias) que acabou de fechar
 let _lastBillingCheck = '';
 setInterval(() => {
   const brNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
