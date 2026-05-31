@@ -1497,7 +1497,7 @@ async function processValidate(id_streamer, req, res) {
       console.log(`[VALIDATE] Streamer "${id_streamer}" nao encontrado`);
       return res.status(404).json({
         valid: false,
-        message: 'Streamer nao encontrado'
+        message: 'Streamer não encontrado no sistema'
       });
     }
 
@@ -1505,7 +1505,7 @@ async function processValidate(id_streamer, req, res) {
       console.log(`[VALIDATE] Streamer "${id_streamer}" bloqueado`);
       return res.status(403).json({
         valid: false,
-        message: 'Streamer bloqueado por inadimplencia'
+        message: 'Streamer não possibilitado de realizar live no momento'
       });
     }
 

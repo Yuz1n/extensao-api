@@ -1521,7 +1521,9 @@
           })
           .then(function (result) {
             if (!result.ok || !result.data.valid) {
-              setStatus('Streamer nao encontrado no sistema', '#f44336');
+              // Usa a mensagem específica da API (bloqueado / não encontrado) com fallback
+              var msg = (result.data && result.data.message) || 'Streamer não encontrado no sistema';
+              setStatus(msg, '#f44336');
               btn.disabled = false;
               btn.textContent = 'Conectar';
               return;
@@ -1614,7 +1616,9 @@
       var data = await resp.json();
 
       if (!resp.ok || !data.valid) {
-        setStatus('Streamer nao encontrado no sistema', '#f44336');
+        // Usa a mensagem específica da API (bloqueado / não encontrado) com fallback
+        var msg = (data && data.message) || 'Streamer não encontrado no sistema';
+        setStatus(msg, '#f44336');
         btn.disabled = false;
         btn.textContent = 'Conectar';
         return;
