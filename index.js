@@ -1330,7 +1330,13 @@ app.get('/api/streamer/me/invoices', requireAuth, async (req, res) => {
       'SELECT * FROM invoices WHERE LOWER(id_streamer) = LOWER($1) ORDER BY created_at DESC',
       [req.auth.id_streamer]
     );
-    return res.json({ invoices: result.rows });
+    // Estado de bloqueio do proprio streamer (pro banner de status no dashboard)
+    const st = await pool.query(
+      'SELECT COALESCE(is_blocked, false) as is_blocked FROM streamer WHERE LOWER(id_streamer) = LOWER($1) LIMIT 1',
+      [req.auth.id_streamer]
+    );
+    const isBlocked = st.rows[0]?.is_blocked || false;
+    return res.json({ invoices: result.rows, is_blocked: isBlocked });
   } catch (e) {
     return res.status(500).json({ message: e.message });
   }
