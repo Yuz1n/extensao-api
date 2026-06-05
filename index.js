@@ -622,33 +622,6 @@ async function initDB() {
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_kick REAL DEFAULT 0`);
     await pool.query(`ALTER TABLE lives ADD COLUMN IF NOT EXISTS avg_viewers_twitch REAL DEFAULT 0`);
 
-    // Banner ads (controle por streamer) — Adsterra integration
-    // ads_zones é array JSONB de banners disponíveis: [{key, url, width, height}, ...]
-    // O overlay escolhe qual zone usar baseado na viewport do viewer.
-    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS ads_enabled BOOLEAN DEFAULT false`);
-    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS ads_zones JSONB DEFAULT '[]'::jsonb`);
-
-    // Métricas de ads (instrumentação client-side)
-    // Cada flush do overlay = 1 row por (live, viewer, session, zone). UPSERT pelo unique.
-    // Comparando attempts/rendered/blank com Adsterra dashboard, identificamos onde tá o vazamento.
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ad_metrics_log (
-        id BIGSERIAL PRIMARY KEY,
-        live_id INTEGER REFERENCES lives(id) ON DELETE CASCADE,
-        id_streamer VARCHAR(50),
-        viewer_uid VARCHAR(64),
-        session_id VARCHAR(32),
-        zone_size VARCHAR(20),
-        attempts INTEGER DEFAULT 0,
-        rendered INTEGER DEFAULT 0,
-        blank INTEGER DEFAULT 0,
-        first_seen TIMESTAMPTZ DEFAULT NOW(),
-        last_seen TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(live_id, viewer_uid, session_id, zone_size)
-      )
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ad_metrics_live ON ad_metrics_log(live_id)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ad_metrics_streamer ON ad_metrics_log(id_streamer, last_seen DESC)`);
 
     // Renomear kick_username → username (idempotente — só roda se kick_username ainda existe e username não)
     await pool.query(`
@@ -672,6 +645,20 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_live_viewer_sessions_ip ON live_viewer_sessions(ip)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_streamer ON invoices(id_streamer)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)`);
+
+    // PixGG — anti-reuso de donate: cada donate.id so paga uma cobranca (PK garante)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pixgg_donations_used (
+        donate_id BIGINT PRIMARY KEY,
+        id_streamer VARCHAR(255),
+        invoice_id INTEGER,
+        total_amount REAL,
+        donator_nickname VARCHAR(255),
+        used_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    // Flag: streamer estava AO VIVO quando a cobranca foi gerada → bloqueia ao fim da live
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS pending_block BOOLEAN DEFAULT false`);
 
     // Version gate — bloqueia .exe desatualizado no startup do streamer-app.
     // Consultada por /api/app/version-check. Bumpar required_version força update.
@@ -1181,11 +1168,23 @@ async function generateWeeklyInvoices() {
     // Buscar todos os streamers e gerar cobrança pra cada um
     const streamers = await pool.query('SELECT id, "user", id_streamer, value_per_view_hour, commission, billing_type, fixed_weekly_value FROM streamer');
     let generated = 0;
+    let blocked = 0;
     for (const s of streamers.rows) {
       const ok = await generateInvoiceForStreamer(s, periodStart, periodEnd);
-      if (ok) generated++;
+      if (!ok) continue;
+      generated++;
+      // Bloqueio automatico: offline bloqueia ja; ao vivo agenda bloqueio pro fim da live
+      const isLive = !!activeLives[s.id_streamer.toLowerCase()];
+      if (isLive) {
+        await pool.query('UPDATE streamer SET pending_block = true WHERE LOWER(id_streamer) = LOWER($1)', [s.id_streamer]);
+        console.log(`[BILLING] ${s.user} ao vivo — bloqueio agendado pro fim da live`);
+      } else {
+        await pool.query('UPDATE streamer SET is_blocked = true WHERE LOWER(id_streamer) = LOWER($1)', [s.id_streamer]);
+        blocked++;
+      }
     }
-    console.log(`[BILLING] ${generated} cobranças geradas para ${periodStart} → ${periodEnd}`);
+    invalidateStreamerCache();
+    console.log(`[BILLING] ${generated} cobranças geradas para ${periodStart} → ${periodEnd} | ${blocked} bloqueados (offline)`);
   } catch (e) {
     console.error('[BILLING] Erro ao gerar cobranças:', e.message);
   }
@@ -1220,7 +1219,9 @@ app.get('/api/admin/invoices', requireApiKey, async (req, res) => {
     if (conditions.length) q += ' WHERE ' + conditions.join(' AND ');
     q += ' ORDER BY i.created_at DESC';
     const result = await pool.query(q, values);
-    return res.json({ total: result.rows.length, invoices: result.rows });
+    // Dias ate o token do PixGG expirar — pro admin renovar antes de quebrar o desbloqueio
+    const pixggTokenDaysLeft = pixgg.getTokenDaysLeft(process.env.PIXGG_ACCESS_TOKEN || '');
+    return res.json({ total: result.rows.length, invoices: result.rows, pixggTokenDaysLeft });
   } catch (e) {
     return res.status(500).json({ message: e.message });
   }
@@ -1335,18 +1336,79 @@ app.get('/api/streamer/me/invoices', requireAuth, async (req, res) => {
   }
 });
 
-// ── POST /api/streamer/me/invoices/:id/pay — Streamer marca como pago ──
+// ── POST /api/streamer/me/invoices/:id/pay — Streamer confirma pagamento (valida no PixGG) ──
 app.post('/api/streamer/me/invoices/:id/pay', requireAuth, async (req, res) => {
   try {
     if (req.auth.role !== 'streamer') return res.status(403).json({ message: 'Apenas streamers' });
-    const result = await pool.query(
-      `UPDATE invoices SET status = 'paid', paid_at = NOW()
-       WHERE id = $1 AND LOWER(id_streamer) = LOWER($2) AND status IN ('pending', 'overdue') RETURNING id`,
-      [req.params.id, req.auth.id_streamer]
+    const idStreamer = req.auth.id_streamer;
+
+    // 1. Busca a cobranca pendente do proprio streamer
+    const inv = await pool.query(
+      `SELECT id, created_at FROM invoices
+       WHERE id = $1 AND LOWER(id_streamer) = LOWER($2) AND status IN ('pending', 'overdue') LIMIT 1`,
+      [req.params.id, idStreamer]
     );
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Cobrança não encontrada ou já paga' });
-    return res.json({ paid: true, id: result.rows[0].id });
+    if (inv.rows.length === 0) {
+      return res.status(404).json({ message: 'Cobrança não encontrada ou já paga' });
+    }
+    const invoice = inv.rows[0];
+
+    // 2. Procura donate elegivel no PixGG (nick == id, > R$50, aprovado, apos a geracao).
+    //    Margem de 24h pra cobrir diferenca de fuso entre PixGG e servidor.
+    const afterDate = new Date(new Date(invoice.created_at).getTime() - 24 * 3600 * 1000);
+    const pg = await pixgg.findEligibleDonations({ idStreamer, minAmount: 50, afterDate });
+
+    if (!pg.ok) {
+      // Falha de infra (token expirado / WAF / rede) — NAO marca pago, pede retry
+      console.error(`[PIXGG] Validacao falhou pra ${idStreamer}: ${pg.error} (status ${pg.status})`);
+      return res.status(502).json({
+        message: 'Não conseguimos validar seu pagamento agora. Tente novamente em alguns minutos.',
+      });
+    }
+
+    if (pg.eligible.length === 0) {
+      return res.status(400).json({
+        notFound: true,
+        message: `Não encontramos seu pagamento. Confirme: doação de mais de R$50 no PixGG com o apelido igual ao seu ID de streamer ("${idStreamer}").`,
+      });
+    }
+
+    // 3. Anti-reuso: consome o primeiro donate ainda nao usado. O INSERT com PK
+    //    (donate_id) ON CONFLICT serve de trava final contra clique duplo/race.
+    let consumed = null;
+    for (const d of pg.eligible) {
+      const ins = await pool.query(
+        `INSERT INTO pixgg_donations_used (donate_id, id_streamer, invoice_id, total_amount, donator_nickname)
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (donate_id) DO NOTHING RETURNING donate_id`,
+        [d.id, idStreamer, invoice.id, d.totalAmount, d.donatorNickname]
+      );
+      if (ins.rows.length > 0) { consumed = d; break; }
+    }
+
+    if (!consumed) {
+      return res.status(400).json({
+        notFound: true,
+        message: 'Esse pagamento já foi usado em uma cobrança anterior. Faça uma nova doação para esta cobrança.',
+      });
+    }
+
+    // 4. Marca pago + DESBLOQUEIA (limpa pending_block tambem)
+    await pool.query(`UPDATE invoices SET status = 'paid', paid_at = NOW() WHERE id = $1`, [invoice.id]);
+    await pool.query(
+      'UPDATE streamer SET is_blocked = false, pending_block = false WHERE LOWER(id_streamer) = LOWER($1)',
+      [idStreamer]
+    );
+    invalidateStreamerCache();
+    console.log(`[PIXGG] ${idStreamer} pagou invoice #${invoice.id} via donate #${consumed.id} (R$${consumed.totalAmount}) — DESBLOQUEADO`);
+
+    return res.json({
+      paid: true,
+      unblocked: true,
+      id: invoice.id,
+      donate: { nick: consumed.donatorNickname, amount: consumed.totalAmount },
+    });
   } catch (e) {
+    console.error('[PIXGG] Erro no pay:', e.message);
     return res.status(500).json({ message: e.message });
   }
 });
@@ -1489,7 +1551,7 @@ let streamerCacheLoaded = false;
 
 async function loadStreamerCache() {
   const result = await pool.query(
-    'SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, new_plataform, is_blocked, ads_enabled, ads_zones FROM streamer'
+    'SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, new_plataform, is_blocked FROM streamer'
   );
   // Limpar cache antes de recarregar
   for (const key in streamerCache) delete streamerCache[key];
@@ -1672,135 +1734,6 @@ app.post('/api/viewer/leave', requireApiKey, async (req, res) => {
   }
 });
 
-// ── POST /api/metrics/ad — Recebe métricas client-side de loading do banner ──
-// Cada flush do overlay envia totals desde início da sessão (idempotent UPSERT).
-// Permite comparar attempts/rendered/blank com Adsterra dashboard pra achar onde vaza.
-app.post('/api/metrics/ad', requireApiKey, async (req, res) => {
-  try {
-    const id_streamer = (req.body.id_streamer || '').toLowerCase();
-    const viewer_uid = req.body.viewer_uid;
-    const session_id = req.body.session_id;
-    const zones = req.body.zones; // { '728x90': {attempts, rendered, blank}, ... }
-
-    if (!id_streamer || !viewer_uid || !session_id || !zones) {
-      return res.status(400).json({ message: 'Campos obrigatorios faltando' });
-    }
-
-    const live = activeLives[id_streamer];
-    if (!live) {
-      // Sem live ativa, descarta silenciosamente (viewer pode ter pago após end)
-      return res.json({ accepted: false, reason: 'no_active_live' });
-    }
-
-    // UPSERT cada zone — client envia totals desde inicio da session, server faz REPLACE
-    const queries = [];
-    for (const [zone_size, counts] of Object.entries(zones)) {
-      if (!counts || typeof counts !== 'object') continue;
-      const attempts = parseInt(counts.attempts || 0, 10);
-      const rendered = parseInt(counts.rendered || 0, 10);
-      const blank = parseInt(counts.blank || 0, 10);
-      if (attempts === 0 && rendered === 0 && blank === 0) continue;
-
-      queries.push(pool.query(
-        `INSERT INTO ad_metrics_log (live_id, id_streamer, viewer_uid, session_id, zone_size, attempts, rendered, blank, last_seen)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-         ON CONFLICT (live_id, viewer_uid, session_id, zone_size)
-         DO UPDATE SET
-           attempts = GREATEST(ad_metrics_log.attempts, EXCLUDED.attempts),
-           rendered = GREATEST(ad_metrics_log.rendered, EXCLUDED.rendered),
-           blank    = GREATEST(ad_metrics_log.blank, EXCLUDED.blank),
-           last_seen = NOW()`,
-        [live.liveId, id_streamer, viewer_uid, session_id, zone_size, attempts, rendered, blank]
-      ));
-    }
-    await Promise.all(queries);
-
-    return res.json({ accepted: true, zones_updated: queries.length });
-  } catch (err) {
-    console.error('[METRICS/AD] Erro:', err.message);
-    return res.status(500).json({ message: 'Erro interno do servidor' });
-  }
-});
-
-// ── GET /api/admin/ad-stats — Agregação de métricas de ads por live ──
-// Query params: live_id (opcional) OU id_streamer (pega live ativa)
-app.get('/api/admin/ad-stats', requireApiKey, async (req, res) => {
-  try {
-    let liveId = req.query.live_id ? parseInt(req.query.live_id, 10) : null;
-    const id_streamer = (req.query.id_streamer || '').toLowerCase();
-
-    if (!liveId && id_streamer) {
-      const live = activeLives[id_streamer];
-      if (live) liveId = live.liveId;
-      else {
-        // Pega live mais recente
-        const r = await pool.query('SELECT live_id FROM lives WHERE LOWER(id_streamer) = $1 ORDER BY started_at DESC LIMIT 1', [id_streamer]);
-        if (r.rows.length) liveId = r.rows[0].live_id;
-      }
-    }
-
-    if (!liveId) {
-      return res.status(400).json({ message: 'Forneca live_id ou id_streamer com live ativa/recente' });
-    }
-
-    // Agregação por zone
-    const byZone = await pool.query(`
-      SELECT
-        zone_size,
-        SUM(attempts) AS total_attempts,
-        SUM(rendered) AS total_rendered,
-        SUM(blank) AS total_blank,
-        COUNT(DISTINCT viewer_uid) AS unique_viewers,
-        COUNT(DISTINCT session_id) AS sessions
-      FROM ad_metrics_log
-      WHERE live_id = $1
-      GROUP BY zone_size
-      ORDER BY total_attempts DESC
-    `, [liveId]);
-
-    // Totais agregados
-    const totalsR = await pool.query(`
-      SELECT
-        SUM(attempts) AS attempts,
-        SUM(rendered) AS rendered,
-        SUM(blank) AS blank,
-        COUNT(DISTINCT viewer_uid) AS unique_viewers,
-        COUNT(DISTINCT session_id) AS sessions
-      FROM ad_metrics_log
-      WHERE live_id = $1
-    `, [liveId]);
-
-    const t = totalsR.rows[0];
-    const renderRate = t.attempts > 0 ? (t.rendered / t.attempts * 100).toFixed(1) : 0;
-    const blankRate = t.attempts > 0 ? (t.blank / t.attempts * 100).toFixed(1) : 0;
-
-    return res.json({
-      live_id: liveId,
-      totals: {
-        attempts: parseInt(t.attempts || 0, 10),
-        rendered: parseInt(t.rendered || 0, 10),
-        blank: parseInt(t.blank || 0, 10),
-        unique_viewers: parseInt(t.unique_viewers || 0, 10),
-        sessions: parseInt(t.sessions || 0, 10),
-        render_rate_pct: parseFloat(renderRate),
-        blank_rate_pct: parseFloat(blankRate),
-      },
-      by_zone: byZone.rows.map(r => ({
-        zone_size: r.zone_size,
-        attempts: parseInt(r.total_attempts, 10),
-        rendered: parseInt(r.total_rendered, 10),
-        blank: parseInt(r.total_blank, 10),
-        unique_viewers: parseInt(r.unique_viewers, 10),
-        sessions: parseInt(r.sessions, 10),
-        render_rate_pct: parseInt(r.total_attempts, 10) > 0 ? parseFloat((r.total_rendered / r.total_attempts * 100).toFixed(1)) : 0,
-      })),
-    });
-  } catch (err) {
-    console.error('[ADMIN/AD-STATS] Erro:', err.message);
-    return res.status(500).json({ message: 'Erro interno do servidor' });
-  }
-});
-
 // ── GET /api/viewer/count/:id_streamer — Ver contagem atual ──
 app.get('/api/viewer/count/:id_streamer', requireApiKey, async (req, res) => {
   const { id_streamer } = req.params;
@@ -1890,7 +1823,7 @@ app.post('/api/streamer', requireApiKeyOrAuth, async (req, res) => {
 app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { id_streamer } = req.params;
-    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour, billing_type, fixed_weekly_value, new_plataform, ads_enabled, ads_zones } = req.body;
+    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour, billing_type, fixed_weekly_value, new_plataform } = req.body;
 
     console.log(`[UPDATE] Atualizando streamer: "${id_streamer}" body:`, JSON.stringify(req.body));
 
@@ -1911,8 +1844,6 @@ app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
     if (billing_type !== undefined)         { fields.push(`billing_type = $${idx++}`);         values.push(billing_type); }
     if (fixed_weekly_value !== undefined)   { fields.push(`fixed_weekly_value = $${idx++}`);   values.push(fixed_weekly_value); }
     if (new_plataform !== undefined)        { fields.push(`new_plataform = $${idx++}`);        values.push(new_plataform || null); }
-    if (ads_enabled !== undefined)          { fields.push(`ads_enabled = $${idx++}`);          values.push(!!ads_enabled); }
-    if (ads_zones !== undefined)            { fields.push(`ads_zones = $${idx++}`);            values.push(JSON.stringify(ads_zones)); }
 
     if (fields.length === 0) {
       return res.status(400).json({ message: 'Nenhum campo para atualizar' });
@@ -2233,6 +2164,20 @@ async function onLiveEnd(idStreamer) {
   } catch (e) {
     logger.live(idStreamer, 'ERROR', '[LIVE] Erro ao encerrar:', e.message);
   }
+
+  // Bloqueio diferido: cobranca foi gerada enquanto o streamer estava AO VIVO →
+  // bloqueia agora que a live encerrou (nao derrubou a transmissao no meio).
+  try {
+    const pb = await pool.query('SELECT pending_block FROM streamer WHERE LOWER(id_streamer) = LOWER($1)', [idStreamer]);
+    if (pb.rows[0]?.pending_block) {
+      await pool.query('UPDATE streamer SET is_blocked = true, pending_block = false WHERE LOWER(id_streamer) = LOWER($1)', [idStreamer]);
+      invalidateStreamerCache();
+      logger.live(idStreamer, 'INFO', '[BILLING] Bloqueado ao fim da live (cobrança pendente)');
+    }
+  } catch (e) {
+    logger.live(idStreamer, 'ERROR', '[BILLING] Erro no bloqueio diferido:', e.message);
+  }
+
   delete activeLives[idStreamer];
   delete activeViewers[idStreamer];
 }

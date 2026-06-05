@@ -90,4 +90,37 @@ async function getDonations({ donatorNickName = '', page = 1, pageSize = 10 } = 
   return { ok: true, status: resp.status, donations: Array.isArray(data) ? data : [], error: null };
 }
 
-module.exports = { getDonations, getTokenExpiry, getTokenDaysLeft };
+/**
+ * Busca donates ELEGIVEIS pra pagar a cobranca de um streamer.
+ * Filtra: nick == idStreamer (case-insensitive, trim), totalAmount > minAmount,
+ * status == 3 (aprovado), approvedDate >= afterDate.
+ *
+ * NAO checa anti-reuso — isso o caller faz no banco (tabela pixgg_donations_used),
+ * pra manter este modulo sem dependencia de DB.
+ *
+ * Retorna { ok, status, eligible, error }. eligible ordenado do mais recente.
+ */
+async function findEligibleDonations({ idStreamer, minAmount = 50, afterDate = null }) {
+  const r = await getDonations({ donatorNickName: idStreamer, page: 1, pageSize: 50 });
+  if (!r.ok) return { ok: false, status: r.status, eligible: [], error: r.error };
+
+  const nick = (idStreamer || '').trim().toLowerCase();
+  const cutoff = afterDate ? new Date(afterDate).getTime() : null;
+
+  const eligible = r.donations.filter((d) => {
+    if ((d.donatorNickname || '').trim().toLowerCase() !== nick) return false;
+    if (Number(d.totalAmount) <= minAmount) return false;
+    if (Number(d.status) !== 3) return false;
+    if (cutoff !== null) {
+      const ad = d.approvedDate ? new Date(d.approvedDate).getTime() : 0;
+      if (!ad || ad < cutoff) return false;
+    }
+    return true;
+  });
+
+  // Mais recente primeiro
+  eligible.sort((a, b) => new Date(b.approvedDate || 0) - new Date(a.approvedDate || 0));
+  return { ok: true, status: r.status, eligible, error: null };
+}
+
+module.exports = { getDonations, getTokenExpiry, getTokenDaysLeft, findEligibleDonations };
