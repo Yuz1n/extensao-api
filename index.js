@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const pixgg = require('./pixgg');
 
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const ADMIN_USER = process.env.ADMIN_USER || '';
@@ -1298,6 +1299,28 @@ app.post('/api/admin/streamer/:id_streamer/unblock', requireApiKey, async (req, 
   }
 });
 
+// ── GET /api/admin/pixgg-test — Testa se o servidor passa pelo WAF do PixGG ──
+// TEMPORARIO: valida o bloqueante (WAF + token) antes de construir o fluxo de
+// desbloqueio automatico. Remover apos confirmar.
+app.get('/api/admin/pixgg-test', requireApiKey, async (req, res) => {
+  try {
+    const daysLeft = pixgg.getTokenDaysLeft(process.env.PIXGG_ACCESS_TOKEN || '');
+    const result = await pixgg.getDonations({ pageSize: 3 });
+    return res.json({
+      tokenDaysLeft: daysLeft,           // dias ate o token expirar (null = nao configurado/invalido)
+      passouWAF: result.ok,              // true = servidor conseguiu falar com o PixGG
+      httpStatus: result.status,         // 200 ok | 401 token | 403 WAF
+      error: result.error,
+      sampleCount: result.donations.length,
+      sample: result.donations.slice(0, 2).map(d => ({
+        nick: d.donatorNickname, total: d.totalAmount, status: d.status, date: d.approvedDate,
+      })),
+    });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
 // ── GET /api/streamer/me/invoices — Listar cobranças do streamer autenticado ──
 app.get('/api/streamer/me/invoices', requireAuth, async (req, res) => {
   try {
@@ -1503,9 +1526,15 @@ async function processValidate(id_streamer, req, res) {
 
     if (streamer.is_blocked) {
       console.log(`[VALIDATE] Streamer "${id_streamer}" bloqueado`);
+      // O app do streamer se identifica com viewer_uid=streamer-app-validate.
+      // Pra ELE mostramos o motivo real (inadimplência); pro VIEWER, msg neutra
+      // (não expõe publicamente que o streamer está devendo).
+      const isStreamerApp = req.query.viewer_uid === 'streamer-app-validate';
       return res.status(403).json({
         valid: false,
-        message: 'Streamer não possibilitado de realizar live no momento'
+        message: isStreamerApp
+          ? 'Conta bloqueada por inadimplência. Regularize o pagamento para voltar a transmitir.'
+          : 'Streamer não possibilitado de realizar live no momento'
       });
     }
 
