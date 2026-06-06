@@ -1300,6 +1300,21 @@ app.post('/api/admin/streamer/:id_streamer/unblock', requireApiKey, async (req, 
   }
 });
 
+// ── GET /api/admin/pixgg-token — Dias restantes do token PixGG (leve: só decodifica o JWT) ──
+// Usado pelo banner do dashboard admin. NAO chama o PixGG (rápido, pode ser chamado sempre).
+app.get('/api/admin/pixgg-token', requireApiKey, (req, res) => {
+  try {
+    const token = process.env.PIXGG_ACCESS_TOKEN || '';
+    return res.json({
+      configured: !!token,
+      daysLeft: pixgg.getTokenDaysLeft(token),
+      expiresAt: pixgg.getTokenExpiry(token),
+    });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
 // ── GET /api/admin/pixgg-test — Testa se o servidor passa pelo WAF do PixGG ──
 // TEMPORARIO: valida o bloqueante (WAF + token) antes de construir o fluxo de
 // desbloqueio automatico. Remover apos confirmar.
