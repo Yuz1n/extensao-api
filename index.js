@@ -1276,6 +1276,28 @@ app.post('/api/admin/invoices/:id/overdue', requireApiKey, async (req, res) => {
   }
 });
 
+// ── POST /api/admin/invoices/:id/mark-paid — Admin marca pago DIRETO (pagamento fora do PixGG) ──
+// Pra quando o streamer paga direto pro admin. Vai pra 'confirmed' (quitado) + desbloqueia.
+// Atualiza os dois lados: admin vê "Confirmado", streamer vê "Pago" e some o bloqueio.
+app.post('/api/admin/invoices/:id/mark-paid', requireApiKey, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE invoices SET status = 'confirmed', paid_at = COALESCE(paid_at, NOW()), confirmed_at = NOW(), confirmed_by = 'admin'
+       WHERE id = $1 AND status IN ('pending', 'overdue') RETURNING id, id_streamer`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Cobrança não encontrada ou já paga' });
+    const idStreamer = result.rows[0].id_streamer;
+    // Pagou → desbloqueia o streamer (limpa bloqueio imediato e o agendado)
+    await pool.query('UPDATE streamer SET is_blocked = false, pending_block = false WHERE LOWER(id_streamer) = LOWER($1)', [idStreamer]);
+    invalidateStreamerCache();
+    console.log(`[ADMIN] Invoice #${result.rows[0].id} marcada como paga (direto) + ${idStreamer} desbloqueado`);
+    return res.json({ paid: true, id: result.rows[0].id, id_streamer: idStreamer });
+  } catch (e) {
+    return res.status(500).json({ message: e.message });
+  }
+});
+
 // ── POST /api/admin/streamer/:id_streamer/block — Bloquear streamer (admin) ──
 app.post('/api/admin/streamer/:id_streamer/block', requireApiKey, async (req, res) => {
   try {
