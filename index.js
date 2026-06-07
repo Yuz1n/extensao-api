@@ -6,6 +6,7 @@ const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pixgg = require('./pixgg');
+const exchange = require('./exchange');
 
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const ADMIN_USER = process.env.ADMIN_USER || '';
@@ -607,6 +608,9 @@ async function initDB() {
         confirmed_by VARCHAR(255)
       )
     `);
+    // Cotação USD→BRL congelada no momento do pagamento (valor em real da cobrança paga
+    // não muda depois; só as em aberto variam com a cotação atual).
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS paid_usd_brl_rate REAL`);
 
     // Coluna de bloqueio no streamer
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT false`);
@@ -1281,10 +1285,12 @@ app.post('/api/admin/invoices/:id/overdue', requireApiKey, async (req, res) => {
 // Atualiza os dois lados: admin vê "Confirmado", streamer vê "Pago" e some o bloqueio.
 app.post('/api/admin/invoices/:id/mark-paid', requireApiKey, async (req, res) => {
   try {
+    const payRate = await exchange.getUsdBrlRate();
     const result = await pool.query(
-      `UPDATE invoices SET status = 'confirmed', paid_at = COALESCE(paid_at, NOW()), confirmed_at = NOW(), confirmed_by = 'admin'
+      `UPDATE invoices SET status = 'confirmed', paid_at = COALESCE(paid_at, NOW()), confirmed_at = NOW(),
+              confirmed_by = 'admin', paid_usd_brl_rate = COALESCE(paid_usd_brl_rate, $2)
        WHERE id = $1 AND status IN ('pending', 'overdue') RETURNING id, id_streamer`,
-      [req.params.id]
+      [req.params.id, payRate]
     );
     if (result.rows.length === 0) return res.status(404).json({ message: 'Cobrança não encontrada ou já paga' });
     const idStreamer = result.rows[0].id_streamer;
@@ -1373,7 +1379,9 @@ app.get('/api/streamer/me/invoices', requireAuth, async (req, res) => {
       [req.auth.id_streamer]
     );
     const isBlocked = st.rows[0]?.is_blocked || false;
-    return res.json({ invoices: result.rows, is_blocked: isBlocked });
+    // Cotação USD→BRL pra mostrar os valores em real (cache 1h)
+    const usdBrlRate = await exchange.getUsdBrlRate();
+    return res.json({ invoices: result.rows, is_blocked: isBlocked, usd_brl_rate: usdBrlRate });
   } catch (e) {
     return res.status(500).json({ message: e.message });
   }
@@ -1435,8 +1443,12 @@ app.post('/api/streamer/me/invoices/:id/pay', requireAuth, async (req, res) => {
       });
     }
 
-    // 4. Marca pago + DESBLOQUEIA (limpa pending_block tambem)
-    await pool.query(`UPDATE invoices SET status = 'paid', paid_at = NOW() WHERE id = $1`, [invoice.id]);
+    // 4. Marca pago + congela a cotação USD→BRL do momento + DESBLOQUEIA
+    const payRate = await exchange.getUsdBrlRate();
+    await pool.query(
+      `UPDATE invoices SET status = 'paid', paid_at = NOW(), paid_usd_brl_rate = $2 WHERE id = $1`,
+      [invoice.id, payRate]
+    );
     await pool.query(
       'UPDATE streamer SET is_blocked = false, pending_block = false WHERE LOWER(id_streamer) = LOWER($1)',
       [idStreamer]
