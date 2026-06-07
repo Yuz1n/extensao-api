@@ -611,6 +611,19 @@ async function initDB() {
     // Cotação USD→BRL congelada no momento do pagamento (valor em real da cobrança paga
     // não muda depois; só as em aberto variam com a cotação atual).
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS paid_usd_brl_rate REAL`);
+    // Backfill (uma vez): cobranças JÁ pagas sem cotação salva congelam na cotação ATUAL agora.
+    // Não temos o dólar histórico da época, então usamos o de hoje pra elas pararem de variar.
+    try {
+      const rate = await exchange.getUsdBrlRate();
+      if (rate) {
+        const bf = await pool.query(
+          `UPDATE invoices SET paid_usd_brl_rate = $1
+           WHERE paid_usd_brl_rate IS NULL AND status IN ('paid', 'confirmed')`,
+          [rate]
+        );
+        if (bf.rowCount > 0) console.log(`[DB] Backfill cotação em ${bf.rowCount} cobrança(s) paga(s) @ ${rate}`);
+      }
+    } catch (e) { console.error('[DB] Backfill cotação falhou:', e.message); }
 
     // Coluna de bloqueio no streamer
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT false`);
@@ -1225,7 +1238,8 @@ app.get('/api/admin/invoices', requireApiKey, async (req, res) => {
     const result = await pool.query(q, values);
     // Dias ate o token do PixGG expirar — pro admin renovar antes de quebrar o desbloqueio
     const pixggTokenDaysLeft = pixgg.getTokenDaysLeft(process.env.PIXGG_ACCESS_TOKEN || '');
-    return res.json({ total: result.rows.length, invoices: result.rows, pixggTokenDaysLeft });
+    const usdBrlRate = await exchange.getUsdBrlRate();
+    return res.json({ total: result.rows.length, invoices: result.rows, pixggTokenDaysLeft, usd_brl_rate: usdBrlRate });
   } catch (e) {
     return res.status(500).json({ message: e.message });
   }
