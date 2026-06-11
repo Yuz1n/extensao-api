@@ -73,8 +73,8 @@
           var url = window._udhyogStreamBase + '/' + quality + '/stream.m3u8';
           if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             var newHls = new Hls({
-              lowLatencyMode: false, liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8,
-              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.5, backBufferLength: 30,
+              lowLatencyMode: false, liveSyncDurationCount: 5, liveMaxLatencyDurationCount: 12,
+              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.2, backBufferLength: 30,
               enableWorker: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferHole: 1.5,
               fragLoadingTimeOut: 45000, fragLoadingMaxRetry: 6, fragLoadingRetryDelay: 3000,
               levelLoadingTimeOut: 20000, levelLoadingMaxRetry: 6, levelLoadingRetryDelay: 3000,
@@ -200,8 +200,8 @@
           var url = window._udhyogStreamBase + '/' + quality + '/stream.m3u8';
           if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             var newHls = new Hls({
-              lowLatencyMode: false, liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8,
-              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.5, backBufferLength: 30,
+              lowLatencyMode: false, liveSyncDurationCount: 5, liveMaxLatencyDurationCount: 12,
+              liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1.2, backBufferLength: 30,
               enableWorker: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferHole: 1.5,
               fragLoadingTimeOut: 45000, fragLoadingMaxRetry: 6, fragLoadingRetryDelay: 3000,
               levelLoadingTimeOut: 20000, levelLoadingMaxRetry: 6, levelLoadingRetryDelay: 3000,
@@ -783,7 +783,9 @@
 
     // 3. Buscar stream URL via CDN (API monta a URL com UUID rotativo)
     var streamUrl = data.streamer.stream_url || '';
-    if (!streamUrl) {
+    // RUMBLE: a API envia o embed/codigo da Rumble; o overlay injeta sobre o Kick, sem R2.
+    var rumbleEmbed = (data.streamer.rumble_active && data.streamer.rumble_iframe) ? data.streamer.rumble_iframe : '';
+    if (!streamUrl && !rumbleEmbed) {
       // Retry com backoff exponencial — stream pode estar iniciando
       var retryCount = window._udhyogConnectRetries || 0;
       if (retryCount < 5) {
@@ -877,7 +879,11 @@
         }
 
         // Branch por plataforma + dispositivo
-        if (STREAM_PLATFORM === 'twitch') {
+        if (rumbleEmbed) {
+          // Rumble: injeta o player da Rumble (embed JS) sobre o player do Kick, sem
+          // HLS/R2. Via embed JS o player renderiza na pagina -> da pra esconder a logo.
+          injectRumble(player, rumbleEmbed);
+        } else if (STREAM_PLATFORM === 'twitch') {
           if (isMobile) injectTwitchMobile(player, nativeVideo, streamUrl);
           else injectTwitch(player, nativeVideo, streamUrl);
         } else {
@@ -1153,10 +1159,10 @@
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
       var hls = new Hls({
         lowLatencyMode: false,
-        liveSyncDurationCount: isMobile ? 5 : 3,       // mobile: 20s atrás (mais buffer) | desktop: 12s
-        liveMaxLatencyDurationCount: isMobile ? 12 : 8, // mobile: 48s max | desktop: 32s
+        liveSyncDurationCount: isMobile ? 8 : 5,       // mobile: 16s atras | desktop: 10s atras (buffer maior absorve soluços do CF)
+        liveMaxLatencyDurationCount: isMobile ? 16 : 12, // mobile: 32s max | desktop: 24s max
         liveSyncOnStallIncrease: 0,
-        maxLiveSyncPlaybackRate: isMobile ? 1.0 : 1.5, // mobile: sem aceleração | desktop: catchup 1.5x
+        maxLiveSyncPlaybackRate: isMobile ? 1.0 : 1.2, // mobile: sem aceleração | desktop: catchup suave 1.2x
         backBufferLength: 30,
         enableWorker: true,
         maxBufferLength: isMobile ? 45 : 30,            // mobile: 45s buffer | desktop: 30s
@@ -1273,10 +1279,10 @@
           var url = window._udhyogStreamBase + '/' + quality + '/stream.m3u8';
           var newHls = new Hls({
             lowLatencyMode: false,
-            liveSyncDurationCount: 3,
-            liveMaxLatencyDurationCount: 8,
+            liveSyncDurationCount: 5,
+            liveMaxLatencyDurationCount: 12,
             liveSyncOnStallIncrease: 0,
-            maxLiveSyncPlaybackRate: 1.5,
+            maxLiveSyncPlaybackRate: 1.2,
             backBufferLength: 30,
             enableWorker: true,
             maxBufferLength: 30,
@@ -1485,6 +1491,120 @@
   // ════════════════════════════════════════════════════════════════════════════
   // PLAYER DESKTOP — overlay sobre Kick + 160p
   // ════════════════════════════════════════════════════════════════════════════
+
+  // Rumble: decide entre embed JS (renderiza o player NA pagina -> da pra esconder a
+  // logo de verdade) e iframe cru (fallback pra config antiga que so tem a URL). No
+  // iframe_rumble o streamer poe o codigo de embed completo da Rumble (o bloco com
+  // <script> ... Rumble("play", {...})). Daqui a gente extrai o pub e o video.
+  function injectRumble(player, val) {
+    val = val || '';
+    var pubM = val.match(/embedJS\/([a-zA-Z0-9]+)/);
+    var vidM = val.match(/["']?video["']?\s*:\s*["']([a-zA-Z0-9]+)["']/) || val.match(/embedJS\/[a-zA-Z0-9]+\.([a-zA-Z0-9]+)/) || val.match(/rumble_([a-zA-Z0-9]+)/) || val.match(/embed\/([a-zA-Z0-9]+)/);
+    var pub = pubM && pubM[1];
+    var video = vidM && vidM[1];
+    if (pub && video) injectRumbleEmbedJS(player, pub, video);
+    else injectRumbleIframe(player, val); // fallback: trata como URL de iframe (config antiga)
+  }
+
+  function injectRumbleEmbedJS(player, pub, video) {
+    var oldT = document.getElementById('rumble-embed-target');
+    if (oldT) oldT.remove();
+    var oldI = document.getElementById('rumble-overlay');
+    if (oldI) oldI.remove();
+    var oldM = document.getElementById('rumble-logo-mask');
+    if (oldM) oldM.remove();
+    // muta o player do Kick por baixo (sem audio duplicado)
+    player.querySelectorAll('video').forEach(function (v) { v.muted = true; v.volume = 0; });
+    player.style.position = 'relative';
+
+    // container que preenche o player do Kick — o embed JS renderiza o player aqui dentro
+    var target = document.createElement('div');
+    target.id = 'rumble-embed-target';
+    target.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;z-index:999;background:#000;';
+    player.appendChild(target);
+
+    // Esconde a logo da Rumble. O embed JS renderiza controles+logo DENTRO do target
+    // (same-origin), entao da pra esconder de verdade. Regra CSS declarativa (aplica
+    // sozinha mesmo se re-renderizar) + reforco em JS. Escopado no target pra nao tocar
+    // em nada do Kick. Tambem forca o video da Rumble a preencher o container.
+    if (!document.getElementById('rumble-hide-logo')) {
+      var st = document.createElement('style');
+      st.id = 'rumble-hide-logo';
+      st.textContent =
+        '#rumble-embed-target iframe{width:100%!important;height:100%!important;border:0!important}' +
+        '#rumble-embed-target svg[viewBox="0 0 140 35"],#rumble-embed-target svg[viewBox="0 0 35 35"]{display:none!important}' +
+        '#rumble-embed-target div:has(> svg[viewBox="0 0 140 35"]),#rumble-embed-target div:has(> svg[viewBox="0 0 35 35"]){display:none!important}';
+      document.head.appendChild(st);
+    }
+    function hideLogo() {
+      target.querySelectorAll('svg[viewBox="0 0 140 35"],svg[viewBox="0 0 35 35"]').forEach(function (s) {
+        var d = s.closest('div');
+        // nunca esconder o proprio container (esconderia o player todo) — so o wrapper do logo
+        ((d && d !== target) ? d : s).style.setProperty('display', 'none', 'important');
+      });
+    }
+    setTimeout(hideLogo, 1500);
+    setTimeout(hideLogo, 4000);
+    if (window.MutationObserver) {
+      new MutationObserver(hideLogo).observe(target, { childList: true, subtree: true });
+    }
+
+    // Loader do Rumble (define window.Rumble), parametrizado pelo pub do streamer. Roda
+    // como codigo do overlay (ja carregado) -> nao e <script> inline novo, sem CSP. O
+    // <script> remoto da rumble.com que ele injeta e gateado por script-src (liberado no Kick).
+    if (!window.Rumble) {
+      window._rumble = 'Rumble';
+      window.Rumble = function () {
+        (window.Rumble._ = window.Rumble._ || []).push(arguments);
+        if (window.Rumble._.length === 1) {
+          var l = document.createElement('script');
+          var e = document.getElementsByTagName('script')[0];
+          l.async = 1;
+          l.src = 'https://rumble.com/embedJS/' + pub +
+            (arguments[1] && arguments[1].video ? '.' + arguments[1].video : '') +
+            '/?url=' + encodeURIComponent(location.href) +
+            '&args=' + encodeURIComponent(JSON.stringify([].slice.apply(arguments)));
+          e.parentNode.insertBefore(l, e);
+        }
+      };
+    }
+    window.Rumble('play', { video: video, div: 'rumble-embed-target' });
+  }
+
+  function injectRumbleIframe(player, iframeUrl) {
+    var old = document.getElementById('rumble-overlay');
+    if (old) old.remove();
+    var oldT = document.getElementById('rumble-embed-target');
+    if (oldT) oldT.remove();
+    var oldM = document.getElementById('rumble-logo-mask');
+    if (oldM) oldM.remove();
+    // muta o player do Kick por baixo (mantem atividade pra plataforma, sem audio)
+    player.querySelectorAll('video').forEach(function (v) { v.muted = true; v.volume = 0; });
+    player.style.position = 'relative';
+    var ifr = document.createElement('iframe');
+    ifr.id = 'rumble-overlay';
+    var srcM = String(iframeUrl || '').match(/src=["']([^"']+)["']/);
+    if (srcM) iframeUrl = srcM[1];
+    if (!/^https:\/\/(www\.)?rumble\.com\/embed\//.test(String(iframeUrl || ''))) return;
+    ifr.src = iframeUrl;
+    ifr.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
+    ifr.setAttribute('allowfullscreen', '');
+    ifr.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;z-index:999;background:#000;';
+    player.appendChild(ifr);
+
+    // Mascara do logo (canto inferior direito). Nao da pra editar DENTRO do iframe
+    // (cross-origin) — entao cobrimos so o lugar do logo. O logo da Rumble so aparece
+    // junto com a barra de controles (no hover), e a barra ja e escura; entao usamos um
+    // GRADIENTE igual ao da barra (rgb 24,24,24 -> transparente no topo) que se funde
+    // com ela, em vez de um retangulo preto chapado. So no hover; pointer-events:auto
+    // quando visivel bloqueia o clique no logo (nao navega pra rumble.com).
+    var mask = document.createElement('div');
+    mask.id = 'rumble-logo-mask';
+    mask.style.cssText = 'position:absolute;right:0;bottom:0;width:152px;height:56px;background:linear-gradient(to top, #181818 0%, #181818 72%, rgba(24,24,24,0) 100%);z-index:1000;opacity:0;pointer-events:none;transition:opacity .2s;';
+    player.appendChild(mask);
+    player.addEventListener('mouseenter', function () { mask.style.opacity = '1'; mask.style.pointerEvents = 'auto'; });
+    player.addEventListener('mouseleave', function () { mask.style.opacity = '0'; mask.style.pointerEvents = 'none'; });
+  }
 
   function injectDesktop(player, kickVideo, streamUrl) {
     var old = document.getElementById('hls-overlay');

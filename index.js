@@ -630,6 +630,13 @@ async function initDB() {
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS billing_type VARCHAR(20) DEFAULT 'view_hours'`);
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS fixed_weekly_value REAL DEFAULT 0`);
 
+    // Restream pra Rumble (consumido pelo app rumble-relay): servidor RTMP + chave + on/off por streamer
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS rumble_server VARCHAR(500)`);
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS rumble_key VARCHAR(500)`);
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS rumble_enabled BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS iframe_rumble TEXT`);
+    await pool.query(`ALTER TABLE streamer ALTER COLUMN iframe_rumble TYPE TEXT`);
+
     // Multi-plataforma: link Twitch opcional + métricas separadas por plataforma
     // Coluna 'platform' já existia em live_viewer_sessions (guarda OS), por isso usamos 'stream_platform'
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS new_plataform VARCHAR(255)`);
@@ -1620,7 +1627,7 @@ let streamerCacheLoaded = false;
 
 async function loadStreamerCache() {
   const result = await pool.query(
-    'SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, new_plataform, is_blocked FROM streamer'
+    'SELECT id, "user", link, id_streamer, max_spectators, id_mediamtx, new_plataform, is_blocked, COALESCE(rumble_enabled, false) AS rumble_enabled, iframe_rumble FROM streamer'
   );
   // Limpar cache antes de recarregar
   for (const key in streamerCache) delete streamerCache[key];
@@ -1680,13 +1687,24 @@ async function processValidate(id_streamer, req, res) {
 
     const streamEnded = endedStreamers[id_streamer.toLowerCase()] || false;
 
+    // Rumble: viewer assiste pelo embed da Rumble (injetado sobre o Kick) em vez do R2.
+    // SÓ libera quando a live está ON — isLive vem do getStreamUrl, que só retorna URL
+    // se há live ativa em activeLives (registrada pelo notify do app no início). Offline
+    // => sem iframe + stream_url vazio => cai no gate normal de "stream offline" do
+    // overlay. A checagem de URL/canal do overlay continua acontecendo antes disso.
+    const rumbleEnabled = !!(streamer.rumble_enabled && streamer.iframe_rumble);
+    const isLive = !!stream_url && !streamEnded;
+    const rumbleActive = rumbleEnabled && isLive;
+
     return res.json({
       valid: true,
       stream_ended: streamEnded,
       streamer: {
         ...streamer,
         current_viewers: currentViewers,
-        stream_url: streamEnded ? '' : stream_url
+        stream_url: (rumbleEnabled || streamEnded) ? '' : stream_url,
+        rumble_active: rumbleActive,
+        rumble_iframe: rumbleActive ? streamer.iframe_rumble : null
       }
     });
   } catch (err) {
@@ -1892,7 +1910,7 @@ app.post('/api/streamer', requireApiKeyOrAuth, async (req, res) => {
 app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { id_streamer } = req.params;
-    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour, billing_type, fixed_weekly_value, new_plataform } = req.body;
+    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour, billing_type, fixed_weekly_value, new_plataform, rumble_server, rumble_key, rumble_enabled, iframe_rumble } = req.body;
 
     console.log(`[UPDATE] Atualizando streamer: "${id_streamer}" body:`, JSON.stringify(req.body));
 
@@ -1913,6 +1931,10 @@ app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
     if (billing_type !== undefined)         { fields.push(`billing_type = $${idx++}`);         values.push(billing_type); }
     if (fixed_weekly_value !== undefined)   { fields.push(`fixed_weekly_value = $${idx++}`);   values.push(fixed_weekly_value); }
     if (new_plataform !== undefined)        { fields.push(`new_plataform = $${idx++}`);        values.push(new_plataform || null); }
+    if (rumble_server !== undefined)        { fields.push(`rumble_server = $${idx++}`);       values.push(rumble_server || null); }
+    if (rumble_key !== undefined)           { fields.push(`rumble_key = $${idx++}`);          values.push(rumble_key || null); }
+    if (rumble_enabled !== undefined)       { fields.push(`rumble_enabled = $${idx++}`);      values.push(!!rumble_enabled); }
+    if (iframe_rumble !== undefined)        { fields.push(`iframe_rumble = $${idx++}`);       values.push(iframe_rumble || null); }
 
     if (fields.length === 0) {
       return res.status(400).json({ message: 'Nenhum campo para atualizar' });
@@ -1935,6 +1957,45 @@ app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
     console.error('[UPDATE] Erro:', err.message);
     return res.status(500).json({ message: 'Erro interno do servidor' });
   }
+});
+
+// ── GET /api/streamer/:id_streamer/rumble-config (consumido pelo app rumble-relay) ──
+// Retorna a config de restream pro Rumble. Protegido por X-Api-Key (server-side only).
+app.get('/api/streamer/:id_streamer/rumble-config', requireApiKey, async (req, res) => {
+  try {
+    const { id_streamer } = req.params;
+    const r = await pool.query(
+      'SELECT COALESCE(rumble_enabled, false) AS enabled, rumble_server AS server, rumble_key AS key FROM streamer WHERE LOWER(id_streamer) = LOWER($1) LIMIT 1',
+      [id_streamer]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ message: 'Streamer nao encontrado' });
+    return res.json(r.rows[0]);
+  } catch (err) {
+    console.error('[RUMBLE-CONFIG] Erro:', err.message);
+    return res.status(500).json({ message: 'Erro interno do servidor' });
+  }
+});
+
+// Status ao-vivo do Rumble por streamer (em memoria) — reportado pelo app rumble-relay.
+const rumbleLiveStatus = {};
+
+// ── POST /api/streamer/:id_streamer/rumble-status (reportado pelo rumble-relay) ──
+app.post('/api/streamer/:id_streamer/rumble-status', requireApiKey, (req, res) => {
+  const { id_streamer } = req.params;
+  const live = !!(req.body && req.body.live);
+  rumbleLiveStatus[id_streamer.toLowerCase()] = { live, at: Date.now() };
+  return res.json({ ok: true });
+});
+
+// ── GET /api/admin/rumble-status (dashboard) ──
+app.get('/api/admin/rumble-status', requireApiKeyOrAuth, (req, res) => {
+  // "ao vivo" só se reportou nos últimos 60s (heartbeat de 30s) — evita status preso se o relay morrer.
+  const now = Date.now();
+  const out = {};
+  for (const [k, v] of Object.entries(rumbleLiveStatus)) {
+    out[k] = { live: v.live && (now - v.at < 60000), at: v.at };
+  }
+  return res.json(out);
 });
 
 // ── DELETE /api/streamer/:id_streamer (admin) ──
@@ -2294,7 +2355,7 @@ async function flushLiveViewerSessions(live) {
         if (r.status === 'fulfilled') count++;
         else batchErrors++;
       }
-      if (batchErrors === 0) break; // batch inteiro OK, prosseguir
+      if (batchErrors === 0) break;
       errors += batchErrors;
       if (attempt < 2) {
         logger.warn(`[FLUSH] Batch live #${live.liveId} falhou (${batchErrors} erros), retentando em 1s...`);
