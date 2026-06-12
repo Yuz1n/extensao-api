@@ -636,6 +636,7 @@ async function initDB() {
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS rumble_enabled BOOLEAN DEFAULT false`);
     await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS iframe_rumble TEXT`);
     await pool.query(`ALTER TABLE streamer ALTER COLUMN iframe_rumble TYPE TEXT`);
+    await pool.query(`ALTER TABLE streamer ADD COLUMN IF NOT EXISTS rumble_api_url TEXT`);
 
     // Multi-plataforma: link Twitch opcional + métricas separadas por plataforma
     // Coluna 'platform' já existia em live_viewer_sessions (guarda OS), por isso usamos 'stream_platform'
@@ -1696,6 +1697,17 @@ async function processValidate(id_streamer, req, res) {
     const isLive = !!stream_url && !streamEnded;
     const rumbleActive = rumbleEnabled && isLive;
 
+    // O id do vídeo da Rumble muda a cada live → resolve o id atual via a Live Stream API
+    // (cacheado, server-side) e troca no embed. is_live NÃO muda (continua o activeLives).
+    let rumbleEmbed = null;
+    if (rumbleActive) {
+      rumbleEmbed = streamer.iframe_rumble;
+      try {
+        const freshId = await getRumbleVideoId(id_streamer);
+        if (freshId) rumbleEmbed = patchEmbedVideoId(rumbleEmbed, freshId);
+      } catch (e) { /* mantém o embed armazenado */ }
+    }
+
     return res.json({
       valid: true,
       stream_ended: streamEnded,
@@ -1704,7 +1716,7 @@ async function processValidate(id_streamer, req, res) {
         current_viewers: currentViewers,
         stream_url: (rumbleEnabled || streamEnded) ? '' : stream_url,
         rumble_active: rumbleActive,
-        rumble_iframe: rumbleActive ? streamer.iframe_rumble : null
+        rumble_iframe: rumbleEmbed
       }
     });
   } catch (err) {
@@ -1910,7 +1922,7 @@ app.post('/api/streamer', requireApiKeyOrAuth, async (req, res) => {
 app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
   try {
     const { id_streamer } = req.params;
-    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour, billing_type, fixed_weekly_value, new_plataform, rumble_server, rumble_key, rumble_enabled, iframe_rumble } = req.body;
+    const { user, link, max_spectators, id_mediamtx, login, senha, value_per_view_hour, billing_type, fixed_weekly_value, new_plataform, rumble_server, rumble_key, rumble_enabled, iframe_rumble, rumble_api_url } = req.body;
 
     console.log(`[UPDATE] Atualizando streamer: "${id_streamer}" body:`, JSON.stringify(req.body));
 
@@ -1935,6 +1947,7 @@ app.put('/api/streamer/:id_streamer', requireApiKeyOrAuth, async (req, res) => {
     if (rumble_key !== undefined)           { fields.push(`rumble_key = $${idx++}`);          values.push(rumble_key || null); }
     if (rumble_enabled !== undefined)       { fields.push(`rumble_enabled = $${idx++}`);      values.push(!!rumble_enabled); }
     if (iframe_rumble !== undefined)        { fields.push(`iframe_rumble = $${idx++}`);       values.push(iframe_rumble || null); }
+    if (rumble_api_url !== undefined)       { fields.push(`rumble_api_url = $${idx++}`);      values.push(rumble_api_url || null); }
 
     if (fields.length === 0) {
       return res.status(400).json({ message: 'Nenhum campo para atualizar' });
@@ -1978,6 +1991,72 @@ app.get('/api/streamer/:id_streamer/rumble-config', requireApiKey, async (req, r
 
 // Status ao-vivo do Rumble por streamer (em memoria) — reportado pelo app rumble-relay.
 const rumbleLiveStatus = {};
+
+// ── Resolução do id do vídeo da Rumble (muda a cada live) via a Live Stream API ──
+// O id do embed da Rumble muda a cada live. Guardamos a URL da Live Stream API do streamer
+// (secret, coluna rumble_api_url — NUNCA no streamerCache/validate) e buscamos o id da
+// live atual (livestreams[0].id), com cache + stale-while-revalidate (1 fetch em voo por
+// streamer). is_live continua vindo do activeLives — isto é SÓ pro id do vídeo.
+const rumbleVideoCache = {};   // { id_streamer_lower: { videoId, at } }
+const _rumbleRefreshing = {};  // dedupe de fetch em voo por streamer
+const RUMBLE_VIDEO_TTL = 30000;
+
+function refreshRumbleVideoId(key) {
+  if (_rumbleRefreshing[key]) return _rumbleRefreshing[key];
+  const fallback = () => (rumbleVideoCache[key] ? rumbleVideoCache[key].videoId : null);
+  const p = (async () => {
+    let timer;
+    try {
+      const r = await pool.query(
+        'SELECT rumble_api_url FROM streamer WHERE LOWER(id_streamer) = LOWER($1) LIMIT 1', [key]
+      );
+      const apiUrl = r.rows[0] && r.rows[0].rumble_api_url;
+      if (!apiUrl || !/^https:\/\/(www\.)?rumble\.com\//i.test(apiUrl)) return fallback();
+      const ctrl = new AbortController();
+      timer = setTimeout(() => ctrl.abort(), 5000);
+      const resp = await fetch(apiUrl, { signal: ctrl.signal });
+      const data = await resp.json();
+      const ls = data && data.livestreams && data.livestreams[0];
+      const rawId = ls && ls.id;
+      if (rawId) {
+        // A Live Stream API retorna o id SEM o "v" inicial (ex: "7905aa"); o embed usa o
+        // slug COM "v" (ex: "v7905aa"). Prefixa o "v" se faltar.
+        const id = String(rawId);
+        const videoId = id.charAt(0) === 'v' ? id : 'v' + id;
+        rumbleVideoCache[key] = { videoId: videoId, at: Date.now() };
+        return videoId;
+      }
+      return fallback();
+    } catch (e) {
+      console.error('[RUMBLE-API] fetch do id falhou:', e.message);
+      return fallback();
+    } finally {
+      if (timer) clearTimeout(timer);
+      delete _rumbleRefreshing[key];
+    }
+  })();
+  _rumbleRefreshing[key] = p;
+  return p;
+}
+
+// id atual: fresh do cache, ou stale enquanto revalida; só bloqueia na 1a vez (sem cache).
+async function getRumbleVideoId(idStreamer) {
+  const key = idStreamer.toLowerCase();
+  const c = rumbleVideoCache[key];
+  if (c && c.videoId && Date.now() - c.at < RUMBLE_VIDEO_TTL) return c.videoId;
+  const p = refreshRumbleVideoId(key);
+  if (c && c.videoId) return c.videoId;  // stale-while-revalidate: não bloqueia
+  return await p;                         // primeira vez: espera o fetch
+}
+
+// Troca o id do vídeo no embed da Rumble (aparece no div + na chamada Rumble("play",...)).
+function patchEmbedVideoId(template, freshId) {
+  if (!template || !freshId) return template;
+  const m = template.match(/"video"\s*:\s*"([a-zA-Z0-9]+)"/);
+  const oldId = m && m[1];
+  if (!oldId || oldId === freshId) return template;
+  return template.split(oldId).join(freshId);
+}
 
 // ── POST /api/streamer/:id_streamer/rumble-status (reportado pelo rumble-relay) ──
 app.post('/api/streamer/:id_streamer/rumble-status', requireApiKey, (req, res) => {
@@ -2310,6 +2389,7 @@ async function onLiveEnd(idStreamer) {
 
   delete activeLives[idStreamer];
   delete activeViewers[idStreamer];
+  delete rumbleVideoCache[(idStreamer || '').toLowerCase()];  // próxima live re-busca o id do vídeo
 }
 
 // Flush sessões de viewer pro banco
